@@ -1,0 +1,51 @@
+# dependencies
+node_modules/
+.pnp
+.pnp.js
+
+# next.js
+/.next/
+/out/
+next-env.d.ts
+
+# production
+/build
+/dist
+
+# testing
+/coverage
+/.vitest
+
+# secrets — every env file except the example
+.env
+.env.*
+!.env.example
+
+# curl cookie jars — these hold live bd_session tokens from local smoke runs
+cookies.txt
+*-cookies.txt
+.*-cookies.txt
+
+# local file storage — application data must never enter version control
+/.data/
+/data/
+*.storage-key
+
+# logs
+*.log
+npm-debug.log*
+logs/
+.dev-out.log
+.dev-err.log
+
+# os / editor
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/*
+!.vscode/extensions.json
+
+# misc
+*.pem
+.tsbuildinfo
+*.tsbuildinfo

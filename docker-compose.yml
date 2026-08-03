@@ -1,0 +1,118 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# Base service graph. Compose this with an override file:
+#   dev : docker compose -f docker-compose.yml -f docker-compose.dev.yml up
+#   prod: docker compose -f docker-compose.yml -f docker-compose.prod.yml \
+#           --env-file .env.production up -d
+#
+# Persistence rule: file bytes live on the `app-data` volume and MongoDB on
+# `mongo-data`. Neither is ever stored inside a container layer, so redeploys and
+# restarts cannot lose research data.
+# ─────────────────────────────────────────────────────────────────────────────
+
+services:
+  mongodb:
+    image: mongo:7
+    container_name: biotech-drive-mongo
+    restart: unless-stopped
+    # A replica set (even single-node) is required for multi-document transactions.
+    command: ['mongod', '--replSet', 'rs0', '--bind_ip_all']
+    volumes:
+      - mongo-data:/data/db
+    healthcheck:
+      test: ['CMD', 'mongosh', '--quiet', '--eval', "db.adminCommand('ping').ok"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 20s
+    networks:
+      - internal
+
+  # Runs rs.initiate() exactly once, then exits. Without it the set never becomes primary.
+  mongo-init:
+    image: mongo:7
+    container_name: biotech-drive-mongo-init
+    depends_on:
+      mongodb:
+        condition: service_healthy
+    restart: 'no'
+    entrypoint:
+      - bash
+      - -c
+      - |
+        mongosh --host mongodb:27017 --quiet --eval '
+          try {
+            rs.status();
+            print("replica set already initialised");
+          } catch (e) {
+            rs.initiate({_id: "rs0", members: [{_id: 0, host: "mongodb:27017"}]});
+            print("replica set initialised");
+          }
+        '
+    networks:
+      - internal
+
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        GIT_SHA: ${GIT_SHA:-dev}
+    container_name: biotech-drive-app
+    restart: unless-stopped
+    depends_on:
+      mongodb:
+        condition: service_healthy
+    env_file:
+      - .env
+    environment:
+      NODE_ENV: ${NODE_ENV:-production}
+      MONGODB_URI: ${MONGODB_URI:-mongodb://mongodb:27017/biotech_drive?replicaSet=rs0}
+      LOCAL_STORAGE_ROOT: /data/storage
+      TEMP_UPLOAD_ROOT: /data/temp
+      QUARANTINE_ROOT: /data/quarantine
+      PREVIEW_ROOT: /data/previews
+      EXPORT_ROOT: /data/exports
+      BACKUP_ROOT: /data/backups
+    volumes:
+      # THE persistence guarantee: research files live here, outside the container.
+      - app-data:/data
+      # The backup job's status files, read-only here. This is the entire channel from
+      # the backup container to the admin dashboard, and it only runs one way: the
+      # application can see whether backups are working, and can do nothing to them.
+      - backup-status:/data/backups:ro
+    healthcheck:
+      test: ['CMD', 'curl', '-fsS', 'http://127.0.0.1:3000/api/health']
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 30s
+    networks:
+      - internal
+
+  nginx:
+    image: nginx:1.27-alpine
+    container_name: biotech-drive-nginx
+    restart: unless-stopped
+    depends_on:
+      - app
+    networks:
+      - internal
+      - public
+
+networks:
+  internal:
+    driver: bridge
+    # No published ports on this network — only nginx faces the outside world.
+  public:
+    driver: bridge
+
+volumes:
+  app-data:
+    driver: local
+  mongo-data:
+    driver: local
+  # Written by the backup container, read by the application. Kept separate from
+  # app-data so the backup container can mount the research files read-only and still
+  # have somewhere to report.
+  backup-status:
+    driver: local

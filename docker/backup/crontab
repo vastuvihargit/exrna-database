@@ -1,0 +1,19 @@
+# Backup container schedule (BusyBox cron, UTC).
+#
+# Times are staggered deliberately: the nightly backup must be finished long before the
+# weekly restore drill starts reading the same repository.
+#
+# Every job runs through run-job.sh, which loads the environment (cron inherits none)
+# and appends to a log the admin dashboard's status files summarise.
+
+# Daily: dump MongoDB, back up the file volume, verify 5% of the pack data, copy off-server.
+15 2 * * *   sh /usr/local/bin/run-job.sh backup
+
+# Weekly (Sunday): restore the latest snapshot into a scratch database and re-hash a
+# sample of the restored objects. This is the job that turns "we have backups" into
+# "we have restores".
+30 3 * * 0   sh /usr/local/bin/run-job.sh verify-restore
+
+# Weekly (Saturday): full read-back of every pack in the repository. Slower than the
+# nightly 5% sample and the only thing that finds bit rot in rarely-touched snapshots.
+0 4 * * 6    sh /usr/local/bin/run-job.sh full-check

@@ -1,0 +1,183 @@
+# Production override: hardened runtime, TLS, resource limits, backups.
+#   docker compose -f docker-compose.yml -f docker-compose.prod.yml \
+#     --env-file .env.production up -d
+
+services:
+  mongodb:
+    command: ['mongod', '--replSet', 'rs0', '--bind_ip_all', '--auth', '--keyFile', '/etc/mongo-keyfile']
+    environment:
+      MONGO_INITDB_ROOT_USERNAME: ${MONGO_INITDB_ROOT_USERNAME}
+      MONGO_INITDB_ROOT_PASSWORD: ${MONGO_INITDB_ROOT_PASSWORD}
+    volumes:
+      - mongo-data:/data/db
+      - ./docker/mongo/keyfile:/etc/mongo-keyfile:ro
+    deploy:
+      resources:
+        limits:
+          memory: 2G
+
+  app:
+    restart: unless-stopped
+    read_only: true
+    tmpfs:
+      - /tmp
+      - /app/.next/cache
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    volumes:
+      - app-data:/data
+      # Secrets that are files rather than environment variables — today, the Google
+      # service-account key.
+      #
+      # A mounted file rather than an env var because a PEM in `env` shows up in
+      # `docker inspect`, in process listings, and in any crash report that dumps the
+      # environment. `GOOGLE_DRIVE_SERVICE_ACCOUNT_PRIVATE_KEY_FILE` takes precedence over
+      # the inline form precisely so production never needs the inline form.
+      #
+      # The *directory* is mounted, not the file. A bind mount of a missing file makes
+      # Docker create a directory with that name, and the application would then be handed
+      # a directory where it expected a key — a confusing failure at the worst moment.
+      # Mounting the directory means a deployment without Drive simply has an empty one.
+      #
+      # Put the key at docker/secrets/google-drive-key.pem, mode 0400, and set
+      # GOOGLE_DRIVE_SERVICE_ACCOUNT_PRIVATE_KEY_FILE=/run/secrets/google-drive-key.pem
+      - ./docker/secrets:/run/secrets:ro
+    deploy:
+      resources:
+        limits:
+          cpus: '2.0'
+          memory: 2G
+    logging:
+      driver: json-file
+      options:
+        max-size: '20m'
+        max-file: '5'
+
+  # Scheduled maintenance: health monitoring and alerting, storage integrity sweeps,
+  # expired-upload cleanup, trash retention.
+  #
+  # Built from the `maintenance` stage, which carries the source and tsx — the runtime
+  # image is a standalone bundle with no scripts directory, so the jobs literally cannot
+  # run there. Serves no traffic and publishes no port.
+  scheduler:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: maintenance
+      args:
+        GIT_SHA: ${GIT_SHA:-dev}
+    container_name: biotech-drive-scheduler
+    restart: unless-stopped
+    depends_on:
+      mongodb:
+        condition: service_healthy
+    env_file:
+      - .env.production
+    environment:
+      LOCAL_STORAGE_ROOT: /data/storage
+      TEMP_UPLOAD_ROOT: /data/temp
+      QUARANTINE_ROOT: /data/quarantine
+      PREVIEW_ROOT: /data/previews
+      EXPORT_ROOT: /data/exports
+      BACKUP_ROOT: /data/backups
+    volumes:
+      - app-data:/data
+      # Read-only: the monitor reports on backups, it does not touch them.
+      - backup-status:/data/backups:ro
+      # The same one key the app reads, not a second copy. `drive:drain`, `drive:sync` and
+      # `drive:check-approvals` all authenticate as the same service account.
+      - ./docker/secrets:/run/secrets:ro
+    networks:
+      - internal
+    logging:
+      driver: json-file
+      options:
+        max-size: '10m'
+        max-file: '5'
+    deploy:
+      resources:
+        limits:
+          cpus: '1.0'
+          memory: 1G
+
+  nginx:
+    volumes:
+      - ./docker/nginx/prod.conf:/etc/nginx/conf.d/default.conf:ro
+      - ./docker/nginx/proxy-headers.inc:/etc/nginx/conf.d/proxy-headers.inc:ro
+      - ./docker/nginx/certs:/etc/nginx/certs:ro
+    ports:
+      - '80:80'
+      - '443:443'
+
+  # Antivirus for uploads. Runs on the internal network with no published port: the
+  # only thing that ever talks to it is the application's upload pipeline.
+  #
+  # MALWARE_SCAN_ENABLED=true in production also makes scanning fail CLOSED (see
+  # config/env.ts) — an unreachable scanner refuses uploads rather than waving them
+  # through, because "unknown" is not "clean".
+  clamav:
+    image: clamav/clamav:1.4
+    container_name: biotech-drive-clamav
+    restart: unless-stopped
+    environment:
+      CLAMAV_NO_MILTERD: 'true'
+      # Signature updates. An antivirus with three-month-old definitions is theatre.
+      FRESHCLAM_CHECKS: '4'
+    volumes:
+      - clamav-db:/var/lib/clamav
+    healthcheck:
+      test: ['CMD-SHELL', 'echo PING | nc -w 5 127.0.0.1 3310 | grep -q PONG']
+      interval: 60s
+      timeout: 10s
+      retries: 3
+      # The first start downloads the full signature database; that takes minutes.
+      start_period: 300s
+    networks:
+      - internal
+    deploy:
+      resources:
+        limits:
+          memory: 2G
+
+  # Encrypted backups of MongoDB and the file volume, pushed off-server.
+  #
+  # The file volume is mounted READ-ONLY — a backup job must never be able to damage
+  # the data it is protecting. Its only writable outputs are the backup repository and
+  # the status directory the application reads.
+  backup:
+    image: alpine:3.20
+    container_name: biotech-drive-backup
+    restart: unless-stopped
+    depends_on:
+      - mongodb
+    env_file:
+      - .env.production
+    environment:
+      BACKUP_ROOT: /backups
+      BACKUP_STATUS_DIR: /status
+    volumes:
+      - app-data:/data:ro
+      - backup-data:/backups
+      - backup-status:/status
+      - ./docker/backup/backup.sh:/usr/local/bin/backup.sh:ro
+      - ./docker/backup/restore.sh:/usr/local/bin/restore.sh:ro
+      - ./docker/backup/verify-restore.sh:/usr/local/bin/verify-restore.sh:ro
+      - ./docker/backup/run-job.sh:/usr/local/bin/run-job.sh:ro
+      - ./docker/backup/entrypoint.sh:/usr/local/bin/entrypoint.sh:ro
+      - ./docker/backup/crontab:/usr/local/etc/backup-crontab:ro
+    entrypoint: ['/bin/sh', '/usr/local/bin/entrypoint.sh']
+    logging:
+      driver: json-file
+      options:
+        max-size: '10m'
+        max-file: '5'
+    networks:
+      - internal
+
+volumes:
+  backup-data:
+    driver: local
+  clamav-db:
+    driver: local

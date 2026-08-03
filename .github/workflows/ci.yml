@@ -1,0 +1,141 @@
+name: CI
+
+# Every push and every pull request. The gate is deliberately the same in both, so a
+# branch cannot be green as a push and red as a PR.
+on:
+  push:
+    branches: [main, develop]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  # A new push supersedes an in-flight run on the same ref. Nobody needs the result of
+  # a commit that has already been replaced.
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  NODE_VERSION: '22'
+
+jobs:
+  quality:
+    name: Typecheck, lint and test
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+
+    # The test suite is not a unit-test suite: the security tests run against a real
+    # MongoDB replica set through mongodb-memory-server, because "does this permission
+    # check work" cannot be answered against a mock.
+    env:
+      NODE_ENV: test
+      APP_URL: http://localhost:3000
+      MONGODB_URI: mongodb://127.0.0.1:27017/biotech_drive_test
+      AUTH_SECRET: ci-only-not-a-secret-value-0000000000
+      SESSION_SECRET: ci-only-not-a-secret-value-1111111111
+      COMPANY_EMAIL_DOMAINS: company.com
+      LOCAL_STORAGE_ROOT: /tmp/biotech-ci/storage
+      TEMP_UPLOAD_ROOT: /tmp/biotech-ci/temp
+      QUARANTINE_ROOT: /tmp/biotech-ci/quarantine
+      PREVIEW_ROOT: /tmp/biotech-ci/previews
+      EXPORT_ROOT: /tmp/biotech-ci/exports
+      BACKUP_ROOT: /tmp/biotech-ci/backups
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      # Cached separately: mongodb-memory-server downloads a MongoDB binary on first
+      # run, which is slow and occasionally rate-limited upstream.
+      - name: Cache the MongoDB binary
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/mongodb-binaries
+          key: mongodb-binaries-${{ runner.os }}
+
+      - name: Typecheck
+        run: npm run typecheck
+
+      - name: Lint
+        run: npm run lint
+
+      - name: Test
+        run: npm test
+
+  build:
+    name: Production build
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    needs: quality
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      # Placeholders only. The build must never need a real secret — if it does, a
+      # secret has leaked into the bundle, which is a finding rather than a config task.
+      - name: Build
+        env:
+          NODE_ENV: production
+          APP_URL: https://build.invalid
+          MONGODB_URI: mongodb://placeholder:27017/build
+          AUTH_SECRET: build-time-placeholder-value-not-a-secret-32
+          SESSION_SECRET: build-time-placeholder-value-not-a-secret-33
+          COMPANY_EMAIL_DOMAINS: example.com
+          LOCAL_STORAGE_ROOT: /tmp/build/storage
+          TEMP_UPLOAD_ROOT: /tmp/build/temp
+          QUARANTINE_ROOT: /tmp/build/quarantine
+          PREVIEW_ROOT: /tmp/build/previews
+          EXPORT_ROOT: /tmp/build/exports
+        run: npm run build
+
+      - name: Build the Docker images
+        run: |
+          docker build --target runner -t biotech-drive:ci .
+          docker build --target maintenance -t biotech-drive-scheduler:ci .
+
+  audit:
+    name: Dependency audit
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    # Advisory: a new advisory against a transitive dependency must not block an
+    # unrelated hotfix at 2am. It is reported, loudly, and triaged.
+    continue-on-error: true
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: npm audit (high and above)
+        run: npm audit --audit-level=high
+
+      - name: Check for committed secrets
+        # The one audit that is NOT advisory. .env.example is the only .env* file that
+        # may exist in the tree; anything else is a leaked credential.
+        continue-on-error: false
+        run: |
+          if git ls-files | grep -E '^\.env' | grep -v '^\.env\.example$'; then
+            echo "::error::An environment file other than .env.example is committed."
+            exit 1
+          fi
+          echo "No environment files committed."
