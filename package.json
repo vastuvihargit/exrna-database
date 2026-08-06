@@ -36,7 +36,8 @@
     "drive:drain": "tsx scripts/drain-drive-transfers.ts",
     "drive:check-approvals": "tsx scripts/check-approved-content.ts",
     "drive:sync": "tsx scripts/sync-drive-changes.ts",
-    "test:mongo": "vitest run"
+    "test:mongo": "vitest run",
+    "acl:validate": "tsx scripts/validate-acl-uniqueness.ts"
   },
   "dependencies": {
     "@hookform/resolvers": "^5.5.7",
