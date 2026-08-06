@@ -200,7 +200,7 @@ export async function update(
   const project = await projectService.getById(actor, current.projectId);
   assertProjectPermission(actor, project, 'metadata.edit', 'You cannot change this experiment');
 
-  const update: Record<string, unknown> = { updatedBy: actor.userId };
+  const update: experimentRepository.ExperimentPatch = { updatedBy: actor.userId };
 
   if (input.title !== undefined) {
     const title = sanitizeDisplayName(input.title);
@@ -233,7 +233,7 @@ export async function update(
     update.folderId = await validFolderId(actor, project, input.folderId);
   }
 
-  const updated = await experimentRepository.updateById(experimentId, { $set: update });
+  const updated = await experimentRepository.updateById(experimentId, update);
   if (!updated) throw new NotFoundError();
 
   await auditService.recordForActor(actor, meta, {

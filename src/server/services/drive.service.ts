@@ -130,7 +130,7 @@ export async function getProjectRoot(actor: Actor, projectId: string): Promise<F
   });
 
   if (!project.rootFolderId) {
-    await projectRepository.updateById(projectId, { $set: { rootFolderId: root.id } });
+    await projectRepository.updateById(projectId, { rootFolderId: root.id });
   }
   return root;
 }
