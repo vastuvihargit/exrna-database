@@ -6,7 +6,19 @@ export default defineConfig({
     environment: 'node',
     globals: true,
     include: ['tests/**/*.test.ts', 'tests/**/*.test.tsx'],
-    exclude: ['node_modules', '.next', 'tests/e2e/**'],
+    /**
+     * `tests/d1/**` is excluded here and run by `vitest.d1.config.ts` as a separate process.
+     *
+     * Not for tidiness — for contention. The D1 suite shells out to wrangler ~30 times and
+     * each call leaves a workerd process winding down. The database suites start a real
+     * `mongod` per file through mongodb-memory-server, and with `fileParallelism: false` the
+     * next file begins while those workerd processes are still exiting. That was enough to
+     * push `startTestDb()` past its 180 s hook timeout on a loaded machine — a failure with
+     * nothing wrong in either suite.
+     *
+     * `npm test` runs both, in sequence, in separate processes.
+     */
+    exclude: ['node_modules', '.next', 'tests/e2e/**', 'tests/d1/**'],
     setupFiles: ['tests/setup.ts'],
     testTimeout: 30_000,
     hookTimeout: 60_000,

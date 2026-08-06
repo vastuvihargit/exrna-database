@@ -65,8 +65,19 @@ jobs:
       - name: Lint
         run: npm run lint
 
-      - name: Test
-        run: npm test
+      # The D1 schema-contract suite asserts against a real local D1, so the database has to
+      # exist before the tests run. It deliberately fails rather than skips when it cannot
+      # reach one — a green run that silently checked nothing is worse than a red one.
+      - name: Create the local D1 database and apply migrations
+        run: npm run db:migrate:local
+
+      # Two steps rather than `npm test`, so a failure names which suite broke. They run in
+      # separate processes for the contention reason documented in vitest.config.ts.
+      - name: Test (MongoDB suites)
+        run: npm run test:mongo
+
+      - name: Test (D1 schema contract)
+        run: npm run test:d1
 
   build:
     name: Production build
