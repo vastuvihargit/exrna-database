@@ -31,21 +31,20 @@ export function allowedConfidentialities(actor: Actor): ConfidentialityLevel[] {
 export function resourceVisibilityFilter(actor: Actor): VisibilityFilter {
   const organizationId = toObjectId(actor.organizationId);
   const base: VisibilityFilter = { organizationId };
+  const principalIds = actorPrincipalIds(actor);
+  const denyGuard = aclDenyGuard(principalIds);
 
   if (actor.isSuperAdmin || actorHasCompanyWideRead(actor)) {
     // Company-wide readers still cannot see beyond their clearance, and `restricted`
-    // is never covered by clearance alone.
-    return { ...base, confidentiality: { $in: allowedConfidentialities(actor) } };
+    // is never covered by clearance alone. The deny guard applies to them too — see below.
+    return {
+      $and: [base, denyGuard, { confidentiality: { $in: allowedConfidentialities(actor) } }],
+    };
   }
 
   const userId = toObjectId(actor.userId);
   const departmentId = actor.departmentId ? toObjectId(actor.departmentId) : null;
   const projectIds = actor.projectIds.map(toObjectId).filter((id): id is Types.ObjectId => id !== null);
-  const roleIds = actor.grants.map((grant) => toObjectId(grant.roleId)).filter((id): id is Types.ObjectId => id !== null);
-
-  const principalIds = [userId, departmentId, ...projectIds, ...roleIds].filter(
-    (id): id is Types.ObjectId => id !== null,
-  );
 
   const clearance = allowedConfidentialities(actor);
 
@@ -53,7 +52,7 @@ export function resourceVisibilityFilter(actor: Actor): VisibilityFilter {
     // Your own content, at any classification.
     ...(userId ? [{ ownerId: userId }] : []),
     // Anything explicitly shared with you, your department, a project, or one of your roles.
-    ...(principalIds.length ? [{ 'permissions.principalId': { $in: principalIds } }] : []),
+    ...(principalIds.length ? [aclAllowBranch(principalIds)] : []),
     // Your department's content, within clearance.
     ...(departmentId ? [{ departmentId, confidentiality: { $in: clearance } }] : []),
     // Your projects' content, within clearance.
@@ -64,7 +63,73 @@ export function resourceVisibilityFilter(actor: Actor): VisibilityFilter {
   // files — expressed explicitly so the query can never degenerate into "match all".
   if (branches.length === 0) return { ...base, _id: { $in: [] } };
 
-  return { ...base, $or: branches };
+  return { $and: [base, denyGuard, { $or: branches }] };
+}
+
+/**
+ * Entries that are live *and* name this actor.
+ *
+ * `aclGrants()` in `authorize.ts` skips an expired entry before it looks at anything else
+ * (`if (entry.expiresAt && entry.expiresAt.getTime() <= now) continue`). These fragments
+ * reproduce that, so an expired grant confers no visibility and an expired **deny** blocks
+ * nothing — capability and visibility agree on when an entry stops existing.
+ */
+function livePredicate(): VisibilityFilter {
+  return { $or: [{ expiresAt: null }, { expiresAt: { $gt: new Date() } }] };
+}
+
+function aclAllowBranch(principalIds: Types.ObjectId[]): VisibilityFilter {
+  return {
+    permissions: {
+      $elemMatch: {
+        principalId: { $in: principalIds },
+        deny: { $ne: true },
+        ...livePredicate(),
+      },
+    },
+  };
+}
+
+/**
+ * "No live deny naming this actor."
+ *
+ * ── Security correction, Phase 3 module 4 ───────────────────────────────────────────────
+ *
+ * Until this change `resourceVisibilityFilter` had **no deny guard at all**, and its ACL
+ * branch matched `permissions.principalId` without looking at `deny` or `expiresAt`. Two
+ * consequences, both live in production:
+ *
+ *   • a resource carrying an explicit **denial** naming the actor was *more* visible to them
+ *     than to somebody with no entry at all — the deny matched the branch and granted
+ *     visibility;
+ *   • an **expired** share kept granting visibility indefinitely.
+ *
+ * `canAccess` still refused the action, so this never let anyone open a file. It did let a
+ * restricted filename, its folder path and its existence appear in a search listing and in the
+ * result count — which for research data is the disclosure that matters.
+ *
+ * The earlier plan was to reproduce this in D1 so the Phase 6 comparison would agree. That was
+ * the wrong call and has been reversed: a migration is not a reason to carry a confidentiality
+ * leak forward. Both engines now implement the corrected rule, Phase 6 compares against the
+ * corrected behaviour, and the Mongo tests were updated in the same commit.
+ *
+ * Applied to super admins and company-wide readers as well, because `canAccess` step 4 (deny)
+ * precedes step 5 (super admin): deny beats everything, and visibility must not be laxer than
+ * capability.
+ */
+function aclDenyGuard(principalIds: Types.ObjectId[]): VisibilityFilter {
+  if (principalIds.length === 0) return {};
+  return {
+    permissions: {
+      $not: {
+        $elemMatch: {
+          principalId: { $in: principalIds },
+          deny: true,
+          ...livePredicate(),
+        },
+      },
+    },
+  };
 }
 
 /**
@@ -84,10 +149,9 @@ export function resourceVisibilityFilter(actor: Actor): VisibilityFilter {
 export function childVisibilityFilter(actor: Actor): VisibilityFilter {
   const principalIds = actorPrincipalIds(actor);
 
-  const denyGuard: VisibilityFilter =
-    principalIds.length > 0
-      ? { permissions: { $not: { $elemMatch: { principalId: { $in: principalIds }, deny: true } } } }
-      : {};
+  // Shared with `resourceVisibilityFilter` so the two cannot drift. Now also expiry-aware:
+  // an expired deny blocks nothing, matching `aclGrants()`.
+  const denyGuard = aclDenyGuard(principalIds);
 
   const clearance = allowedConfidentialities(actor);
 
@@ -107,7 +171,8 @@ export function childVisibilityFilter(actor: Actor): VisibilityFilter {
     // Owner and direct grantee are not subject to the clearance gate — they were given
     // the resource explicitly (docs/phase-0/05, resolution steps 6–8).
     ...(userId ? [{ ownerId: userId }] : []),
-    ...(principalIds.length ? [{ 'permissions.principalId': { $in: principalIds } }] : []),
+    // Expiry-aware from Phase 3 module 4: an expired share used to keep granting visibility.
+    ...(principalIds.length ? [aclAllowBranch(principalIds)] : []),
     { confidentiality: { $in: clearance }, $or: scopeBranches },
   ];
 
