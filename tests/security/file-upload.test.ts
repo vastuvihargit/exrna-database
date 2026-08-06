@@ -619,7 +619,7 @@ describe('storage accounting', () => {
     const folderId = await personalFolder(alice, 'Quota ceiling');
 
     const quota = 4096;
-    await userRepository.updateById(alice.userId, { $set: { storageQuotaBytes: quota } });
+    await userRepository.updateById(alice.userId, { storageQuotaBytes: quota });
     try {
       await expect(
         uploadService.authorizeUpload(
@@ -630,7 +630,7 @@ describe('storage accounting', () => {
       ).rejects.toMatchObject({ code: 'QUOTA_EXCEEDED' });
     } finally {
       await userRepository.updateById(alice.userId, {
-        $set: { storageQuotaBytes: 20 * 1024 ** 3 },
+        storageQuotaBytes: 20 * 1024 ** 3,
       });
     }
   });

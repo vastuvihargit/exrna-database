@@ -1,334 +1,107 @@
 /**
- * User repository — the only place user documents are queried.
+ * User repository — the only place user records are queried.
  *
- * Callers receive plain objects, never Mongoose documents, so no business code can
- * accidentally `.save()` a partially loaded user or serialize a hidden field.
- */
-import { Types, type ClientSession, type FilterQuery } from 'mongoose';
-import { connectToDatabase } from '@/server/db/connection';
-import { UserModel, type UserDocument, type UserStatus } from '@/server/db/models';
-
-export interface UserRecord {
-  id: string;
-  organizationId: string;
-  email: string;
-  emailDomain: string;
-  name: string;
-  avatarUrl: string | null;
-  jobTitle: string | null;
-  status: UserStatus;
-  isSuperAdmin: boolean;
-  departmentId: string | null;
-  projectIds: string[];
-  storageQuotaBytes: number;
-  storageUsedBytes: number;
-  lastLoginAt: Date | null;
-  lastActiveAt: Date | null;
-  failedLoginCount: number;
-  lockedUntil: Date | null;
-  passwordUpdatedAt: Date | null;
-  mustChangePassword: boolean;
-  mfaEnabled: boolean;
-  authProviders: string[];
-  createdAt: Date;
-  deactivatedAt: Date | null;
-  deactivationReason: string | null;
-}
-
-type LeanUser = UserDocument & { _id: Types.ObjectId; createdAt: Date; updatedAt: Date };
-
-export function toUserRecord(doc: LeanUser): UserRecord {
-  return {
-    id: String(doc._id),
-    organizationId: String(doc.organizationId),
-    email: doc.email,
-    emailDomain: doc.emailDomain,
-    name: doc.name,
-    avatarUrl: doc.avatarUrl ?? null,
-    jobTitle: doc.jobTitle ?? null,
-    status: doc.status as UserStatus,
-    isSuperAdmin: Boolean(doc.isSuperAdmin),
-    departmentId: doc.departmentId ? String(doc.departmentId) : null,
-    projectIds: (doc.projectIds ?? []).map(String),
-    storageQuotaBytes: doc.storageQuotaBytes,
-    storageUsedBytes: doc.storageUsedBytes ?? 0,
-    lastLoginAt: doc.lastLoginAt ?? null,
-    lastActiveAt: doc.lastActiveAt ?? null,
-    failedLoginCount: doc.failedLoginCount ?? 0,
-    lockedUntil: doc.lockedUntil ?? null,
-    passwordUpdatedAt: doc.passwordUpdatedAt ?? null,
-    mustChangePassword: Boolean(doc.mustChangePassword),
-    mfaEnabled: Boolean(doc.mfa?.enabled),
-    authProviders: (doc.authProviders ?? []).map((provider) => provider.provider),
-    createdAt: doc.createdAt,
-    deactivatedAt: doc.deactivatedAt ?? null,
-    deactivationReason: doc.deactivationReason ?? null,
-  };
-}
-
-function objectId(id: string): Types.ObjectId | null {
-  return Types.ObjectId.isValid(id) ? new Types.ObjectId(id) : null;
-}
-
-export async function findById(id: string): Promise<UserRecord | null> {
-  const _id = objectId(id);
-  if (!_id) return null;
-  await connectToDatabase();
-  const doc = await UserModel.findOne({ _id }).lean<LeanUser>().exec();
-  return doc ? toUserRecord(doc) : null;
-}
-
-/**
- * Candidate users for `@mentions` in a comment.
+ * This module is now a façade over two implementations. Every caller keeps the import path,
+ * the function names and the return types it already had; what changed is that each call is
+ * routed to MongoDB or D1 according to `DATA_SOURCE_USERS`.
  *
- * Emails match exactly. Names match case-insensitively but *anchored* — the fragment
- * must be the start of the name — so an unanchored substring cannot be used to sweep the
- * directory, and the escaped pattern cannot be turned into a ReDoS payload.
+ * ── Why a façade rather than swapping the file ──────────────────────────────────────────
+ *
+ * The brief requires a rollback path that stays open until D1 is verified. A swap makes
+ * rollback a code change — a build, a deploy, and a window in which the fix is not yet live.
+ * A flag makes it an environment variable, and the two implementations sit side by side where
+ * they can be run against each other (Phase 6) rather than one replacing the other.
+ *
+ * The dispatch is per call, not cached at module load, so flipping the variable does not need
+ * a restart to take effect on the next request.
+ *
+ * Callers receive plain objects, never Mongoose documents or Drizzle rows, so no business code
+ * can accidentally `.save()` a partially loaded user or serialize a hidden field.
  */
-export async function findForMentions(input: {
-  organizationId: string;
-  emails: string[];
-  names: string[];
-  limit?: number;
-}): Promise<UserRecord[]> {
-  const branches: Record<string, unknown>[] = [];
+import { isD1 } from './data-source';
+import { mongoUserRepository } from './user.repository.mongo';
+import { d1UserRepository } from './user.repository.d1';
+import type {
+  CreateUserInput,
+  FindForMentionsInput,
+  ListUsersCriteria,
+  UserPatch,
+  UserRecord,
+  UserRepository,
+} from './user.repository.contract';
 
-  if (input.emails.length > 0) {
-    branches.push({ email: { $in: input.emails.map((email) => email.toLowerCase()) } });
-  }
-  for (const name of input.names.slice(0, 10)) {
-    const escaped = name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-    branches.push({ name: { $regex: `^${escaped}`, $options: 'i' } });
-  }
-  if (branches.length === 0) return [];
+export type {
+  CreateUserInput,
+  FindForMentionsInput,
+  ListUsersCriteria,
+  UserPatch,
+  UserRecord,
+  UserRepository,
+};
 
-  await connectToDatabase();
-  const organizationId = objectId(input.organizationId);
-  if (!organizationId) return [];
+/** Re-exported so a test can assert the Mongo and D1 paths agree without importing both. */
+export { mongoUserRepository, d1UserRepository };
 
-  const docs = await UserModel.find({ organizationId, $or: branches })
-    .limit(Math.min(input.limit ?? 20, 50))
-    .lean<LeanUser[]>()
-    .exec();
-  return docs.map(toUserRecord);
+function active(): UserRepository {
+  return isD1('users') ? d1UserRepository : mongoUserRepository;
 }
 
-/** Batch lookup, so resolving a share list is one query rather than one per entry. */
-export async function findByIds(ids: string[]): Promise<UserRecord[]> {
-  const valid = ids.map(objectId).filter((id): id is Types.ObjectId => id !== null);
-  if (valid.length === 0) return [];
-  await connectToDatabase();
-  const docs = await UserModel.find({ _id: { $in: valid } }).lean<LeanUser[]>().exec();
-  return docs.map(toUserRecord);
+export function findById(id: string): Promise<UserRecord | null> {
+  return active().findById(id);
 }
 
-/**
- * Case-insensitive by construction: emails are stored lower-cased and the caller
- * normalizes before looking up, so no regex is needed (and none is used — a regex here
- * would be a ReDoS surface on an unauthenticated endpoint).
- */
-export async function findByEmail(email: string): Promise<UserRecord | null> {
-  await connectToDatabase();
-  const doc = await UserModel.findOne({ email: email.toLowerCase() }).lean<LeanUser>().exec();
-  return doc ? toUserRecord(doc) : null;
+export function findByIds(ids: string[]): Promise<UserRecord[]> {
+  return active().findByIds(ids);
 }
 
-/** Loads the password hash explicitly; it is `select: false` on the schema. */
-export async function findByEmailWithSecrets(
+export function findByEmail(email: string): Promise<UserRecord | null> {
+  return active().findByEmail(email);
+}
+
+export function findByEmailWithSecrets(
   email: string,
 ): Promise<{ user: UserRecord; passwordHash: string | null } | null> {
-  await connectToDatabase();
-  const doc = await UserModel.findOne({ email: email.toLowerCase() })
-    .select('+passwordHash')
-    .lean<LeanUser & { passwordHash?: string | null }>()
-    .exec();
-  if (!doc) return null;
-  return { user: toUserRecord(doc), passwordHash: doc.passwordHash ?? null };
+  return active().findByEmailWithSecrets(email);
 }
 
-export interface ListUsersOptions {
-  filter: FilterQuery<UserDocument>;
-  search?: string;
-  status?: UserStatus;
-  departmentId?: string;
-  page: number;
-  pageSize: number;
-  sort?: string;
-  order?: 'asc' | 'desc';
+export function findForMentions(input: FindForMentionsInput): Promise<UserRecord[]> {
+  return active().findForMentions(input);
 }
 
-export async function list(
-  options: ListUsersOptions,
+export function list(
+  criteria: ListUsersCriteria,
 ): Promise<{ items: UserRecord[]; total: number }> {
-  await connectToDatabase();
-
-  const query: FilterQuery<UserDocument> = { ...options.filter };
-
-  if (options.status) query.status = options.status;
-  if (options.departmentId) {
-    const departmentId = objectId(options.departmentId);
-    if (!departmentId) return { items: [], total: 0 };
-    query.departmentId = departmentId;
-  }
-  if (options.search) {
-    // Anchored, escaped prefix match only — never an unbounded user-supplied regex.
-    const escaped = options.search.replace(/[.*+?^${}()|[\]\\]/g, '\\$&').slice(0, 80);
-    const prefix = new RegExp(`^${escaped}`, 'i');
-    const contains = new RegExp(escaped, 'i');
-    query.$or = [{ email: prefix }, { name: contains }];
-  }
-
-  const sortField = ['name', 'email', 'createdAt', 'lastLoginAt', 'status'].includes(options.sort ?? '')
-    ? (options.sort as string)
-    : 'name';
-  const sortOrder = options.order === 'desc' ? -1 : 1;
-
-  const [docs, total] = await Promise.all([
-    UserModel.find(query)
-      .sort({ [sortField]: sortOrder })
-      .skip((options.page - 1) * options.pageSize)
-      .limit(options.pageSize)
-      .lean<LeanUser[]>()
-      .exec(),
-    UserModel.countDocuments(query).exec(),
-  ]);
-
-  return { items: docs.map(toUserRecord), total };
+  return active().list(criteria);
 }
 
-export interface CreateUserInput {
-  organizationId: string;
-  email: string;
-  emailDomain: string;
-  name: string;
-  jobTitle?: string | null;
-  status: UserStatus;
-  departmentId?: string | null;
-  storageQuotaBytes: number;
-  passwordHash?: string | null;
-  isSuperAdmin?: boolean;
-  invitedBy?: string | null;
-  authProvider?: 'password' | 'google' | 'microsoft';
+export function create(input: CreateUserInput): Promise<UserRecord> {
+  return active().create(input);
 }
 
-export async function create(
-  input: CreateUserInput,
-  session?: ClientSession,
-): Promise<UserRecord> {
-  await connectToDatabase();
-
-  const [doc] = await UserModel.create(
-    [
-      {
-        organizationId: new Types.ObjectId(input.organizationId),
-        email: input.email,
-        emailDomain: input.emailDomain,
-        name: input.name,
-        jobTitle: input.jobTitle ?? null,
-        status: input.status,
-        departmentId: input.departmentId ? new Types.ObjectId(input.departmentId) : null,
-        storageQuotaBytes: input.storageQuotaBytes,
-        passwordHash: input.passwordHash ?? null,
-        passwordUpdatedAt: input.passwordHash ? new Date() : null,
-        isSuperAdmin: input.isSuperAdmin ?? false,
-        invitedBy: input.invitedBy ? new Types.ObjectId(input.invitedBy) : null,
-        invitedAt: new Date(),
-        activatedAt: input.status === 'active' ? new Date() : null,
-        authProviders: input.authProvider ? [{ provider: input.authProvider }] : [],
-      },
-    ],
-    session ? { session } : undefined,
-  );
-
-  return toUserRecord(doc!.toObject() as LeanUser);
+export function updateById(id: string, patch: UserPatch): Promise<UserRecord | null> {
+  return active().updateById(id, patch);
 }
 
-export async function updateById(
-  id: string,
-  update: Record<string, unknown>,
-  session?: ClientSession,
-): Promise<UserRecord | null> {
-  const _id = objectId(id);
-  if (!_id) return null;
-  await connectToDatabase();
-
-  const doc = await UserModel.findOneAndUpdate({ _id }, update, {
-    new: true,
-    ...(session ? { session } : {}),
-  })
-    .lean<LeanUser>()
-    .exec();
-
-  return doc ? toUserRecord(doc) : null;
+export function setPasswordHash(id: string, passwordHash: string): Promise<void> {
+  return active().setPasswordHash(id, passwordHash);
 }
 
-export async function setPasswordHash(id: string, passwordHash: string): Promise<void> {
-  const _id = objectId(id);
-  if (!_id) return;
-  await connectToDatabase();
-  await UserModel.updateOne(
-    { _id },
-    { $set: { passwordHash, passwordUpdatedAt: new Date(), mustChangePassword: false } },
-  ).exec();
+export function recordFailedLogin(id: string, lockThreshold: number): Promise<number> {
+  return active().recordFailedLogin(id, lockThreshold);
 }
 
-export async function recordFailedLogin(id: string, lockThreshold: number): Promise<number> {
-  const _id = objectId(id);
-  if (!_id) return 0;
-  await connectToDatabase();
-
-  const doc = await UserModel.findOneAndUpdate(
-    { _id },
-    { $inc: { failedLoginCount: 1 } },
-    { new: true },
-  )
-    .lean<LeanUser>()
-    .exec();
-
-  const count = doc?.failedLoginCount ?? 0;
-
-  if (count >= lockThreshold) {
-    // Exponential backoff: 15 min for the first lock, doubling, capped at 24 h.
-    const excess = count - lockThreshold;
-    const minutes = Math.min(15 * 2 ** excess, 24 * 60);
-    await UserModel.updateOne(
-      { _id },
-      { $set: { lockedUntil: new Date(Date.now() + minutes * 60_000) } },
-    ).exec();
-  }
-
-  return count;
+export function recordSuccessfulLogin(id: string): Promise<void> {
+  return active().recordSuccessfulLogin(id);
 }
 
-export async function recordSuccessfulLogin(id: string): Promise<void> {
-  const _id = objectId(id);
-  if (!_id) return;
-  await connectToDatabase();
-  await UserModel.updateOne(
-    { _id },
-    {
-      $set: { failedLoginCount: 0, lockedUntil: null, lastLoginAt: new Date(), lastActiveAt: new Date() },
-    },
-  ).exec();
-}
-
-export async function linkAuthProvider(
+export function linkAuthProvider(
   id: string,
   provider: 'password' | 'google' | 'microsoft',
   providerAccountId: string | null,
 ): Promise<void> {
-  const _id = objectId(id);
-  if (!_id) return;
-  await connectToDatabase();
-  await UserModel.updateOne(
-    { _id, 'authProviders.provider': { $ne: provider } },
-    { $push: { authProviders: { provider, providerAccountId, linkedAt: new Date() } } },
-  ).exec();
+  return active().linkAuthProvider(id, provider, providerAccountId);
 }
 
-export async function countByOrganization(organizationId: string): Promise<number> {
-  const orgId = objectId(organizationId);
-  if (!orgId) return 0;
-  await connectToDatabase();
-  return UserModel.countDocuments({ organizationId: orgId }).exec();
+export function countByOrganization(organizationId: string): Promise<number> {
+  return active().countByOrganization(organizationId);
 }

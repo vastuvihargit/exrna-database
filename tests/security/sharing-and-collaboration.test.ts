@@ -213,7 +213,7 @@ describe('sharing grants access, and revoking removes it immediately', () => {
     const folderId = await personalFolder(alice, 'Deactivated share');
     const uploaded = await upload(alice, folderId, 'deactivated.txt');
 
-    await userRepository.updateById(fixture.users.viewer, { $set: { status: 'deactivated' } });
+    await userRepository.updateById(fixture.users.viewer, { status: 'deactivated' });
 
     // A grant to a dormant account would silently reactivate with the person — the audit
     // trail would show the share, not the reactivation.
@@ -227,7 +227,7 @@ describe('sharing grants access, and revoking removes it immediately', () => {
       ),
     ).rejects.toMatchObject({ status: 409 });
 
-    await userRepository.updateById(fixture.users.viewer, { $set: { status: 'active' } });
+    await userRepository.updateById(fixture.users.viewer, { status: 'active' });
   });
 
   it('keeps the share list itself behind a permission check', async () => {

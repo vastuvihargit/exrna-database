@@ -32,6 +32,7 @@ import { auditService } from '@/server/audit/audit.service';
 import * as userRepository from '@/server/repositories/user.repository';
 import * as roleRepository from '@/server/repositories/role.repository';
 import * as departmentRepository from '@/server/repositories/department.repository';
+import * as organizationRepository from '@/server/repositories/organization.repository';
 import { getLogger } from '@/server/logging/logger';
 import type { RequestMeta } from '@/server/http/request-meta';
 
@@ -59,15 +60,23 @@ export interface DevUserSummary {
 export async function listSwitchableUsers(): Promise<DevUserSummary[]> {
   assertDevToolingEnabled();
 
+  // Previously an empty filter, which listed every account in every organization. The
+  // repositories now require a tenant scope, and the primary organization is what this
+  // switcher was always actually listing — the development seed creates exactly one.
+  const organization = await organizationRepository.getPrimary();
+  if (!organization) return [];
+
   const { items } = await userRepository.list({
-    filter: {},
+    organizationId: organization.id,
     status: 'active',
     page: 1,
     pageSize: MAX_CANDIDATES,
   });
 
   const departments = new Map<string, string>();
-  for (const department of await departmentRepository.list({}).catch(() => [])) {
+  for (const department of await departmentRepository
+    .list({ organizationId: organization.id })
+    .catch(() => [])) {
     departments.set(department.id, department.name);
   }
 

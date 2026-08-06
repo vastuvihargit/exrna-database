@@ -135,13 +135,26 @@ function grantScopeObjectIds(actor: Actor, scopeType: 'department' | 'project'):
  * Directory visibility. Every active employee may see the internal directory (names,
  * emails, departments) — status and quota fields are stripped by the DTO unless the
  * viewer holds `user.manage`.
+ *
+ * ── Database-neutral, unlike the filters above ──────────────────────────────────────────
+ *
+ * These two return a plain tenant scope rather than a MongoDB filter fragment, because the
+ * user and department repositories moved to D1 in Phase 3 and a `Types.ObjectId` means nothing
+ * to a SQL query. The module's guarantee is unchanged and arguably stronger: `organizationId`
+ * is a *required, named* field on `ListUsersCriteria` and `ListDepartmentsCriteria`, so a
+ * listing that omits the tenant predicate no longer type-checks — where previously it would
+ * merely have been an empty filter object nobody noticed.
+ *
+ * `resourceVisibilityFilter` and the rest stay MongoDB-shaped until their own modules move
+ * (folders and files, Phase 3 module 4). Converting them now would change queries that nothing
+ * in this phase tests.
  */
-export function userDirectoryFilter(actor: Actor): VisibilityFilter {
-  return { organizationId: toObjectId(actor.organizationId) };
+export function userDirectoryFilter(actor: Actor): { organizationId: string } {
+  return { organizationId: actor.organizationId };
 }
 
-export function departmentVisibilityFilter(actor: Actor): VisibilityFilter {
-  return { organizationId: toObjectId(actor.organizationId) };
+export function departmentVisibilityFilter(actor: Actor): { organizationId: string } {
+  return { organizationId: actor.organizationId };
 }
 
 /**
