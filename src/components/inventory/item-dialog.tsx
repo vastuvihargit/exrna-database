@@ -1,8 +1,10 @@
 'use client';
 
 import * as React from 'react';
+import { ChevronDown } from 'lucide-react';
 import { toast } from 'sonner';
 
+import { cn } from '@/lib/utils';
 import { Button } from '@/components/ui/button';
 import {
   Dialog,
@@ -66,6 +68,19 @@ const STATUSES: Array<{ value: InventoryItemStatus; label: string }> = [
 
 const CENTRAL_STORE = 'central';
 
+/**
+ * Marks the two fields with no sensible default.
+ *
+ * Decoration only — the inputs carry `required`, which is what a screen reader announces.
+ */
+function RequiredMark() {
+  return (
+    <span aria-hidden="true" className="text-destructive">
+      *
+    </span>
+  );
+}
+
 interface FormState {
   name: string;
   code: string;
@@ -102,6 +117,11 @@ const EMPTY: FormState = {
  *
  * The code is fixed once created: it is printed on the shelf label and copied into every
  * transaction row that has already been written.
+ *
+ * Ten fields at once reads as ten decisions, when only two of them have to be made. What is
+ * always shown is what defines the item and what makes it reorder; the shelf, the supplier
+ * and the notes sit behind "More details" — open already when an existing item has any of
+ * them, so editing never hides what is there.
  */
 export function ItemDialog({
   item,
@@ -113,12 +133,19 @@ export function ItemDialog({
   onOpenChange: (open: boolean) => void;
 }) {
   const [form, setForm] = React.useState<FormState>(EMPTY);
+  const [detailsOpen, setDetailsOpen] = React.useState(false);
   const create = useCreateInventoryItem();
   const update = useUpdateInventoryItem();
   const { data: departments } = useDepartments();
 
   React.useEffect(() => {
     if (!open) return;
+    setDetailsOpen(
+      Boolean(
+        item &&
+          (item.storageLocation || item.supplier || item.description || item.status !== 'active'),
+      ),
+    );
     setForm(
       item
         ? {
@@ -200,9 +227,11 @@ export function ItemDialog({
             </DialogDescription>
           </DialogHeader>
 
-          <div className="grid gap-3 py-4 sm:grid-cols-2">
+          <div className="grid gap-3 pt-4 sm:grid-cols-2">
             <div className="space-y-1.5 sm:col-span-2">
-              <Label htmlFor="item-name">Item name</Label>
+              <Label htmlFor="item-name">
+                Item name <RequiredMark />
+              </Label>
               <Input
                 id="item-name"
                 value={form.name}
@@ -215,7 +244,7 @@ export function ItemDialog({
             </div>
 
             <div className="space-y-1.5">
-              <Label htmlFor="item-code">Item code</Label>
+              <Label htmlFor="item-code">Item code {item ? null : <RequiredMark />}</Label>
               <Input
                 id="item-code"
                 value={form.code}
@@ -316,59 +345,89 @@ export function ItemDialog({
               </p>
             </div>
 
-            <div className="space-y-1.5">
-              <Label htmlFor="item-status">Status</Label>
-              <Select
-                value={form.status}
-                onValueChange={(value) => set('status', value as InventoryItemStatus)}
-              >
-                <SelectTrigger id="item-status">
-                  <SelectValue />
-                </SelectTrigger>
-                <SelectContent>
-                  {STATUSES.map((status) => (
-                    <SelectItem key={status.value} value={status.value}>
-                      {status.label}
-                    </SelectItem>
-                  ))}
-                </SelectContent>
-              </Select>
-            </div>
+          </div>
 
-            <div className="space-y-1.5">
-              <Label htmlFor="item-location">Storage location</Label>
-              <Input
-                id="item-location"
-                value={form.storageLocation}
-                onChange={(event) => set('storageLocation', event.target.value)}
-                placeholder="Cold room A — shelf 3"
-                maxLength={120}
+          <div className="space-y-3 pb-4 pt-3">
+            <button
+              type="button"
+              onClick={() => setDetailsOpen((current) => !current)}
+              aria-expanded={detailsOpen}
+              aria-controls="item-more-details"
+              className="flex w-full items-center gap-2 border-t pt-3 text-sm font-medium transition-colors hover:text-foreground"
+            >
+              <ChevronDown
+                className={cn('size-4 transition-transform', detailsOpen && 'rotate-180')}
+                aria-hidden="true"
               />
-            </div>
+              More details
+              <span className="font-normal text-muted-foreground">
+                — status, shelf, supplier, notes
+              </span>
+            </button>
 
-            <div className="space-y-1.5">
-              <Label htmlFor="item-supplier">Supplier</Label>
-              <Input
-                id="item-supplier"
-                value={form.supplier}
-                onChange={(event) => set('supplier', event.target.value)}
-                placeholder="Thermo Fisher"
-                maxLength={200}
-              />
-            </div>
+            {/* Collapsed rather than unmounted-and-forgotten: the values live in `form`, so
+                closing this never discards anything the user typed. */}
+            {detailsOpen ? (
+              <div id="item-more-details" className="grid gap-3 sm:grid-cols-2">
+                <div className="space-y-1.5">
+                  <Label htmlFor="item-status">Status</Label>
+                  <Select
+                    value={form.status}
+                    onValueChange={(value) => set('status', value as InventoryItemStatus)}
+                  >
+                    <SelectTrigger id="item-status">
+                      <SelectValue />
+                    </SelectTrigger>
+                    <SelectContent>
+                      {STATUSES.map((status) => (
+                        <SelectItem key={status.value} value={status.value}>
+                          {status.label}
+                        </SelectItem>
+                      ))}
+                    </SelectContent>
+                  </Select>
+                  <p className="text-[11px] text-muted-foreground">
+                    Inactive and discontinued items keep their stock and their history — they
+                    are only shown dimmed in the list.
+                  </p>
+                </div>
 
-            <div className="space-y-1.5 sm:col-span-2">
-              <Label htmlFor="item-description">Description</Label>
-              <textarea
-                id="item-description"
-                value={form.description}
-                onChange={(event) => set('description', event.target.value)}
-                rows={2}
-                maxLength={4000}
-                placeholder="Handling notes, hazard information, catalogue number"
-                className="flex w-full rounded-md border border-input bg-transparent px-3 py-2 text-sm shadow-sm placeholder:text-muted-foreground focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring"
-              />
-            </div>
+                <div className="space-y-1.5">
+                  <Label htmlFor="item-location">Storage location</Label>
+                  <Input
+                    id="item-location"
+                    value={form.storageLocation}
+                    onChange={(event) => set('storageLocation', event.target.value)}
+                    placeholder="Cold room A — shelf 3"
+                    maxLength={120}
+                  />
+                </div>
+
+                <div className="space-y-1.5 sm:col-span-2">
+                  <Label htmlFor="item-supplier">Supplier</Label>
+                  <Input
+                    id="item-supplier"
+                    value={form.supplier}
+                    onChange={(event) => set('supplier', event.target.value)}
+                    placeholder="Thermo Fisher"
+                    maxLength={200}
+                  />
+                </div>
+
+                <div className="space-y-1.5 sm:col-span-2">
+                  <Label htmlFor="item-description">Description</Label>
+                  <textarea
+                    id="item-description"
+                    value={form.description}
+                    onChange={(event) => set('description', event.target.value)}
+                    rows={2}
+                    maxLength={4000}
+                    placeholder="Handling notes, hazard information, catalogue number"
+                    className="flex w-full rounded-md border border-input bg-transparent px-3 py-2 text-sm shadow-sm placeholder:text-muted-foreground focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring"
+                  />
+                </div>
+              </div>
+            ) : null}
           </div>
 
           <DialogFooter className="gap-2">

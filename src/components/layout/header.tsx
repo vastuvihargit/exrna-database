@@ -3,7 +3,7 @@
 import * as React from 'react';
 import Link from 'next/link';
 import { useRouter, useSearchParams } from 'next/navigation';
-import { Dna, Menu, Search } from 'lucide-react';
+import { CircleHelp, Dna, Menu, Search } from 'lucide-react';
 
 import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
@@ -50,7 +50,7 @@ export function Header({ appName }: { appName: string }) {
   }, []);
 
   return (
-    <header className="sticky top-0 z-40 flex h-14 items-center gap-3 border-b bg-background px-4">
+    <header className="z-40 flex h-14 shrink-0 items-center gap-3 border-b bg-background px-4">
       {/* Below lg the sidebar collapses into a sheet. */}
       <Sheet open={mobileNavOpen} onOpenChange={setMobileNavOpen}>
         <SheetTrigger asChild>
@@ -76,6 +76,11 @@ export function Header({ appName }: { appName: string }) {
       </React.Suspense>
 
       <div className="flex items-center gap-1">
+        <Button asChild variant="ghost" size="icon">
+          <Link href="/help" aria-label="Help — what each part of the drive is for">
+            <CircleHelp className="size-5" />
+          </Link>
+        </Button>
         <NotificationBell />
         <ThemeToggle />
         <UserMenu />
@@ -92,6 +97,11 @@ export function Header({ appName }: { appName: string }) {
  * Every keystroke would be a permission-filtered query across the whole archive, and a
  * researcher typing a sample ID does not want results for its prefixes. Enter (or the
  * form's implicit submit) navigates to /search, which owns the state from then on.
+ *
+ * Which means the box has to say so. Somebody who types and sees nothing happen concludes
+ * search is broken, so the Enter it is waiting for appears as a real button the moment
+ * there is something to search for — visible to the people who would never guess, and
+ * clickable by the people who would never press it.
  */
 function HeaderSearch() {
   const router = useRouter();
@@ -125,9 +135,30 @@ function HeaderSearch() {
           value={term}
           onChange={(event) => setTerm(event.target.value)}
           placeholder="Search files, folders, samples, experiments…"
-          className="pl-9"
+          // The native clear button would sit underneath the submit affordance below.
+          className="pl-9 pr-24 [&::-webkit-search-cancel-button]:appearance-none"
           aria-label="Search the drive"
         />
+
+        {term.trim() ? (
+          <Button
+            type="submit"
+            variant="ghost"
+            size="sm"
+            className="absolute right-1 top-1/2 h-7 -translate-y-1/2 gap-1.5 px-2 text-xs font-normal text-muted-foreground"
+          >
+            Search
+            <kbd className="rounded border bg-muted px-1 py-px font-mono text-[10px]">Enter</kbd>
+          </Button>
+        ) : (
+          // The shortcut is only advertised where there is room; `?` lists it in full.
+          <kbd
+            aria-hidden="true"
+            className="pointer-events-none absolute right-3 top-1/2 hidden -translate-y-1/2 rounded border bg-muted px-1.5 py-px font-mono text-[10px] text-muted-foreground sm:block"
+          >
+            /
+          </kbd>
+        )}
       </div>
     </form>
   );

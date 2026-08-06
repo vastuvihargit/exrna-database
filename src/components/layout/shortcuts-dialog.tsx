@@ -1,5 +1,7 @@
 'use client';
 
+import Link from 'next/link';
+
 import {
   Dialog,
   DialogContent,
@@ -74,6 +76,14 @@ export function ShortcutsDialog({
             </section>
           ))}
         </div>
+
+        {/* Somebody who opens this looking for help is often not looking for shortcuts. */}
+        <p className="border-t pt-4 text-sm text-muted-foreground">
+          New here?{' '}
+          <Link href="/help" onClick={() => onOpenChange(false)} className="font-medium text-foreground hover:underline">
+            What each part of the drive is for
+          </Link>
+        </p>
       </DialogContent>
     </Dialog>
   );

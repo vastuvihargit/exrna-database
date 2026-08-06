@@ -50,13 +50,17 @@ export function Sidebar({ className, onNavigate }: SidebarProps) {
   return (
     <nav
       aria-label="Main navigation"
-      className={cn('flex h-full w-64 flex-col border-r border-sidebar-border bg-sidebar', className)}
+      className={cn(
+        'flex h-full min-h-0 w-64 shrink-0 flex-col border-r border-sidebar-border bg-sidebar',
+        className,
+      )}
     >
-      <div className="p-3">
+      <div className="shrink-0 p-3">
         <NewMenu className="w-full justify-start gap-2" onAction={onNavigate} />
       </div>
 
-      <div className="scrollbar-thin flex-1 space-y-4 overflow-y-auto px-3 pb-4">
+      {/* Only this list scrolls — the New button and the storage meter stay put. */}
+      <div className="scrollbar-thin min-h-0 flex-1 space-y-4 overflow-y-auto px-3 pb-4">
         {navSections.map((section) => {
           // Sections are hidden entirely from employees who cannot use them — the server
           // enforces this too; hiding it here just avoids a dead end.
@@ -85,7 +89,7 @@ export function Sidebar({ className, onNavigate }: SidebarProps) {
         })}
       </div>
 
-      <div className="border-t border-sidebar-border p-4">
+      <div className="shrink-0 border-t border-sidebar-border p-4">
         <p className="mb-2 text-xs font-medium text-muted-foreground">Storage</p>
         <div
           className="h-2 w-full overflow-hidden rounded-full bg-muted"

@@ -13,9 +13,11 @@ import { Sidebar } from './sidebar';
 export function AppShell({ children, appName }: { children: ReactNode; appName: string }) {
   return (
     <UploadProvider>
-      <div className="flex min-h-screen flex-col">
+      {/* The shell is pinned to the viewport (h-dvh + overflow-hidden) so the page itself
+          never scrolls. The sidebar and the content region each scroll on their own. */}
+      <div className="flex h-dvh flex-col overflow-hidden">
         <Header appName={appName} />
-        <div className="flex flex-1 overflow-hidden">
+        <div className="flex min-h-0 flex-1 overflow-hidden">
           <Sidebar className="hidden lg:flex" />
           <main id="main-content" className="scrollbar-thin flex-1 overflow-y-auto">
             <div className="mx-auto w-full max-w-7xl p-6">{children}</div>
