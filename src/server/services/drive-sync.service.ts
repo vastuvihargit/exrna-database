@@ -709,7 +709,7 @@ async function applyFolderChange(
   organizationId: string,
   summary: DriveSyncSummary,
 ): Promise<void> {
-  const folder = await folderRepository.findByDriveFolderId(driveFile.id);
+  const folder = await folderRepository.findByDriveFolderIdInternal(driveFile.id);
   if (!folder) {
     summary.unmanaged += 1;
     return;
@@ -720,7 +720,7 @@ async function applyFolderChange(
   if (!renamed && !trashed) return;
 
   summary.conflicts += 1;
-  await folderRepository.updateById(folder.id, { $set: { syncStatus: 'conflict' } });
+  await folderRepository.updateById(folder.id, { syncStatus: 'conflict' });
 
   await auditService.recordSystem({
     action: 'drive_storage.sync_conflict',

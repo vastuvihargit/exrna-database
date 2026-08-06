@@ -24,6 +24,7 @@ import * as fileRepository from '@/server/repositories/file.repository';
 import type { FileRecord, FileSortField } from '@/server/repositories/file.repository';
 import * as versionRepository from '@/server/repositories/file-version.repository';
 import * as folderRepository from '@/server/repositories/folder.repository';
+import type { FolderRecord } from '@/server/repositories/folder.repository';
 import * as projectRepository from '@/server/repositories/project.repository';
 import * as recentRepository from '@/server/repositories/recent-item.repository';
 import * as reviewRepository from '@/server/repositories/review.repository';
@@ -265,8 +266,8 @@ export async function moveFile(
     );
     if (!moved) throw new NotFoundError();
 
-    await folderRepository.updateById(context.file.folderId, { $inc: { fileCount: -1 } }, session);
-    await folderRepository.updateById(target.folder.id, { $inc: { fileCount: 1 } }, session);
+    await folderRepository.updateById(context.file.folderId, { fileCountDelta: -1 }, session);
+    await folderRepository.updateById(target.folder.id, { fileCountDelta: 1 }, session);
 
     // Storage accounting follows the file: moving between departments moves the bytes
     // from one department's quota to the other's.
@@ -378,7 +379,9 @@ export async function copyFilesForFolderCopy(
   let skipped = 0;
 
   for (const [sourceFolderId, targetFolderId] of folderIdMap) {
-    const targetFolder = await folderRepository.findById(targetFolderId);
+    // Internal: the destination was created by this same copy, moments ago, inside an
+    // operation the actor is already authorized for.
+    const targetFolder = await folderRepository.findByIdInternal(targetFolderId);
     if (!targetFolder) continue;
 
     const { items } = await fileRepository.listInFolder({
@@ -412,7 +415,7 @@ export async function copyFilesForFolderCopy(
 async function performCopy(
   actor: Actor,
   context: FileContext,
-  targetFolder: Awaited<ReturnType<typeof folderRepository.findById>> & object,
+  targetFolder: FolderRecord,
   meta: RequestMeta,
 ): Promise<FileRecord> {
   const target = { folder: targetFolder };
@@ -522,7 +525,7 @@ async function performCopy(
         { $set: { currentVersionId: version.id }, $inc: { versionCount: 1 } },
         session,
       );
-      await folderRepository.updateById(target.folder.id, { $inc: { fileCount: 1 } }, session);
+      await folderRepository.updateById(target.folder.id, { fileCountDelta: 1 }, session);
       await usageRepository.applyDelta(
         {
           userId: file.ownerId,
@@ -777,7 +780,7 @@ export async function trashFile(
     commit: () =>
       withTransaction(async (session) => {
         await fileRepository.setDeleted({ fileId, deleted: true, userId: actor.userId }, session);
-        await folderRepository.updateById(context.file.folderId, { $inc: { fileCount: -1 } }, session);
+        await folderRepository.updateById(context.file.folderId, { fileCountDelta: -1 }, session);
       }),
   });
 
@@ -815,7 +818,11 @@ export async function restoreFile(
   const context = await requireFile(actor, fileId, 'resource.restore', { includeDeleted: true });
   if (!context.file.deletedAt) return toView(context, actor, false);
 
-  const folder = await folderRepository.findById(context.file.folderId, { includeDeleted: true });
+  // Internal: whether the containing folder is still in the trash does not depend on who
+  // is asking — a folder the actor may not view can still be why their restore has to wait.
+  const folder = await folderRepository.findByIdInternal(context.file.folderId, {
+    includeDeleted: true,
+  });
   if (!folder) throw new ConflictError('The folder this file was in no longer exists');
   if (folder.deletedAt) {
     throw new ConflictError(`Restore the folder "${folder.name}" first — this file was inside it`);
@@ -835,7 +842,7 @@ export async function restoreFile(
     commit: () =>
       withTransaction(async (session) => {
         await fileRepository.setDeleted({ fileId, deleted: false, userId: actor.userId }, session);
-        await folderRepository.updateById(context.file.folderId, { $inc: { fileCount: 1 } }, session);
+        await folderRepository.updateById(context.file.folderId, { fileCountDelta: 1 }, session);
       }),
   });
 

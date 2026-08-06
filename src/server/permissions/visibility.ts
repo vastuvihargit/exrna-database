@@ -67,6 +67,85 @@ export function resourceVisibilityFilter(actor: Actor): VisibilityFilter {
 }
 
 /**
+ * Role-scope branches — the department, project and folder grants `roleScopeGrants()` honours.
+ *
+ * The MongoDB half of `roleScopeBranches` in `visibility.d1.ts`; the two are kept in step by
+ * the folder repository suites, which run the same scenarios against both engines.
+ */
+function roleScopeBranches(actor: Actor): VisibilityFilter[] {
+  const branches: VisibilityFilter[] = [];
+
+  const departmentScopes = grantScopeObjectIds(actor, 'department');
+  if (departmentScopes.length) branches.push({ departmentId: { $in: departmentScopes } });
+
+  const projectScopes = grantScopeObjectIds(actor, 'project');
+  if (projectScopes.length) branches.push({ projectId: { $in: projectScopes } });
+
+  const folderScopes = grantScopeObjectIds(actor, 'folder');
+  if (folderScopes.length) {
+    // The folder itself, or anything beneath it.
+    branches.push({ $or: [{ _id: { $in: folderScopes } }, { pathAncestors: { $in: folderScopes } }] });
+  }
+
+  return branches;
+}
+
+/**
+ * "May this actor be shown this **one** resource?" — the filter behind a permission-aware
+ * `findById`.
+ *
+ * Deliberately a **superset of `canAccess`'s allow set**, and deliberately different from
+ * `resourceVisibilityFilter` for that reason: a listing may be narrower than the permission
+ * layer (the cost is a row missing from a search page), but a lookup may not, because a
+ * repository returning `null` becomes a 404 on a folder the actor is entitled to open. The
+ * three cases `resourceVisibilityFilter` would wrongly hide are a role-scoped grant on another
+ * department, a folder-scoped grant, and a company-wide reader's own content classified above
+ * their clearance.
+ *
+ * What it does **not** relax is organization isolation and the live deny guard, which are
+ * AND-ed over everything, super admins included. `assertCan` still makes the real decision
+ * afterwards with the full ancestor chain; this is the half that runs inside the query, so a
+ * guessed id never loads a row.
+ *
+ * The full reasoning lives on `lookupVisibility()` in `visibility.d1.ts`.
+ */
+export function resourceLookupFilter(actor: Actor): VisibilityFilter {
+  const organizationId = toObjectId(actor.organizationId);
+  const principalIds = actorPrincipalIds(actor);
+  const denyGuard = aclDenyGuard(principalIds);
+  const clearance = allowedConfidentialities(actor);
+
+  const userId = toObjectId(actor.userId);
+  const branches: VisibilityFilter[] = [
+    ...(userId ? [{ ownerId: userId }] : []),
+    ...(principalIds.length ? [aclAllowBranch(principalIds)] : []),
+  ];
+
+  if (actor.isSuperAdmin || actorHasCompanyWideRead(actor)) {
+    branches.push({ confidentiality: { $in: clearance } });
+  } else {
+    const departmentId = actor.departmentId ? toObjectId(actor.departmentId) : null;
+    const projectIds = actor.projectIds
+      .map(toObjectId)
+      .filter((id): id is Types.ObjectId => id !== null);
+    if (departmentId) branches.push({ departmentId, confidentiality: { $in: clearance } });
+    if (projectIds.length) {
+      branches.push({ projectId: { $in: projectIds }, confidentiality: { $in: clearance } });
+    }
+  }
+
+  const scopes = roleScopeBranches(actor);
+  if (scopes.length) {
+    branches.push({ confidentiality: { $in: clearance }, $or: scopes });
+  }
+
+  // Never "match all": an actor with nothing at all gets a filter that matches nothing.
+  if (branches.length === 0) return { organizationId, _id: { $in: [] } };
+
+  return { $and: [{ organizationId }, denyGuard, { $or: branches }] };
+}
+
+/**
  * Entries that are live *and* name this actor.
  *
  * `aclGrants()` in `authorize.ts` skips an expired entry before it looks at anything else
@@ -189,7 +268,10 @@ function actorPrincipalIds(actor: Actor): Types.ObjectId[] {
   return ids.filter((id): id is Types.ObjectId => id !== null);
 }
 
-function grantScopeObjectIds(actor: Actor, scopeType: 'department' | 'project'): Types.ObjectId[] {
+function grantScopeObjectIds(
+  actor: Actor,
+  scopeType: 'department' | 'project' | 'folder',
+): Types.ObjectId[] {
   return actor.grants
     .filter((grant) => grant.scopeType === scopeType && grant.scopeId)
     .map((grant) => toObjectId(grant.scopeId as string))

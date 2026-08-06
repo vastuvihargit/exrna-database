@@ -302,6 +302,113 @@ export function inheritedDenyGuard(
   return sql`NOT (${columns.inheritPermissions} = 1 AND ${boundedAncestorExists(kind, principalIds, nowIso, 1)})`;
 }
 
+/**
+ * The department-, project- and folder-scoped **role grants** `roleScopeGrants()` honours.
+ *
+ * `resourceVisibility` deliberately does not include these — see `lookupVisibility` below for
+ * why a single-row lookup does.
+ */
+function roleScopeBranches(kind: ResourceKind, actor: Actor): SQL[] {
+  const columns = columnsFor(kind);
+  const branches: SQL[] = [];
+
+  const departmentScopes = scopeIds(actor, 'department');
+  if (departmentScopes.length) branches.push(inArray(columns.departmentId, departmentScopes));
+
+  const projectScopes = scopeIds(actor, 'project');
+  if (projectScopes.length) branches.push(inArray(columns.projectId, projectScopes));
+
+  // A folder-scoped grant covers the folder itself and everything beneath it, which is what
+  // `roleScopeGrants` expresses as "scopeId is the resource or one of its ancestors".
+  const folderScopes = scopeIds(actor, 'folder');
+  if (folderScopes.length) {
+    const { table, child } = ancestorScope(kind);
+    const underScope = sql`EXISTS (SELECT 1 FROM ${table} scope
+                                    WHERE scope.${child} = ${columns.id}
+                                      AND ${inArray(sql`scope.ancestor_id`, folderScopes)})`;
+    branches.push(
+      kind === 'folder' ? or(inArray(columns.id, folderScopes), underScope)! : underScope,
+    );
+  }
+
+  return branches;
+}
+
+/**
+ * "May this actor be shown this **one** row?" — the predicate behind a permission-aware
+ * `findById`.
+ *
+ * ── Why this is not `resourceVisibility` ────────────────────────────────────────────────
+ *
+ * A listing predicate is allowed to be narrower than `canAccess`: a row it omits is a row
+ * missing from a search page, which is a lesser evil than a leak. A **lookup** predicate is
+ * not, because the repository returning `null` becomes a 404 for a folder the actor can
+ * legitimately open — the department head opening their department's drive, the reviewer
+ * following a folder-scoped grant, the company-wide reader opening a restricted folder they
+ * own themselves. Each of those is allowed by `canAccess` and each is absent from
+ * `resourceVisibility`.
+ *
+ * So this predicate is deliberately built as a **superset of `canAccess`'s allow set**:
+ *
+ *   • every branch `resourceVisibility` has, plus
+ *   • the role-scope grants of `roleScopeGrants()` (step 9), gated by clearance exactly as
+ *     `passesConfidentialityGate` gates them, plus
+ *   • owner and direct/inherited grants **also** on the super-admin and company-wide path,
+ *     which `resourceVisibility` short-circuits past.
+ *
+ * What it is *not* laxer about is the part that matters: organization isolation and the live
+ * deny guards are AND-ed over everything, super admins included, so a denied or foreign-tenant
+ * folder is unreachable through this path however privileged the caller.
+ *
+ * `assertCan` still runs afterwards with the full ancestor chain and makes the actual decision.
+ * This is the SQL half — it stops an id-guessing lookup from ever loading the row.
+ */
+export function lookupVisibility(
+  kind: ResourceKind,
+  actor: Actor,
+  options: VisibilityOptions = {},
+): SQL {
+  const nowIso = options.nowIso ?? new Date().toISOString();
+  const columns = columnsFor(kind);
+  const principalIds = actorPrincipalIds(actor);
+
+  const guards: SQL[] = [eq(columns.organizationId, actor.organizationId)];
+  const deny = denyGuard(kind, principalIds, nowIso);
+  if (deny) guards.push(deny);
+  const inheritedDeny = inheritedDenyGuard(kind, principalIds, nowIso);
+  if (inheritedDeny) guards.push(inheritedDeny);
+
+  const clearance = clearancePredicate(kind, actor);
+  const branches: SQL[] = [];
+
+  if (actor.userId) branches.push(eq(columns.ownerId, actor.userId));
+  const direct = directGrant(kind, principalIds, nowIso);
+  if (direct) branches.push(direct);
+  const inherited = inheritedGrant(kind, principalIds, nowIso);
+  if (inherited) branches.push(inherited);
+
+  if (actor.isSuperAdmin || actorHasCompanyWideRead(actor)) {
+    // Everything in the tenant they are cleared for — *and* the branches above, because a
+    // company-wide reader whose clearance stops below `restricted` still owns their own files.
+    branches.push(clearance);
+  } else {
+    if (actor.departmentId) {
+      branches.push(and(eq(columns.departmentId, actor.departmentId), clearance)!);
+    }
+    if (actor.projectIds.length > 0) {
+      branches.push(and(inArray(columns.projectId, actor.projectIds), clearance)!);
+    }
+  }
+
+  // Role scope is gated by clearance for everybody — `passesConfidentialityGate` applies to
+  // exactly this branch of `canAccess` and to no other.
+  const scopes = roleScopeBranches(kind, actor);
+  if (scopes.length) branches.push(and(clearance, or(...scopes)!)!);
+
+  if (branches.length === 0) return sql`1 = 0`;
+  return and(...guards, or(...branches)!)!;
+}
+
 export function clearancePredicate(kind: ResourceKind, actor: Actor): SQL {
   const allowed = [...CLEARANCE_BY_MAX_LEVEL[actorClearance(actor)]] as ConfidentialityLevel[];
   return inArray(columnsFor(kind).confidentiality, allowed);
@@ -415,7 +522,7 @@ export function childVisibility(
   return guards.length ? and(...guards, or(...branches)!)! : or(...branches)!;
 }
 
-function scopeIds(actor: Actor, scopeType: 'department' | 'project'): string[] {
+function scopeIds(actor: Actor, scopeType: 'department' | 'project' | 'folder'): string[] {
   return [
     ...new Set(
       actor.grants

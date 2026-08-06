@@ -95,7 +95,7 @@ export async function getDepartmentRoot(
         confidentiality: 'internal',
       })
       .catch(() => undefined);
-    return (await folderRepository.findById(root.id)) ?? root;
+    return (await folderRepository.findByIdInternal(root.id)) ?? root;
   }
 
   return root;
@@ -159,7 +159,7 @@ export async function listDrives(actor: Actor): Promise<{
   projects: DriveSummary[];
 }> {
   const [myRoot, departments, projects] = await Promise.all([
-    folderRepository.findByRootKey(myDriveRootKey(actor.userId)),
+    folderRepository.findByRootKeyInternal(myDriveRootKey(actor.userId)),
     departmentRepository.list(departmentVisibilityFilter(actor)),
     listVisibleProjects(actor),
   ]);
@@ -179,7 +179,7 @@ export async function listDrives(actor: Actor): Promise<{
     ...accessibleDepartments.map((d) => departmentRootKey(d.id)),
     ...projects.map((p) => projectRootKey(p.id)),
   ];
-  const roots = await folderRepository.findByRootKeys(rootKeys);
+  const roots = await folderRepository.findByRootKeysInternal(rootKeys);
   const rootByKey = new Map(roots.map((root) => [root.rootKey, root.id]));
 
   return {

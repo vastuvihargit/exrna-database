@@ -48,15 +48,29 @@ export function toAncestorAcls(ancestors: FolderRecord[]): FolderContext['ancest
   }));
 }
 
+/**
+ * The folder, its ancestor chain, and the ACLs a decision needs.
+ *
+ * Two lookups with deliberately different authorization:
+ *
+ *   • the folder itself goes through the **permission-aware** `findById`, so a guessed id
+ *     never loads a row the actor may not see — the 404 happens in SQL rather than after the
+ *     name, path and classification have already been read into memory;
+ *   • the ancestor chain goes through the **internal** lookup, and has to. `canAccess` walks
+ *     that chain looking for an inherited deny; filtering it by what the actor may see would
+ *     drop exactly the ancestors carrying a denial they are not meant to know about, and the
+ *     walk would then allow what it should refuse.
+ */
 export async function loadFolderContext(
+  actor: Actor,
   folderId: string,
   options: { includeDeleted?: boolean } = {},
 ): Promise<FolderContext | null> {
-  const folder = await folderRepository.findById(folderId, options);
+  const folder = await folderRepository.findById(actor, folderId, options);
   if (!folder) return null;
 
-  const ancestorDocs = await folderRepository.findByIds(folder.pathAncestors);
-  // findByIds does not preserve order; pathAncestors is the authority on it.
+  const ancestorDocs = await folderRepository.findByIdsInternal(folder.pathAncestors);
+  // The lookup does not preserve order; pathAncestors is the authority on it.
   const byId = new Map(ancestorDocs.map((doc) => [doc.id, doc]));
   const ancestors = folder.pathAncestors
     .map((id) => byId.get(id))
@@ -77,7 +91,7 @@ export async function requireFolder(
   permission: Permission,
   options: { includeDeleted?: boolean } = {},
 ): Promise<FolderContext> {
-  const context = await loadFolderContext(folderId, options);
+  const context = await loadFolderContext(actor, folderId, options);
   if (!context) throw new NotFoundError();
 
   assertCan(actor, permission, folderResource(context.folder), {

@@ -333,9 +333,8 @@ export async function listSharedWithMe(
       pageSize: input.pageSize,
     }),
     folderRepository.listSharedWith({
-      organizationId: actor.organizationId,
+      actor,
       principalIds,
-      excludeOwnerId: actor.userId,
       page: input.page,
       pageSize: input.pageSize,
     }),
@@ -564,25 +563,31 @@ async function writeAcl(
   actorUserId: string,
   inheritPermissions?: boolean,
 ): Promise<void> {
-  const update = {
-    $set: {
-      permissions: entries.map((entry) => ({
-        principalType: entry.principalType,
-        principalId: entry.principalId,
-        accessLevel: entry.accessLevel,
-        deny: Boolean(entry.deny),
-        expiresAt: entry.expiresAt ?? null,
-        grantedBy: actorUserId,
-      })),
-      updatedBy: actorUserId,
-      ...(inheritPermissions !== undefined ? { inheritPermissions } : {}),
-    },
-  };
+  const permissions = entries.map((entry) => ({
+    principalType: entry.principalType,
+    principalId: entry.principalId,
+    accessLevel: entry.accessLevel,
+    deny: Boolean(entry.deny),
+    expiresAt: entry.expiresAt ?? null,
+    grantedBy: actorUserId,
+  }));
 
+  // Two shapes for one change: the file repository still speaks MongoDB update documents,
+  // the folder repository now speaks a database-neutral patch.
   const updated =
     targetType === 'file'
-      ? await fileRepository.updateById(targetId, update)
-      : await folderRepository.updateById(targetId, update);
+      ? await fileRepository.updateById(targetId, {
+          $set: {
+            permissions,
+            updatedBy: actorUserId,
+            ...(inheritPermissions !== undefined ? { inheritPermissions } : {}),
+          },
+        })
+      : await folderRepository.updateById(targetId, {
+          permissions,
+          updatedBy: actorUserId,
+          ...(inheritPermissions !== undefined ? { inheritPermissions } : {}),
+        });
 
   if (!updated) throw new NotFoundError();
 }

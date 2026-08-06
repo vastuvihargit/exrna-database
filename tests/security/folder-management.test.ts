@@ -88,6 +88,130 @@ describe('personal drives', () => {
   });
 });
 
+/**
+ * The MongoDB half of the D1 folder-repository isolation suite.
+ *
+ * `findById` used to return any row and leave the decision to the service, which always made
+ * it. It is now permission-aware in both engines, and these are the cases from
+ * `tests/d1/folder-repository.test.ts` that can be run against MongoDB with the same fixture —
+ * so the two implementations are asserted to agree rather than assumed to.
+ */
+describe('permission-aware lookup (MongoDB)', () => {
+  it('refuses a folder the actor has no route to, however well they guess the id', async () => {
+    if (skipUnlessDb()) return;
+    const { folderService, driveService, folderRepository } = await services();
+    const alice = await actorFor(fixture.users.scientistA);
+    const outsider = await actorFor(fixture.users.noRole);
+
+    const root = await driveService.getMyDriveRoot(alice);
+    const folder = await folderService.createFolder(
+      alice,
+      { name: 'Guess my id', parentFolderId: root.id },
+      TEST_META,
+    );
+
+    expect(await folderRepository.findById(outsider, folder.id)).toBeNull();
+    expect(await folderRepository.findById(alice, folder.id)).not.toBeNull();
+  });
+
+  it('an explicit denial removes the folder, ownership included', async () => {
+    if (skipUnlessDb()) return;
+    const { folderService, driveService, folderRepository } = await services();
+    const alice = await actorFor(fixture.users.scientistA);
+
+    const root = await driveService.getMyDriveRoot(alice);
+    const folder = await folderService.createFolder(
+      alice,
+      { name: 'Denied to its owner', parentFolderId: root.id },
+      TEST_META,
+    );
+
+    await folderRepository.updateById(folder.id, {
+      permissions: [
+        {
+          principalType: 'user',
+          principalId: alice.userId,
+          accessLevel: 'viewer',
+          deny: true,
+        },
+      ],
+    });
+
+    expect(await folderRepository.findById(alice, folder.id)).toBeNull();
+  });
+
+  it('an expired allow grants nothing and an expired denial blocks nothing', async () => {
+    if (skipUnlessDb()) return;
+    const { folderService, driveService, folderRepository } = await services();
+    const alice = await actorFor(fixture.users.scientistA);
+    const bob = await actorFor(fixture.users.scientistB);
+
+    const root = await driveService.getMyDriveRoot(alice);
+    const folder = await folderService.createFolder(
+      alice,
+      { name: 'Expiry', parentFolderId: root.id },
+      TEST_META,
+    );
+
+    const past = new Date('2020-01-01T00:00:00.000Z');
+    await folderRepository.updateById(folder.id, {
+      permissions: [
+        { principalType: 'user', principalId: bob.userId, accessLevel: 'viewer', expiresAt: past },
+      ],
+    });
+    expect(await folderRepository.findById(bob, folder.id)).toBeNull();
+
+    // The same entry, expired and denying: it blocks the owner no more than it granted Bob.
+    await folderRepository.updateById(folder.id, {
+      permissions: [
+        {
+          principalType: 'user',
+          principalId: alice.userId,
+          accessLevel: 'viewer',
+          deny: true,
+          expiresAt: past,
+        },
+      ],
+    });
+    expect(await folderRepository.findById(alice, folder.id)).not.toBeNull();
+  });
+
+  it('counts and page totals exclude what the actor may not see', async () => {
+    if (skipUnlessDb()) return;
+    const { folderService, driveService, folderRepository } = await services();
+    const alice = await actorFor(fixture.users.scientistA);
+    const outsider = await actorFor(fixture.users.noRole);
+
+    const root = await driveService.getMyDriveRoot(alice);
+    const parent = await folderService.createFolder(
+      alice,
+      { name: 'Counted parent', parentFolderId: root.id },
+      TEST_META,
+    );
+    await folderService.createFolder(
+      alice,
+      { name: 'Counted child', parentFolderId: parent.id },
+      TEST_META,
+    );
+
+    const page = await folderRepository.listChildrenOf({
+      actor: outsider,
+      parentFolderId: parent.id,
+      page: 1,
+      pageSize: 25,
+      sort: 'name',
+      order: 'asc',
+    });
+
+    expect(page.items).toEqual([]);
+    // The total is computed with the same filter, so it cannot disclose the row the page hid.
+    expect(page.total).toBe(0);
+    expect(
+      await folderRepository.countChildrenOf({ actor: outsider, parentFolderId: parent.id }),
+    ).toBe(0);
+  });
+});
+
 describe('department drives', () => {
   it('refuses a department drive to an employee from another department', async () => {
     if (skipUnlessDb()) return;
@@ -197,7 +321,7 @@ describe('moving folders', () => {
 
     await folderService.moveFolder(alice, source.id, destination.id, TEST_META);
 
-    const movedGrandchild = await folderRepository.findById(grandchild.id);
+    const movedGrandchild = await folderRepository.findById(alice, grandchild.id);
     expect(movedGrandchild).not.toBeNull();
     // root → destination → source → child, in that order.
     expect(movedGrandchild!.pathAncestors).toEqual([root.id, destination.id, source.id, child.id]);
@@ -229,14 +353,16 @@ describe('trash and restore', () => {
     expect(affected).toBe(2);
 
     // Gone from normal reads…
-    expect(await folderRepository.findById(child.id)).toBeNull();
+    expect(await folderRepository.findById(alice, child.id)).toBeNull();
     // …but still there, flagged.
-    const trashedChild = await folderRepository.findById(child.id, { includeDeleted: true });
+    const trashedChild = await folderRepository.findById(alice, child.id, {
+      includeDeleted: true,
+    });
     expect(trashedChild?.deletedAt).toBeTruthy();
     expect(trashedChild?.trashedWithFolderId).toBe(parent.id);
 
     await folderService.restoreFolder(alice, parent.id, TEST_META);
-    expect(await folderRepository.findById(child.id)).not.toBeNull();
+    expect(await folderRepository.findById(alice, child.id)).not.toBeNull();
   });
 
   it('lists only what the user deleted themselves, not the subtree that followed', async () => {
@@ -283,16 +409,14 @@ describe('copying folders', () => {
 
     // Share the original with the whole ANCHEM department.
     await folderRepository.updateById(source.id, {
-      $set: {
-        permissions: [
-          {
-            principalType: 'department',
-            principalId: fixture.departments.anchem,
-            accessLevel: 'viewer',
-            deny: false,
-          },
-        ],
-      },
+      permissions: [
+        {
+          principalType: 'department',
+          principalId: fixture.departments.anchem,
+          accessLevel: 'viewer',
+          deny: false,
+        },
+      ],
     });
 
     const destination = await folderService.createFolder(
@@ -304,8 +428,8 @@ describe('copying folders', () => {
 
     expect(copy.permissions).toEqual([]);
 
-    const descendants = await folderRepository.listDescendants(copy.id);
-    expect(descendants.map((folder) => folder.name)).toEqual(['Copy inner']);
+    const descendants = await folderRepository.listDescendantsInternal(copy.id);
+    expect(descendants.map((folder: { name: string }) => folder.name)).toEqual(['Copy inner']);
   });
 
   it('renames a copy that would collide with an existing folder', async () => {

@@ -328,7 +328,7 @@ async function validFolderId(
   folderId: string | null,
 ): Promise<string | null> {
   if (!folderId) return null;
-  const folder = await folderRepository.findById(folderId);
+  const folder = await folderRepository.findById(actor, folderId);
   if (!folder || folder.organizationId !== actor.organizationId) throw new NotFoundError();
   // Pointing an experiment at a folder in another drive would put a research link across
   // a boundary the permission layer would then have to reason about. It cannot happen.

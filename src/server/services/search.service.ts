@@ -120,8 +120,7 @@ export async function search(actor: Actor, query: SearchQuery): Promise<SearchRe
     // by file-specific criteria — a folder has no extension or review status.
     wantFolders && !query.category && !query.extension && !query.reviewStatus && !query.approvalStatus
       ? folderRepository.search({
-          visibility,
-          organizationId: actor.organizationId,
+          actor,
           ...(query.q ? { text: query.q } : {}),
           ...(query.departmentId ? { departmentId: query.departmentId } : {}),
           ...(query.projectId ? { projectId: query.projectId } : {}),

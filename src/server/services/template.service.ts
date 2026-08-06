@@ -215,7 +215,9 @@ export async function applyFolderTemplate(input: {
   kind: 'project' | 'department';
   confidentiality: ConfidentialityLevel;
 }): Promise<number> {
-  const root = await folderRepository.findById(input.rootFolderId);
+  // Internal: the template builder runs on behalf of the drive, not of a viewer — the
+  // caller has already authorized opening the drive whose root this is.
+  const root = await folderRepository.findByIdInternal(input.rootFolderId);
   if (!root) throw new NotFoundError();
 
   const templates = await getFolderTemplates(input.organizationId);
@@ -230,7 +232,8 @@ export async function applyFolderTemplate(input: {
     if (!parentId) continue;
     if (parentId === root.id && existing.has(entry.name.toLowerCase())) continue;
 
-    const parent = parentId === root.id ? root : await folderRepository.findById(parentId);
+    const parent =
+      parentId === root.id ? root : await folderRepository.findByIdInternal(parentId);
     if (!parent) continue;
 
     const folder = await folderRepository.create({

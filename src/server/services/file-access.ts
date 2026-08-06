@@ -48,7 +48,10 @@ export async function loadFileContext(
   // folderPathAncestors already ends with the containing folder, so this one query
   // covers the whole chain.
   const chainIds = file.folderPathAncestors;
-  const folders = await folderRepository.findByIds(chainIds);
+  // Internal, and it has to be: a file's permission decision walks this chain looking for an
+  // inherited deny, and a chain filtered by what the actor may see would drop the ancestor
+  // carrying it.
+  const folders = await folderRepository.findByIdsInternal(chainIds);
   const byId = new Map(folders.map((folder) => [folder.id, folder]));
   const folderChain = chainIds
     .map((id) => byId.get(id))

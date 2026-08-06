@@ -488,7 +488,7 @@ async function buildFileFromSession(
       );
 
       if (isNewFile) {
-        await folderRepository.updateById(folder.id, { $inc: { fileCount: 1 } }, dbSession);
+        await folderRepository.updateById(folder.id, { fileCountDelta: 1 }, dbSession);
       } else {
         // A review in flight is a review of bytes that are no longer current. Leaving it
         // open would let a reviewer approve superseded content and have the file show an

@@ -482,7 +482,9 @@ async function ensureLocalFolder(
   const existing = await folderRepository.findChildByName(parentFolderId, name.toLowerCase());
   if (existing) return existing.id;
 
-  const parent = await folderRepository.findById(parentFolderId);
+  // Internal: the import job authorized its target folder when it was created, and this walks
+  // down from there building the mirrored tree.
+  const parent = await folderRepository.findByIdInternal(parentFolderId);
   if (!parent) throw new NotFoundError();
 
   const folder = await folderRepository.create({
@@ -704,7 +706,9 @@ async function importItem(
   }
 
   const targetFolderId = item.targetFolderId ?? job.targetFolderId;
-  const folder = await folderRepository.findById(targetFolderId);
+  // Internal: `file.upload` on the job's target folder was asserted when the job was created,
+  // and this runs on the worker rather than inside the requesting user's session.
+  const folder = await folderRepository.findByIdInternal(targetFolderId);
   if (!folder) throw new NotFoundError();
 
   // Stage first. The bytes land in migration-staging, outside the served tree and outside
@@ -870,7 +874,7 @@ async function importItem(
           session,
         );
 
-        await folderRepository.updateById(folder.id, { $inc: { fileCount: 1 } }, session);
+        await folderRepository.updateById(folder.id, { fileCountDelta: 1 }, session);
         await usageRepository.applyDelta(
           {
             userId: actor.userId,
