@@ -574,3 +574,157 @@ describe('soft delete and the file variant', () => {
     expect(rows.map((row) => row.id)).toEqual(['child-ok']);
   });
 });
+
+/* ================================================================== inheritance boundary */
+
+/**
+ * `canAccess` walks leaf → root and stops **after** the first ancestor with
+ * `inheritPermissions = false` — that ancestor's ACL still applies, nothing above it does.
+ *
+ * The listing predicate must agree. Relying on `canAccess` to refuse the row afterwards is
+ * not enough: by then it has been counted, paginated and had its name rendered, which is the
+ * disclosure. Every case below therefore asserts `COUNT(*)` as well as the rows.
+ *
+ * Tree used throughout:  root ── mid ── leaf
+ */
+describe('inheritance boundaries', () => {
+  async function tree(midInherits: boolean): Promise<void> {
+    await seedFolder({ id: 'root' });
+    await seedFolder({ id: 'mid', parentId: 'root', inherit: midInherits });
+    await seedFolder({ id: 'leaf', parentId: 'mid' });
+
+    // depth: 0 = drive root, increasing towards the parent.
+    await d1.prepare('INSERT INTO folder_ancestors (folder_id,ancestor_id,depth) VALUES (?,?,?)').bind('mid', 'root', 0).run();
+    await d1.prepare('INSERT INTO folder_ancestors (folder_id,ancestor_id,depth) VALUES (?,?,?)').bind('leaf', 'root', 0).run();
+    await d1.prepare('INSERT INTO folder_ancestors (folder_id,ancestor_id,depth) VALUES (?,?,?)').bind('leaf', 'mid', 1).run();
+  }
+
+  it('1. a parent grant is inherited by the child', async () => {
+    await tree(true);
+    await seedAcl('folder', 'root', VIEWER);
+
+    const result = await visible('folder', resourceVisibility('folder', actor()));
+    expect(result.ids.sort()).toEqual(['leaf', 'mid', 'root']);
+    expect(result.total).toBe(3);
+  });
+
+  it('2 & 3. an intermediate folder disabling inheritance hides itself and everything below', async () => {
+    await tree(false);
+    await seedAcl('folder', 'root', VIEWER);
+
+    const result = await visible('folder', resourceVisibility('folder', actor()));
+    // `mid` broke inheritance and holds no direct grant; `leaf` is below the boundary.
+    expect(result.ids).toEqual(['root']);
+    expect(result.total).toBe(1);
+  });
+
+  it('4. a direct grant beneath the boundary restores visibility', async () => {
+    await tree(false);
+    await seedAcl('folder', 'root', VIEWER);
+    await seedAcl('folder', 'leaf', VIEWER);
+
+    const result = await visible('folder', resourceVisibility('folder', actor()));
+    expect(result.ids.sort()).toEqual(['leaf', 'root']);
+    expect(result.total).toBe(2);
+  });
+
+  /**
+   * The boundary folder's own ACL is still in scope — `canAccess` breaks *after* considering
+   * it — so a grant on `mid` reaches `leaf`, while `root` above the boundary still does not.
+   */
+  it('4b. the boundary folder\u2019s own grant still flows downwards', async () => {
+    await tree(false);
+    await seedAcl('folder', 'mid', VIEWER);
+
+    const result = await visible('folder', resourceVisibility('folder', actor()));
+    expect(result.ids.sort()).toEqual(['leaf', 'mid']);
+  });
+
+  it('5. a direct denial beneath the boundary removes visibility', async () => {
+    await tree(false);
+    await seedAcl('folder', 'mid', VIEWER);
+    await seedAcl('folder', 'leaf', VIEWER, { deny: true });
+
+    const result = await visible('folder', resourceVisibility('folder', actor()));
+    expect(result.ids).toEqual(['mid']);
+    expect(result.total).toBe(1);
+  });
+
+  it('5b. a denial above the boundary cannot reach past it', async () => {
+    await tree(false);
+    await seedAcl('folder', 'root', VIEWER, { deny: true });
+    await seedAcl('folder', 'mid', VIEWER);
+
+    const result = await visible('folder', resourceVisibility('folder', actor()));
+    // The deny on `root` is out of scope for `mid` and `leaf`; `root` itself is not granted.
+    expect(result.ids.sort()).toEqual(['leaf', 'mid']);
+  });
+
+  it('6. moving a folder across a boundary recalculates visibility', async () => {
+    await tree(false);
+    await seedAcl('folder', 'root', VIEWER);
+
+    // Below the boundary: invisible.
+    expect((await visible('folder', resourceVisibility('folder', actor()))).ids).toEqual(['root']);
+
+    // Re-parent `leaf` directly under `root`, bypassing `mid` -- exactly what a move does to
+    // the ancestor rows.
+    await d1.prepare('DELETE FROM folder_ancestors WHERE folder_id = ?').bind('leaf').run();
+    await d1
+      .prepare('INSERT INTO folder_ancestors (folder_id,ancestor_id,depth) VALUES (?,?,?)')
+      .bind('leaf', 'root', 0)
+      .run();
+    await d1.prepare('UPDATE folders SET parent_folder_id = ? WHERE id = ?').bind('root', 'leaf').run();
+
+    const after = await visible('folder', resourceVisibility('folder', actor()));
+    expect(after.ids.sort()).toEqual(['leaf', 'root']);
+    expect(after.total).toBe(2);
+  });
+
+  it('7. counts and pagination exclude rows below a broken boundary', async () => {
+    await tree(false);
+    await seedAcl('folder', 'root', VIEWER);
+
+    const db = await getD1();
+    const predicate = resourceVisibility('folder', actor());
+
+    const page = await db
+      .select({ id: folders.id })
+      .from(folders)
+      .where(predicate)
+      .orderBy(sql`${folders.name} ASC`, sql`${folders.id} ASC`)
+      .limit(10);
+    const counted = await db
+      .select({ value: sql<number>`count(*)` })
+      .from(folders)
+      .where(predicate);
+
+    // A page of one and a total of one -- the hidden rows are absent from both, so the total
+    // cannot be differenced against a wider query to learn they exist.
+    expect(page.map((row) => row.id)).toEqual(['root']);
+    expect(Number(counted[0]!.value)).toBe(1);
+  });
+
+  it('applies the same boundary to files', async () => {
+    await tree(false);
+    await seedFile('leaf-file', 'leaf', 'internal');
+    await d1
+      .prepare('INSERT INTO file_folder_ancestors (file_id,ancestor_id,depth) VALUES (?,?,?)')
+      .bind('leaf-file', 'root', 0)
+      .run();
+    await d1
+      .prepare('INSERT INTO file_folder_ancestors (file_id,ancestor_id,depth) VALUES (?,?,?)')
+      .bind('leaf-file', 'mid', 1)
+      .run();
+    await seedAcl('folder', 'root', VIEWER);
+
+    const blocked = await visible('file', resourceVisibility('file', actor()));
+    expect(blocked.ids).toEqual([]);
+    expect(blocked.total).toBe(0);
+
+    // A grant on the boundary folder itself does reach it.
+    await seedAcl('folder', 'mid', VIEWER);
+    const reached = await visible('file', resourceVisibility('file', actor()));
+    expect(reached.ids).toEqual(['leaf-file']);
+  });
+});

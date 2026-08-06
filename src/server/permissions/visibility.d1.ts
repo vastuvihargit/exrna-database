@@ -197,18 +197,89 @@ export function directGrant(
   return aclExists(kind, columns.id, principalIds, sql`${resourcePermissions.deny} = 0`, nowIso);
 }
 
+function ancestorScope(kind: ResourceKind) {
+  return kind === 'folder'
+    ? { table: sql.raw('folder_ancestors'), child: sql.raw('folder_id') }
+    : { table: sql.raw('file_folder_ancestors'), child: sql.raw('file_id') };
+}
+
 /**
- * A live, non-deny entry on any ancestor folder the resource still inherits from.
+ * The depth of the nearest ancestor that switches inheritance off, or `-1` if none does.
  *
- * The ancestor set comes from `folder_ancestors` / `file_folder_ancestors`, which is why
- * Phase 2 made them tables. `inherit_permissions = 0` on the resource itself cuts the walk
- * off entirely, matching `canAccess` step 4.
+ * ── Why this exists ─────────────────────────────────────────────────────────────────────
  *
- * Note this does **not** stop at an intermediate ancestor that breaks inheritance. That
- * refinement belongs to the per-resource `canAccess` decision, which walks leaf → root with
- * the full chain; here it would mean a recursive CTE per row in a listing. The listing is
- * therefore *no narrower* than capability — a row may appear that `canAccess` later refuses,
- * which is the safe direction — and the design doc records it.
+ * `canAccess` walks leaf → root and **stops after** the first ancestor with
+ * `inheritPermissions = false`. That ancestor's own ACL still applies; nothing above it does.
+ * An earlier version of this module ignored the boundary in listings and left `canAccess` to
+ * refuse the row afterwards — which is exactly the leak the brief forbids, because by then the
+ * row has already been counted, paginated and had its name rendered.
+ *
+ * ── The design, and why this one ────────────────────────────────────────────────────────
+ *
+ * `folder_ancestors.depth` is documented as *"0 = the drive root, increasing towards the
+ * parent"*, so the nearest inheritance-breaking ancestor is simply the one with the **largest
+ * depth** among ancestors whose folder has `inherit_permissions = 0`. Ancestors at or below
+ * that depth are in scope; anything shallower is not.
+ *
+ * That turns the boundary into one scalar sub-select and a `depth >=` comparison — no
+ * recursive CTE, and no precomputed column that hierarchy mutations would have to maintain
+ * (and could leave stale, which would be a leak that no test on the mutation path would see).
+ * It is option 2 of the three the brief listed, chosen because it is the only one that is both
+ * correct and stateless.
+ *
+ * `COALESCE(..., -1)` is what makes "no boundary" mean "every ancestor", since depths start
+ * at 0.
+ *
+ * ── Cost ────────────────────────────────────────────────────────────────────────────────
+ *
+ * Two lookups per candidate row on `ix_folder_ancestors_ordered (folder_id, depth)`, over a
+ * chain whose length is the folder depth — single digits in this application. For files the
+ * equivalent index is `ux_file_folder_ancestors (file_id, ancestor_id)`, which covers the
+ * `file_id` lookup but not the `depth` ordering; a `(file_id, depth)` index would help if file
+ * listings ever became hot, and is recorded rather than added, since the chain is short.
+ */
+function boundaryDepth(kind: ResourceKind): SQL {
+  const columns = columnsFor(kind);
+  const { table, child } = ancestorScope(kind);
+  return sql`COALESCE((SELECT MAX(boundary.depth)
+                         FROM ${table} boundary
+                         JOIN folders boundary_folder ON boundary_folder.id = boundary.ancestor_id
+                        WHERE boundary.${child} = ${columns.id}
+                          AND boundary_folder.inherit_permissions = 0), -1)`;
+}
+
+/**
+ * A live ancestor entry of the requested polarity, considered only down to the inheritance
+ * boundary.
+ *
+ * `deny = 0` builds the inherited-allow branch, `deny = 1` the inherited-deny guard. Both must
+ * respect the same boundary: an ancestor above a broken boundary can neither grant nor deny.
+ */
+function boundedAncestorExists(
+  kind: ResourceKind,
+  principalIds: string[],
+  nowIso: string,
+  deny: 0 | 1,
+): SQL {
+  const columns = columnsFor(kind);
+  const { table, child } = ancestorScope(kind);
+
+  return sql`EXISTS (
+    SELECT 1 FROM ${table} anc
+      JOIN ${resourcePermissions} ON ${resourcePermissions.resourceType} = 'folder'
+                                 AND ${resourcePermissions.resourceId} = anc.ancestor_id
+     WHERE anc.${child} = ${columns.id}
+       AND ${inArray(resourcePermissions.principalId, principalIds)}
+       AND ${liveEntry(nowIso)}
+       AND ${resourcePermissions.deny} = ${deny}
+       AND anc.depth >= ${boundaryDepth(kind)})`;
+}
+
+/**
+ * A live, non-deny entry on an ancestor the resource still inherits from.
+ *
+ * `inherit_permissions = 0` on the resource itself cuts the walk off entirely (matching
+ * `canAccess`), and `boundaryDepth` cuts it off at the nearest ancestor that does the same.
  */
 export function inheritedGrant(
   kind: ResourceKind,
@@ -217,20 +288,10 @@ export function inheritedGrant(
 ): SQL | undefined {
   if (principalIds.length === 0) return undefined;
   const columns = columnsFor(kind);
-  const ancestorTable = kind === 'folder' ? sql.raw('folder_ancestors') : sql.raw('file_folder_ancestors');
-  const childColumn = kind === 'folder' ? sql.raw('folder_id') : sql.raw('file_id');
-
-  return sql`(${columns.inheritPermissions} = 1 AND EXISTS (
-    SELECT 1 FROM ${ancestorTable} anc
-      JOIN ${resourcePermissions} ON ${resourcePermissions.resourceType} = 'folder'
-                                 AND ${resourcePermissions.resourceId} = anc.ancestor_id
-     WHERE anc.${childColumn} = ${columns.id}
-       AND ${inArray(resourcePermissions.principalId, principalIds)}
-       AND ${liveEntry(nowIso)}
-       AND ${resourcePermissions.deny} = 0))`;
+  return sql`(${columns.inheritPermissions} = 1 AND ${boundedAncestorExists(kind, principalIds, nowIso, 0)})`;
 }
 
-/** A live denial on an inherited ancestor removes the row, exactly as a direct one does. */
+/** A live denial on an in-scope ancestor removes the row, exactly as a direct one does. */
 export function inheritedDenyGuard(
   kind: ResourceKind,
   principalIds: string[],
@@ -238,17 +299,7 @@ export function inheritedDenyGuard(
 ): SQL | undefined {
   if (principalIds.length === 0) return undefined;
   const columns = columnsFor(kind);
-  const ancestorTable = kind === 'folder' ? sql.raw('folder_ancestors') : sql.raw('file_folder_ancestors');
-  const childColumn = kind === 'folder' ? sql.raw('folder_id') : sql.raw('file_id');
-
-  return sql`NOT (${columns.inheritPermissions} = 1 AND EXISTS (
-    SELECT 1 FROM ${ancestorTable} anc
-      JOIN ${resourcePermissions} ON ${resourcePermissions.resourceType} = 'folder'
-                                 AND ${resourcePermissions.resourceId} = anc.ancestor_id
-     WHERE anc.${childColumn} = ${columns.id}
-       AND ${inArray(resourcePermissions.principalId, principalIds)}
-       AND ${liveEntry(nowIso)}
-       AND ${resourcePermissions.deny} = 1))`;
+  return sql`NOT (${columns.inheritPermissions} = 1 AND ${boundedAncestorExists(kind, principalIds, nowIso, 1)})`;
 }
 
 export function clearancePredicate(kind: ResourceKind, actor: Actor): SQL {
