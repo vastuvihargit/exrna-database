@@ -45,7 +45,7 @@ export function withAuthenticatedRoute<TParams = Record<string, string>>(
       // Origin check first: a same-site check is cheap and catches the common case
       // before the token comparison.
       assertSameOrigin(request);
-      assertCsrf(resolved.csrfTokenHash, request.headers.get(CSRF_HEADER) ?? undefined);
+      await assertCsrf(resolved.csrfTokenHash, request.headers.get(CSRF_HEADER) ?? undefined);
     }
 
     enforce(`api:user:${resolved.actor.userId}`, RATE_LIMITS.authenticated);

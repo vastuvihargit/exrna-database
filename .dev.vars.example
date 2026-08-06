@@ -1,0 +1,78 @@
+# Local secrets for `wrangler dev` / `npm run cf:preview`.
+#
+# Copy to `.dev.vars` and fill in. `.dev.vars` is git-ignored and must stay that way —
+# it holds the same secrets as the production secret store.
+#
+# Remote environments do NOT read this file. Set each value with:
+#   npx wrangler secret put <NAME> --env development|staging|production
+#
+# Plain, non-secret values (NODE_ENV, APP_NAME, LOG_LEVEL) live in wrangler.jsonc
+# under "vars" and are not repeated here.
+
+# ── Application secrets ───────────────────────────────────────────────────────────────
+# Both at least 32 characters, and different from each other in production.
+# Generate with:  node -e "console.log(crypto.randomBytes(32).toString('base64url'))"
+AUTH_SECRET=replace-me-with-at-least-32-characters
+SESSION_SECRET=replace-me-with-a-different-32-plus-characters
+
+APP_URL=http://localhost:8787
+
+# ── Company access ────────────────────────────────────────────────────────────────────
+# Comma-separated. Only these email domains may hold an account.
+COMPANY_EMAIL_DOMAINS=company.com
+
+# ── Google Shared Drive ───────────────────────────────────────────────────────────────
+# The Worker has no filesystem, so Drive is not optional here: without these the
+# application cannot read a single file. See docs/cloudflare-migration/00-phase-0-analysis.md
+# §0 Finding 1 for why the Drive storage cutover (Phase 1a) has to happen first.
+GOOGLE_SHARED_DRIVE_ID=
+GOOGLE_DRIVE_ROOT_FOLDER_ID=
+GOOGLE_WORKSPACE_DOMAIN=company.com
+
+GOOGLE_SERVICE_ACCOUNT_EMAIL=biotech-drive@your-project.iam.gserviceaccount.com
+
+# The full PEM, newlines escaped as \n, on one line. Take the "private_key" value straight
+# from the service account JSON, including the BEGIN/END lines.
+#
+# There is no file-based alternative in a Worker: `GOOGLE_DRIVE_SERVICE_ACCOUNT_PRIVATE_KEY_FILE`
+# reads from disk and the Worker has none. This is a secret, never a var.
+GOOGLE_SERVICE_ACCOUNT_PRIVATE_KEY="-----BEGIN PRIVATE KEY-----\n...\n-----END PRIVATE KEY-----\n"
+
+# ── Google sign-in (Node deployment only; removed at Phase 8) ─────────────────────────
+GOOGLE_CLIENT_ID=
+GOOGLE_CLIENT_SECRET=
+
+# ── Which database backs which module (Phase 3) ───────────────────────────────────────
+# Not secrets. Listed here because they are the switch that decides where reads and writes
+# go, and because the safe value is "absent".
+#
+# Unset (or anything other than the exact string "d1") means MongoDB — the database that
+# serves production today. Only an exact "d1" moves a module across, and each module moves
+# independently so any one of them can be reverted without touching the others.
+#
+# Reverting is deleting the variable. It takes effect on the next request; the flag is read
+# per call, not cached at startup.
+#
+# Migrated so far: users, departments (module 1); roles (module 2);
+# projects, experiments (module 3).
+#
+# `roles` and `users` are best moved together: user.service.ts decorates every user summary
+# with that user's grants, so a directory listing reads both on one request. Ids are preserved
+# across both databases, so a split works — but only for rows that exist in both, which is not
+# true until Phase 5 has loaded the data.
+# `projects` and `experiments` likewise: experiment listings are scoped to the set of project
+# ids the project repository returned, so a split means one database deciding visibility for
+# rows held in another.
+# DATA_SOURCE_USERS=d1
+# DATA_SOURCE_DEPARTMENTS=d1
+# DATA_SOURCE_ROLES=d1
+# DATA_SOURCE_PROJECTS=d1
+# DATA_SOURCE_EXPERIMENTS=d1
+
+# ── Cloudflare Access (Phase 8) ───────────────────────────────────────────────────────
+# Unused until Phase 8. CF_ACCESS_AUD is the Application Audience tag from the Access
+# application; CF_ACCESS_TEAM_DOMAIN is e.g. yourteam.cloudflareaccess.com. The Worker
+# verifies the Access JWT against these — it must never trust the
+# Cf-Access-Authenticated-User-Email header on its own.
+CF_ACCESS_TEAM_DOMAIN=
+CF_ACCESS_AUD=

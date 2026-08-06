@@ -5,7 +5,10 @@
  * 1 degree of parallelism. Memory cost is the parameter that actually resists GPU
  * cracking, so it is the one that must not be lowered casually.
  */
-import { hash, verify } from '@node-rs/argon2';
+// Imported through the `@/` alias, not as `./argon2-binding`. NormalModuleReplacementPlugin
+// matches the *request string* rather than the resolved path, so the specifier has to carry
+// the directories the pattern in next.config.ts looks for.
+import { hash, verify } from '@/server/auth/argon2-binding';
 
 /**
  * `algorithm` is left at the library default, which is Argon2id. Naming the enum

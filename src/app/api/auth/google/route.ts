@@ -21,7 +21,7 @@ export const OAUTH_NONCE_COOKIE = 'bd_oauth_nonce';
 export const GET = withRouteHandler(async () => {
   const env = getEnv();
   const hint = env.COMPANY_EMAIL_DOMAINS[0];
-  const start = beginGoogleLogin(hint);
+  const start = await beginGoogleLogin(hint);
 
   const response = NextResponse.redirect(start.authorizationUrl);
   const options = {

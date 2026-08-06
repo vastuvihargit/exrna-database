@@ -45,11 +45,13 @@ export async function issueSession(input: {
   const absoluteExpiresAt =
     input.absoluteExpiresAt ?? new Date(now + env.SESSION_ABSOLUTE_TIMEOUT_MINUTES * 60_000);
 
+  const [tokenHash, csrfTokenHash] = await Promise.all([hashToken(token), hashToken(csrfToken)]);
+
   const record = await sessionRepository.create({
     userId: input.userId,
     organizationId: input.organizationId,
-    tokenHash: hashToken(token),
-    csrfTokenHash: hashToken(csrfToken),
+    tokenHash,
+    csrfTokenHash,
     expiresAt: expiresAt < absoluteExpiresAt ? expiresAt : absoluteExpiresAt,
     absoluteExpiresAt,
     ip: input.meta.ip,
@@ -86,7 +88,7 @@ const TOUCH_INTERVAL_MS = 5 * 60_000;
 export async function resolveSession(token: string | undefined): Promise<ResolvedSession | null> {
   if (!token || token.length < 20 || token.length > 200) return null;
 
-  const session = await sessionRepository.findLiveByTokenHash(hashToken(token));
+  const session = await sessionRepository.findLiveByTokenHash(await hashToken(token));
   if (!session) return null;
 
   const user = await userRepository.findById(session.userId);
@@ -144,11 +146,14 @@ export async function resolveSession(token: string | undefined): Promise<Resolve
   return { actor, sessionId: session.id, csrfTokenHash: session.csrfTokenHash };
 }
 
-export function assertCsrf(expectedHash: string, presentedToken: string | undefined): void {
+export async function assertCsrf(
+  expectedHash: string,
+  presentedToken: string | undefined,
+): Promise<void> {
   if (!presentedToken) {
     throw new UnauthenticatedError('Missing CSRF token');
   }
-  if (!safeCompare(expectedHash, hashToken(presentedToken))) {
+  if (!safeCompare(expectedHash, await hashToken(presentedToken))) {
     throw new UnauthenticatedError('Invalid CSRF token');
   }
 }

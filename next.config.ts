@@ -74,15 +74,33 @@ const pageExtensions =
     ? BASE_PAGE_EXTENSIONS
     : ['dev.tsx', 'dev.ts', ...BASE_PAGE_EXTENSIONS];
 
+/**
+ * Which runtime this build targets.
+ *
+ * Set by `npm run cf:build` / `cf:preview` / `cf:deploy`. When it is off — every existing
+ * command, including `npm run build` and the Docker image — the configuration below is
+ * byte-for-byte what it was before the Cloudflare work started.
+ */
+const isCloudflareBuild = process.env.BUILD_TARGET === 'cloudflare';
+
 const nextConfig: NextConfig = {
-  // Required for the Docker runtime image: emits a self-contained server bundle.
-  output: 'standalone',
+  // `standalone` emits a self-contained Node server for the Docker runtime image. OpenNext
+  // produces its own Worker bundle instead and rejects this mode, so it is conditional
+  // rather than removed — the Docker deployment is still the production runtime until
+  // Phase 7 and must keep building exactly as it does today.
+  ...(isCloudflareBuild ? {} : { output: 'standalone' as const }),
   reactStrictMode: true,
   poweredByHeader: false,
   pageExtensions,
 
   // Mongoose must never be bundled into the client or edge runtime.
-  serverExternalPackages: ['mongoose', 'pino', 'pino-pretty'],
+  //
+  // On the Cloudflare build, pino and pino-pretty are dropped from this list on purpose:
+  // they are aliased to a Worker shim below, and an externalized module is one webpack
+  // never resolves, so the alias would never be consulted. Mongoose stays external in both.
+  serverExternalPackages: isCloudflareBuild
+    ? ['mongoose']
+    : ['mongoose', 'pino', 'pino-pretty'],
 
   eslint: {
     dirs: ['src', 'scripts', 'tests'],
@@ -102,6 +120,39 @@ const nextConfig: NextConfig = {
    * routes, no dev panel — or it is not.
    */
   webpack: (config, { webpack }) => {
+    /**
+     * Cloudflare build only: replace the three dependencies that cannot exist in a Worker.
+     *
+     * Each has a shim in `src/server/shims/` whose header explains why it exists and when it
+     * goes away. Neither is a silent fallback — the Argon2 one refuses with a message naming
+     * the cause, and the pino one reimplements the redaction list rather than dropping it.
+     *
+     * **Why replace a local module rather than alias the package.** Next.js
+     * auto-externalizes packages with native bindings (`@node-rs/argon2`) and pino. An
+     * externalized module is one webpack never resolves — it emits a bare `require()` and
+     * OpenNext's esbuild pass resolves it from `node_modules` instead, at which point the
+     * build dies on a `.node` binary. `resolve.alias` is therefore never consulted for
+     * either. `argon2-binding.ts` and `pino-binding.ts` are ordinary application source that
+     * webpack always resolves, so replacing *them* actually takes effect. This is the same
+     * technique the dev-switcher replacement below uses, for the same class of reason.
+     */
+    if (isCloudflareBuild) {
+      const replacements: Array<[RegExp, string]> = [
+        [
+          /[\\/]server[\\/]auth[\\/]argon2-binding$/,
+          path.resolve(__dirname, 'src/server/shims/argon2.worker.ts'),
+        ],
+        [
+          /[\\/]server[\\/]logging[\\/]pino-binding$/,
+          path.resolve(__dirname, 'src/server/shims/pino.worker.ts'),
+        ],
+      ];
+
+      for (const [pattern, replacement] of replacements) {
+        config.plugins.push(new webpack.NormalModuleReplacementPlugin(pattern, replacement));
+      }
+    }
+
     if (process.env.NODE_ENV === 'production') {
       // `resolve.alias` does not work for this: Next resolves the `@/*` tsconfig paths
       // through a resolve *plugin* that runs before webpack's alias stage, so an alias

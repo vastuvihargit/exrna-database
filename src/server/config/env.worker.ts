@@ -1,0 +1,217 @@
+/**
+ * Environment validation for the Cloudflare Worker runtime.
+ *
+ * `env.ts` is the Node deployment's contract and stays exactly as it is. This is the
+ * Worker's, and it differs in three ways that all follow from the runtime rather than from
+ * preference:
+ *
+ *   1. **No storage roots.** `LOCAL_STORAGE_ROOT` and its five siblings describe directories
+ *      on a disk. A Worker has no disk. Requiring them would mean inventing six paths that
+ *      can never be opened, and `assertRootsArePrivate()` — which exists to stop file storage
+ *      landing inside the publicly served directory — would be validating nothing.
+ *
+ *   2. **Google Drive is mandatory, not optional.** On Node, Drive is a flag-gated secondary
+ *      provider and `local` is the default. In a Worker there is no second option: if Drive
+ *      is not configured, no file can be read at all. So the checks that `env.ts` applies
+ *      only when `GOOGLE_DRIVE_STORAGE_ENABLED` is true are unconditional here.
+ *
+ *   3. **Bindings are validated, not just variables.** A missing `DB` binding is a
+ *      deployment error that should surface at boot with a sentence explaining it, not as
+ *      `undefined is not a function` inside a repository three requests later.
+ *
+ * The variable *names* are the ones the brief specifies (`GOOGLE_SERVICE_ACCOUNT_EMAIL`,
+ * `GOOGLE_SERVICE_ACCOUNT_PRIVATE_KEY`), and they are accepted alongside the longer
+ * `GOOGLE_DRIVE_*` names the Node deployment already uses, so one `.env` can feed both
+ * during the transition.
+ */
+import { z } from 'zod';
+/**
+ * Imported as types rather than pulled in globally. Adding `@cloudflare/workers-types` to
+ * `tsconfig.json`'s `types` array would redefine `fetch`, `Request` and `Response` for the
+ * whole project, including the 118 Next.js route handlers that are typed against the DOM
+ * lib — which produces hundreds of spurious errors and hides real ones.
+ */
+import type { D1Database, Queue } from '@cloudflare/workers-types';
+
+const bool = (defaultValue: boolean) =>
+  z
+    .enum(['true', 'false', '1', '0', ''])
+    .optional()
+    .transform((v) => (v === undefined || v === '' ? defaultValue : v === 'true' || v === '1'));
+
+const int = (defaultValue: number, min = 0, max = Number.MAX_SAFE_INTEGER) =>
+  z
+    .string()
+    .optional()
+    .transform((v) => (v === undefined || v === '' ? defaultValue : Number(v)))
+    .pipe(z.number().int().min(min).max(max));
+
+const domainList = z
+  .string()
+  .min(1, 'COMPANY_EMAIL_DOMAINS must list at least one domain')
+  .transform((v) =>
+    v
+      .split(',')
+      .map((d) => d.trim().toLowerCase())
+      .filter(Boolean),
+  )
+  .refine((list) => list.length > 0, 'COMPANY_EMAIL_DOMAINS must list at least one domain');
+
+const workerEnvSchema = z.object({
+  NODE_ENV: z.enum(['development', 'test', 'staging', 'production']).default('production'),
+  APP_URL: z.string().url().default('http://localhost:8787'),
+  APP_NAME: z.string().default('Biotech Research Drive'),
+  LOG_LEVEL: z
+    .enum(['fatal', 'error', 'warn', 'info', 'debug', 'trace', 'silent'])
+    .default('info'),
+
+  AUTH_SECRET: z.string().min(32, 'AUTH_SECRET must be at least 32 characters'),
+  SESSION_SECRET: z.string().min(32, 'SESSION_SECRET must be at least 32 characters'),
+
+  COMPANY_EMAIL_DOMAINS: domainList,
+
+  // Google Shared Drive — the only storage a Worker has.
+  GOOGLE_SHARED_DRIVE_ID: z.string().min(1, 'GOOGLE_SHARED_DRIVE_ID is required'),
+  GOOGLE_DRIVE_ROOT_FOLDER_ID: z.string().optional(),
+  GOOGLE_SERVICE_ACCOUNT_EMAIL: z.string().min(1, 'GOOGLE_SERVICE_ACCOUNT_EMAIL is required'),
+  GOOGLE_SERVICE_ACCOUNT_PRIVATE_KEY: z
+    .string()
+    .min(1, 'GOOGLE_SERVICE_ACCOUNT_PRIVATE_KEY is required'),
+  GOOGLE_WORKSPACE_DOMAIN: z.string().min(1, 'GOOGLE_WORKSPACE_DOMAIN is required'),
+
+  GOOGLE_CLIENT_ID: z.string().optional(),
+  GOOGLE_CLIENT_SECRET: z.string().optional(),
+
+  // Cloudflare Access. Optional until Phase 8 turns it on, then required in production.
+  CF_ACCESS_TEAM_DOMAIN: z.string().optional(),
+  CF_ACCESS_AUD: z.string().optional(),
+
+  MAX_UPLOAD_SIZE_MB: int(2048, 1, 1024 * 1024),
+  SESSION_IDLE_TIMEOUT_MINUTES: int(480, 5),
+  SESSION_ABSOLUTE_TIMEOUT_MINUTES: int(720, 5),
+  TRASH_RETENTION_DAYS: int(30, 1),
+
+  GOOGLE_DRIVE_UPLOAD_CHUNK_MB: int(16, 1, 512),
+  GOOGLE_DRIVE_MAX_CONCURRENT_TRANSFERS: int(4, 1, 32),
+  GOOGLE_DRIVE_REQUEST_TIMEOUT_MS: int(120_000, 1000, 900_000),
+  GOOGLE_DRIVE_NATIVE_EDITOR_ENABLED: bool(false),
+  DRIVE_SYNC_INTERVAL_MINUTES: int(15, 1, 1440),
+});
+
+export type RawWorkerEnv = z.infer<typeof workerEnvSchema>;
+
+const MB = 1024 ** 2;
+
+export interface WorkerEnv extends RawWorkerEnv {
+  isProduction: boolean;
+  isDevelopment: boolean;
+  isTest: boolean;
+  maxUploadBytes: number;
+  googleDriveUploadChunkBytes: number;
+  /** Always `google_drive` in a Worker. Present so shared code can read it uniformly. */
+  storageProvider: 'google_drive';
+}
+
+/**
+ * The bindings declared in `wrangler.jsonc`.
+ *
+ * `MIGRATION_WORKFLOW` is optional because it is not declared until Phase 5 — see the
+ * comment in `wrangler.jsonc` explaining why declaring it early breaks `wrangler dev`.
+ */
+export interface WorkerBindings {
+  DB: D1Database;
+  SYNC_QUEUE: Queue;
+  NOTIFICATION_QUEUE: Queue;
+  MIGRATION_WORKFLOW?: unknown;
+}
+
+const REQUIRED_BINDINGS = ['DB', 'SYNC_QUEUE', 'NOTIFICATION_QUEUE'] as const;
+
+export function assertBindings(source: Record<string, unknown>): WorkerBindings {
+  const missing = REQUIRED_BINDINGS.filter((name) => source[name] === undefined);
+
+  if (missing.length > 0) {
+    throw new Error(
+      `Missing Cloudflare bindings: ${missing.join(', ')}.\n\n` +
+        'These are declared in wrangler.jsonc. If this is a local run, check that you are ' +
+        'using `npm run cf:preview` rather than plain `wrangler dev`, and that the D1 ' +
+        'database has been created with `npx wrangler d1 create`.',
+    );
+  }
+
+  return source as unknown as WorkerBindings;
+}
+
+/**
+ * Accepts either the brief's variable names or the longer ones the Node deployment uses, so
+ * a single secret store can serve both runtimes while the two run side by side.
+ */
+function withAliases(source: Record<string, string | undefined>): Record<string, string | undefined> {
+  return {
+    ...source,
+    GOOGLE_SERVICE_ACCOUNT_EMAIL:
+      source.GOOGLE_SERVICE_ACCOUNT_EMAIL ?? source.GOOGLE_DRIVE_SERVICE_ACCOUNT_EMAIL,
+    GOOGLE_SERVICE_ACCOUNT_PRIVATE_KEY:
+      source.GOOGLE_SERVICE_ACCOUNT_PRIVATE_KEY ?? source.GOOGLE_DRIVE_SERVICE_ACCOUNT_PRIVATE_KEY,
+  };
+}
+
+let cached: WorkerEnv | null = null;
+
+export function loadWorkerEnv(source: Record<string, string | undefined>): WorkerEnv {
+  const parsed = workerEnvSchema.safeParse(withAliases(source));
+
+  if (!parsed.success) {
+    const issues = parsed.error.issues
+      .map((i) => `  • ${i.path.join('.') || '(root)'}: ${i.message}`)
+      .join('\n');
+    throw new Error(
+      `Invalid Worker environment configuration:\n${issues}\n\n` +
+        'Plain values go in wrangler.jsonc under "vars". Secrets go in .dev.vars locally, ' +
+        'and `npx wrangler secret put <NAME> --env <environment>` remotely. See ' +
+        '.dev.vars.example for the full list.',
+    );
+  }
+
+  const v = parsed.data;
+
+  if (v.SESSION_ABSOLUTE_TIMEOUT_MINUTES < v.SESSION_IDLE_TIMEOUT_MINUTES) {
+    throw new Error(
+      'Invalid Worker environment configuration:\n' +
+        '  • SESSION_ABSOLUTE_TIMEOUT_MINUTES: must be >= SESSION_IDLE_TIMEOUT_MINUTES',
+    );
+  }
+
+  if (v.NODE_ENV === 'production' && v.APP_URL.startsWith('http://')) {
+    throw new Error(
+      'Invalid Worker environment configuration:\n' +
+        '  • APP_URL: must use https:// in production',
+    );
+  }
+
+  if (v.NODE_ENV === 'production' && v.AUTH_SECRET === v.SESSION_SECRET) {
+    throw new Error(
+      'Invalid Worker environment configuration:\n' +
+        '  • SESSION_SECRET: AUTH_SECRET and SESSION_SECRET must differ in production',
+    );
+  }
+
+  return {
+    ...v,
+    isProduction: v.NODE_ENV === 'production',
+    isDevelopment: v.NODE_ENV === 'development',
+    isTest: v.NODE_ENV === 'test',
+    maxUploadBytes: v.MAX_UPLOAD_SIZE_MB * MB,
+    googleDriveUploadChunkBytes: v.GOOGLE_DRIVE_UPLOAD_CHUNK_MB * MB,
+    storageProvider: 'google_drive',
+  };
+}
+
+export function getWorkerEnv(source: Record<string, string | undefined>): WorkerEnv {
+  cached ??= loadWorkerEnv(source);
+  return cached;
+}
+
+export function resetWorkerEnvCache(): void {
+  cached = null;
+}

@@ -5,7 +5,6 @@
  * error mapping are automatic rather than remembered. A handler that throws can never
  * leak a stack trace or an internal message to the client.
  */
-import { randomUUID } from 'crypto';
 import type { NextRequest } from 'next/server';
 import { requestLogger } from '@/server/logging/logger';
 import { toErrorResponse } from './api-response';
@@ -24,7 +23,8 @@ const REQUEST_ID_HEADER = 'x-request-id';
 export function buildRequestContext(request: NextRequest): RequestContext {
   const headerId = request.headers.get(REQUEST_ID_HEADER);
   // Only accept an upstream id that looks like one — it ends up in audit logs.
-  const requestId = headerId && /^[A-Za-z0-9-]{8,64}$/.test(headerId) ? headerId : randomUUID();
+  const requestId =
+    headerId && /^[A-Za-z0-9-]{8,64}$/.test(headerId) ? headerId : crypto.randomUUID();
 
   const forwardedFor = request.headers.get('x-forwarded-for');
   const ip =

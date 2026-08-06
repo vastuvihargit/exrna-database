@@ -21,7 +21,7 @@
  * mid-run picks up exactly where it stopped: the item status transition is an atomic
  * claim, and a re-scan updates rows rather than re-importing them.
  */
-import { randomUUID } from 'crypto';
+
 
 import { getEnv } from '@/server/config/env';
 import { withTransaction } from '@/server/db/connection';
@@ -269,7 +269,7 @@ export async function beginConnect(actor: Actor, jobId: string): Promise<Connect
     );
   }
 
-  const nonce = randomUUID();
+  const nonce = crypto.randomUUID();
   const state = `${job.id}:${nonce}`;
   return { authorizationUrl: buildConsentUrl({ state }), state };
 }
@@ -286,7 +286,7 @@ export async function completeConnect(
   const updated = await migrationRepository.updateJob(job.id, {
     $set: {
       // Encrypted, not hashed: a resumed migration has to present this value to Google.
-      'connection.refreshTokenCipher': sealSecret(grant.refreshToken),
+      'connection.refreshTokenCipher': await sealSecret(grant.refreshToken),
       'connection.accountEmail': grant.accountEmail,
       'connection.scope': grant.scope,
       'connection.connectedAt': new Date(),
@@ -313,7 +313,7 @@ export async function completeConnect(
 /** Builds the live reader for a job, or explains why it cannot. */
 async function readerFor(jobId: string): Promise<DriveReader> {
   const cipher = await migrationRepository.getRefreshTokenCipher(jobId);
-  const refreshToken = openSecret(cipher);
+  const refreshToken = await openSecret(cipher);
   if (!refreshToken) {
     throw new ConflictError('This migration is not connected to a Google account');
   }

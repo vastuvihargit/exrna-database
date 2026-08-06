@@ -1,0 +1,165 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "biotech-research-drive",
+  "main": ".open-next/worker.js",
+  "compatibility_date": "2026-07-01",
+
+  // `nodejs_compat` gives workerd the Node built-ins this codebase still leans on
+  // (`node:stream` in the Drive client, `node:buffer` in a few DTO paths). It does **not**
+  // give it a filesystem, a raw TCP socket or a native addon — see
+  // docs/cloudflare-migration/00-phase-0-analysis.md §4 for what remains genuinely absent.
+  //
+  // `nodejs_compat_populate_process_env` makes plain-text vars readable as `process.env.X`,
+  // which is what lets `src/server/config/env.ts` keep working unchanged in both runtimes.
+  "compatibility_flags": ["nodejs_compat", "nodejs_compat_populate_process_env"],
+
+  "assets": {
+    "directory": ".open-next/assets",
+    "binding": "ASSETS"
+  },
+
+  // Workers Logs. Without this, a Worker that throws in production tells you nothing, and
+  // the pino redaction list this application relies on would be protecting a log nobody reads.
+  "observability": {
+    "enabled": true,
+    "head_sampling_rate": 1
+  },
+
+  "vars": {
+    "NODE_ENV": "production",
+    "APP_NAME": "Biotech Research Drive",
+    "LOG_LEVEL": "info"
+  },
+
+  // ── Bindings ────────────────────────────────────────────────────────────────────────
+  //
+  // Declared now so every environment is shaped identically from Phase 1 onward, even
+  // though nothing reads them until Phase 3 (DB) and Phase 4 (queues).
+  //
+  // `database_id` values are placeholders. Create the real databases with
+  //   npx wrangler d1 create biotech-drive-dev
+  // and paste the returned id here. `wrangler dev` ignores the id and uses a local SQLite
+  // file, so development works before any remote database exists.
+
+  "d1_databases": [
+    {
+      "binding": "DB",
+      "database_name": "biotech-drive-dev",
+      "database_id": "00000000-0000-0000-0000-000000000000",
+      "migrations_dir": "drizzle/migrations"
+    }
+  ],
+
+  "queues": {
+    "producers": [
+      { "binding": "SYNC_QUEUE", "queue": "biotech-drive-sync-dev" },
+      { "binding": "NOTIFICATION_QUEUE", "queue": "biotech-drive-notifications-dev" }
+    ]
+    // Consumers, dead-letter queues and retry policy arrive in Phase 4 together with the
+    // handlers that service them. A consumer declared without a handler is a queue that
+    // silently swallows messages.
+  },
+
+  // MIGRATION_WORKFLOW is deliberately absent until Phase 5.
+  //
+  // A `workflows` binding requires the Worker entrypoint to export the workflow class, and
+  // the OpenNext-generated entrypoint exports only the Next.js handler. Declaring the
+  // binding now would make `wrangler dev` and every deploy fail with a missing-export error.
+  // Phase 5 adds the class and this block together:
+  //
+  // "workflows": [
+  //   {
+  //     "binding": "MIGRATION_WORKFLOW",
+  //     "name": "biotech-drive-migration",
+  //     "class_name": "MongoToD1MigrationWorkflow"
+  //   }
+  // ],
+
+  "env": {
+    "development": {
+      "vars": {
+        "NODE_ENV": "development",
+        "APP_NAME": "Biotech Research Drive",
+        "LOG_LEVEL": "debug"
+      },
+      "observability": { "enabled": true, "head_sampling_rate": 1 },
+      "d1_databases": [
+        {
+          "binding": "DB",
+          "database_name": "biotech-drive-dev",
+          "database_id": "00000000-0000-0000-0000-000000000000",
+          "migrations_dir": "drizzle/migrations"
+        }
+      ],
+      "queues": {
+        "producers": [
+          { "binding": "SYNC_QUEUE", "queue": "biotech-drive-sync-dev" },
+          { "binding": "NOTIFICATION_QUEUE", "queue": "biotech-drive-notifications-dev" }
+        ]
+      }
+    },
+
+    "staging": {
+      "vars": {
+        "NODE_ENV": "staging",
+        "APP_NAME": "Biotech Research Drive (Staging)",
+        "LOG_LEVEL": "debug"
+      },
+      "observability": { "enabled": true, "head_sampling_rate": 1 },
+      "d1_databases": [
+        {
+          "binding": "DB",
+          "database_name": "biotech-drive-staging",
+          "database_id": "00000000-0000-0000-0000-000000000000",
+          "migrations_dir": "drizzle/migrations"
+        }
+      ],
+      "queues": {
+        "producers": [
+          { "binding": "SYNC_QUEUE", "queue": "biotech-drive-sync-staging" },
+          { "binding": "NOTIFICATION_QUEUE", "queue": "biotech-drive-notifications-staging" }
+        ]
+      }
+    },
+
+    "production": {
+      "vars": {
+        "NODE_ENV": "production",
+        "APP_NAME": "Biotech Research Drive",
+        "LOG_LEVEL": "info"
+      },
+      // Sampled rather than 1.0: production traffic is higher and the interesting events
+      // (errors, denials) are logged explicitly by the application, not inferred from traces.
+      "observability": { "enabled": true, "head_sampling_rate": 0.2 },
+      "d1_databases": [
+        {
+          "binding": "DB",
+          "database_name": "biotech-drive-production",
+          "database_id": "00000000-0000-0000-0000-000000000000",
+          "migrations_dir": "drizzle/migrations"
+        }
+      ],
+      "queues": {
+        "producers": [
+          { "binding": "SYNC_QUEUE", "queue": "biotech-drive-sync-production" },
+          { "binding": "NOTIFICATION_QUEUE", "queue": "biotech-drive-notifications-production" }
+        ]
+      }
+    }
+  }
+
+  // ── Secrets ─────────────────────────────────────────────────────────────────────────
+  //
+  // Never in this file. Set with `npx wrangler secret put <NAME> --env <environment>`:
+  //
+  //   AUTH_SECRET
+  //   SESSION_SECRET
+  //   GOOGLE_CLIENT_ID
+  //   GOOGLE_CLIENT_SECRET
+  //   GOOGLE_SERVICE_ACCOUNT_EMAIL
+  //   GOOGLE_SERVICE_ACCOUNT_PRIVATE_KEY
+  //   GOOGLE_SHARED_DRIVE_ID
+  //   GOOGLE_WORKSPACE_DOMAIN
+  //
+  // Locally they come from `.dev.vars`, which is git-ignored. See `.dev.vars.example`.
+}

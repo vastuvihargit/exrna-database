@@ -4,7 +4,8 @@
  * Redaction is not optional here: physical storage paths, session tokens and password
  * hashes must never be written to a log that gets shipped off the host.
  */
-import pino, { type Logger } from 'pino';
+// Imported through the `@/` alias — see the note in `password.ts`.
+import pino, { type Logger } from '@/server/logging/pino-binding';
 import { getEnv } from '@/server/config/env';
 
 const REDACTED_PATHS = [

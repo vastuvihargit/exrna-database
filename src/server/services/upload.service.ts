@@ -10,7 +10,7 @@
  * rather than what the client claimed, and the metadata is written only once the bytes
  * are safely in place. A failure at any step leaves no half-file and no orphan record.
  */
-import { createHash, randomUUID } from 'crypto';
+import { createHash } from 'crypto';
 import { Readable } from 'stream';
 
 import { getEnv } from '@/server/config/env';
@@ -316,7 +316,7 @@ export async function finalize(
     return describeExistingResult(existing.resultFileId, existing.resultVersionId);
   }
 
-  const claimed = await sessionRepository.claimForFinalization(sessionId, randomUUID());
+  const claimed = await sessionRepository.claimForFinalization(sessionId, crypto.randomUUID());
   if (!claimed) {
     const current = await sessionRepository.findById(sessionId);
     if (current?.status === 'ready' && current.resultFileId && current.resultVersionId) {

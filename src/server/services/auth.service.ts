@@ -375,7 +375,7 @@ export async function requestPasswordReset(
   const token = generateToken();
   await PasswordResetTokenModel.create({
     userId: new Types.ObjectId(user.id),
-    tokenHash: hashToken(token),
+    tokenHash: await hashToken(token),
     expiresAt: new Date(Date.now() + PASSWORD_RESET_TTL_MS),
     requestedIp: meta.ip,
   });
@@ -404,7 +404,7 @@ export async function completePasswordReset(
   await connectToDatabase();
 
   const record = await PasswordResetTokenModel.findOne({
-    tokenHash: hashToken(input.token),
+    tokenHash: await hashToken(input.token),
     usedAt: null,
     expiresAt: { $gt: new Date() },
   }).exec();

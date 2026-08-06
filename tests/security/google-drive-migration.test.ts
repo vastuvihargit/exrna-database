@@ -132,7 +132,7 @@ async function migrationInto(name: string) {
   const { sealSecret } = await import('@/server/auth/secret-box');
   await migrationRepository.updateJob(job.id, {
     $set: {
-      'connection.refreshTokenCipher': sealSecret('test-refresh-token'),
+      'connection.refreshTokenCipher': await sealSecret('test-refresh-token'),
       'connection.accountEmail': 'archive@company.com',
       status: 'connected',
     },
@@ -515,9 +515,9 @@ describe('the sealed-secret box', () => {
   it('round-trips a value and refuses a tampered one', async () => {
     const { sealSecret, openSecret } = await import('@/server/auth/secret-box');
 
-    const sealed = sealSecret('1//refresh-token-value');
+    const sealed = await sealSecret('1//refresh-token-value');
     expect(sealed).not.toContain('refresh-token-value');
-    expect(openSecret(sealed)).toBe('1//refresh-token-value');
+    expect(await openSecret(sealed)).toBe('1//refresh-token-value');
 
     // Flip a bit in the ciphertext: GCM's tag makes that a decryption failure, not a
     // subtly different plaintext. Flipped at the byte level rather than in the base64
@@ -528,8 +528,8 @@ describe('the sealed-secret box', () => {
     body[0] = body[0]! ^ 0xff;
     const tampered = [parts[0], parts[1], parts[2], body.toString('base64url')].join('.');
 
-    expect(openSecret(tampered)).toBeNull();
-    expect(openSecret('not-a-sealed-value')).toBeNull();
-    expect(openSecret(null)).toBeNull();
+    expect(await openSecret(tampered)).toBeNull();
+    expect(await openSecret('not-a-sealed-value')).toBeNull();
+    expect(await openSecret(null)).toBeNull();
   });
 });
