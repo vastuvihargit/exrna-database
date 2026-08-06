@@ -22,6 +22,13 @@
       "when": 1785996132007,
       "tag": "0002_fix_user_roles_active_uniqueness",
       "breakpoints": true
+    },
+    {
+      "idx": 3,
+      "version": "6",
+      "when": 1785996132008,
+      "tag": "0003_user_roles_scope_invariant",
+      "breakpoints": true
     }
   ]
 }
