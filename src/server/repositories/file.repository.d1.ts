@@ -136,6 +136,20 @@ import type {
 
 type FileRow = typeof files.$inferSelect;
 
+/**
+ * One folder in a moved subtree, and the ancestor chain its files will have afterwards.
+ *
+ * The unit of exchange between planning and statement building: whoever knows the new shape of
+ * the folder tree produces these, and the file statements are built from them without going
+ * back to the database. That is what lets the atomic move plan the file half *before* the
+ * folder half has been executed.
+ */
+export interface FolderChain {
+  folderId: string;
+  /** Ordered root → the folder itself, which is always the last element. */
+  chain: string[];
+}
+
 /** Mongo's implicit cap on `takenNamesInFolder`. Reproduced rather than removed. */
 const TAKEN_NAMES_LIMIT = 5000;
 
@@ -1623,17 +1637,33 @@ export async function reparentSubtree(
   const db = await getD1();
   const now = nowIso();
 
-  // Every live file in the subtree, identified through `files` and `folder_ancestors` only —
-  // never through the table about to be rewritten.
-  const affected = await db
-    .selectDistinct({ id: files.id, folderId: files.folderId })
+  const plan = await planFileReparent(db, input);
+  if (plan.length === 0) return;
+
+  await withBatch(db, buildFileReparentStatements(db, { ...input, folderChains: plan, now }));
+}
+
+/**
+ * Which folders in the subtree hold files, and what each one's chain will be afterwards.
+ *
+ * Read from `folder_ancestors`, which by the time a standalone `reparentSubtree` runs has
+ * already been rewritten by the folder move. The atomic unit of work cannot read it — the
+ * folder statements are in the same unexecuted batch — so it computes the identical structure
+ * in memory and hands it to the same builder. That is the whole reason this is a separate
+ * function from the builder below.
+ */
+export async function planFileReparent(
+  db: Database,
+  input: ReparentSubtreeInput,
+): Promise<FolderChain[]> {
+  const folderRows = await db
+    .selectDistinct({ folderId: files.folderId })
     .from(files)
     .where(and(underFolder(input.folderId), live()));
-  if (affected.length === 0) return;
+  if (folderRows.length === 0) return [];
 
-  // Each containing folder's own chain, which the move has already rewritten.
-  const folderIds = [...new Set(affected.map((row) => row.folderId))];
-  const folderChainRows = await db
+  const folderIds = folderRows.map((row) => row.folderId);
+  const chainRows = await db
     .select({
       folderId: folderAncestors.folderId,
       ancestorId: folderAncestors.ancestorId,
@@ -1643,12 +1673,62 @@ export async function reparentSubtree(
     .where(inArray(folderAncestors.folderId, folderIds))
     .orderBy(asc(folderAncestors.folderId), asc(folderAncestors.depth));
 
-  const folderChains = new Map<string, string[]>();
-  for (const row of folderChainRows) {
-    const chain = folderChains.get(row.folderId);
+  const existing = new Map<string, string[]>();
+  for (const row of chainRows) {
+    const chain = existing.get(row.folderId);
     if (chain) chain.push(row.ancestorId);
-    else folderChains.set(row.folderId, [row.ancestorId]);
+    else existing.set(row.folderId, [row.ancestorId]);
   }
+
+  return folderIds.map((folderId) => {
+    // A file directly in the moved folder gets the caller's chain verbatim. One deeper keeps
+    // everything from the moved folder down — unchanged by a move — re-based onto the new
+    // prefix.
+    if (folderId === input.folderId) {
+      return { folderId, chain: [...input.newPathAncestorsForFolder, input.folderId] };
+    }
+    const folderChain = existing.get(folderId) ?? [];
+    const cut = folderChain.indexOf(input.folderId);
+    const below = cut === -1 ? [] : folderChain.slice(cut + 1);
+    return {
+      folderId,
+      chain: [...input.newPathAncestorsForFolder, input.folderId, ...below, folderId],
+    };
+  });
+}
+
+/**
+ * The statements that re-point every file in a moved subtree — built, not executed.
+ *
+ * ── Why this is per *folder* and not per file ───────────────────────────────────────────
+ *
+ * Every file in one folder ends up with the same ancestor chain, so the rebuild is expressed
+ * as `INSERT ... SELECT id FROM files WHERE folder_id = ?` — one statement per (folder, depth)
+ * pair rather than one per (file, ancestor) pair. The earlier implementation emitted the
+ * latter, which made the batch grow with the number of *files*: a folder holding ten thousand
+ * files could not be moved atomically at all.
+ *
+ * The count is now `2 + Σ chain lengths ≈ 2 + folders × depth`, and **the number of files does
+ * not appear in it**. A folder with one file and a folder with a million cost the same.
+ *
+ * This is safe because `files.folder_id` is not touched by a move — only the ancestor rows
+ * are — so `WHERE folder_id = ?` selects the same set before and after, and reads nothing this
+ * batch rewrites.
+ *
+ * `guard`, when supplied, is the folder half's concurrency token. Every statement carries it so
+ * that a stale plan applies nothing on either side. Without it (the standalone path) the folder
+ * move has already committed and there is nothing left to be consistent with.
+ */
+export function buildFileReparentStatements(
+  db: Database,
+  input: ReparentSubtreeInput & { folderChains: FolderChain[]; now: string; guard?: SQL },
+): BatchItem<'sqlite'>[] {
+  const { folderChains, guard, now } = input;
+  if (folderChains.length === 0) return [];
+
+  const folderIds = folderChains.map((entry) => entry.folderId);
+  const inSubtree = inArray(files.folderId, folderIds);
+  const scope = guard ? and(inSubtree, live(), guard)! : and(inSubtree, live())!;
 
   const statements: BatchItem<'sqlite'>[] = [
     db
@@ -1659,33 +1739,30 @@ export async function reparentSubtree(
         projectId: input.projectId,
         updatedAt: now,
       })
-      .where(and(underFolder(input.folderId), live())),
-    db.delete(fileFolderAncestors).where(
-      inArray(
-        fileFolderAncestors.fileId,
-        affected.map((row) => row.id),
+      .where(scope),
+
+    db
+      .delete(fileFolderAncestors)
+      .where(
+        sql`${fileFolderAncestors.fileId} IN (SELECT f.id FROM ${files} f
+              WHERE ${inArray(sql`f.folder_id`, folderIds)} AND f.deleted_at IS NULL)
+            ${guard ? sql` AND ${guard}` : sql``}`,
       ),
-    ),
   ];
 
-  for (const row of affected) {
-    // A file directly in the moved folder gets the caller's chain verbatim. One deeper keeps
-    // everything from the moved folder down — that part is unchanged by a move — re-based onto
-    // the new prefix. Taking the suffix from `folder_ancestors` rather than shifting depths in
-    // `file_folder_ancestors` is what avoids reading the table being written.
-    let chain: string[];
-    if (row.folderId === input.folderId) {
-      chain = [...input.newPathAncestorsForFolder, input.folderId];
-    } else {
-      const folderChain = folderChains.get(row.folderId) ?? [];
-      const cut = folderChain.indexOf(input.folderId);
-      const below = cut === -1 ? [] : folderChain.slice(cut + 1);
-      chain = [...input.newPathAncestorsForFolder, input.folderId, ...below, row.folderId];
-    }
-    statements.push(...ancestorStatements(db, row.id, chain));
+  for (const { folderId, chain } of folderChains) {
+    chain.forEach((ancestorId, depth) => {
+      statements.push(
+        db.insert(fileFolderAncestors).select(
+          sql`select f.id, ${ancestorId}, ${depth} from ${files} f
+               where f.folder_id = ${folderId} and f.deleted_at is null
+               ${guard ? sql` and ${guard}` : sql``}`,
+        ),
+      );
+    });
   }
 
-  await withBatch(db, statements);
+  return statements;
 }
 
 export async function setSubtreeStatus(

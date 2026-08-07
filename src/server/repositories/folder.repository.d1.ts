@@ -817,16 +817,20 @@ export async function adjustChildFolderCount(folderId: string, delta: number): P
  * a marker row that survives every step (its `depth` shifts; the row itself is never deleted),
  * so the set stays stable as the table is rewritten underneath it.
  */
-export async function moveSubtree(input: MoveSubtreeInput): Promise<void> {
-  const db = await getD1();
-
-  /**
-   * The structural refusals, restated here rather than trusted to the caller.
-   *
-   * `folder.service.ts` checks all three before it gets this far, and it should — it can
-   * produce a better message. But a circular move corrupts the closure table in a way that no
-   * later read reports as an error, so the last layer that can still refuse does.
-   */
+/**
+ * The structural refusals, restated here rather than trusted to the caller.
+ *
+ * `folder.service.ts` checks all of these before it gets this far, and it should — it can
+ * produce a better message. But a circular move corrupts the closure table in a way that no
+ * later read reports as an error, so the last layer that can still refuse does.
+ *
+ * Shared by `moveSubtree` and by the atomic folder+file unit of work, so a move composed with
+ * files cannot skip a check a folder-only move applies.
+ */
+export async function assertMoveIsStructurallyLegal(
+  db: Database,
+  input: Pick<MoveSubtreeInput, 'folderId' | 'newParentId' | 'newPathAncestors'>,
+): Promise<void> {
   if (input.newParentId === input.folderId || input.newPathAncestors.includes(input.folderId)) {
     throw new ConflictError('A folder cannot be moved into itself or one of its own subfolders');
   }
@@ -847,125 +851,242 @@ export async function moveSubtree(input: MoveSubtreeInput): Promise<void> {
   if (source.organizationId !== target.organizationId) {
     throw new ConflictError('A folder cannot be moved into another organization');
   }
+}
+
+/**
+ * Everything the move statements need that only a read can supply.
+ *
+ * Computed once, before any statement is built, and carried through unchanged — `stamp` is
+ * what every statement is guarded on, so a plan and the statements built from it describe one
+ * consistent moment.
+ */
+export interface FolderMovePlan {
+  oldDepth: number;
+  newDepth: number;
+  shift: number;
+  /** `folders.updated_at` for the moved folder at planning time. The concurrency token. */
+  stamp: string;
+  now: string;
+}
+
+export async function planFolderMove(
+  db: Database,
+  folderId: string,
+  newPathAncestors: string[],
+): Promise<FolderMovePlan> {
+  const [current] = await db
+    .select({ depth: folders.depth, updatedAt: folders.updatedAt })
+    .from(folders)
+    .where(eq(folders.id, folderId))
+    .limit(1);
+  if (!current) throw new ConflictError('The folder being moved no longer exists');
+
+  const newDepth = newPathAncestors.length;
+  return {
+    oldDepth: current.depth,
+    newDepth,
+    shift: newDepth - current.depth,
+    stamp: current.updatedAt,
+    now: nowIso(),
+  };
+}
+
+/**
+ * "Nothing has touched the moved folder since the plan was computed."
+ *
+ * Exported because the *file* half of an atomic move must carry the identical guard — a file
+ * statement that applied while the folder statements did not would be precisely the split this
+ * design exists to prevent.
+ */
+export function moveGuard(folderId: string, stamp: string): SQL {
+  return sql`(SELECT f.updated_at FROM ${folders} f WHERE f.id = ${folderId}) = ${stamp}`;
+}
+
+/**
+ * The statements that move a folder subtree — built, not executed.
+ *
+ * ── The concurrency shape ───────────────────────────────────────────────────────────────
+ *
+ * The statements need values only a prior read can supply — the folder's current depth, and
+ * therefore the shift every descendant's ancestor rows need. D1 fixes a batch before it runs,
+ * so those values are inevitably read *outside* the transaction that uses them, and a
+ * concurrent move or rename in between would make them wrong. Applying half a shift to a
+ * closure table does not fail loudly; it produces a tree that is quietly in the wrong shape.
+ *
+ * So every statement carries the same guard, and the moved folder's own row is updated
+ * **last** — the caller must keep it last — so the guard holds for every earlier statement and
+ * is invalidated by the final one. Either the state is untouched and every statement applies to
+ * exactly what was read, or something moved first and every statement matches nothing. There is
+ * no partial outcome to clean up.
+ *
+ * ── The statements ──────────────────────────────────────────────────────────────────────
+ *
+ * Descendants are identified throughout by `folder_ancestors.ancestor_id = <moved folder>`, a
+ * marker row that survives every step (its `depth` shifts; the row itself is never deleted), so
+ * the set stays stable as the table is rewritten underneath it.
+ *
+ * Count is `6 + 2 × newDepth` — **independent of how large the subtree is**, because every
+ * statement is set-wise. `MAX_FOLDER_DEPTH` therefore bounds this half at 70 statements.
+ */
+export function buildFolderMoveStatements(
+  db: Database,
+  input: MoveSubtreeInput,
+  plan: FolderMovePlan,
+): BatchItem<'sqlite'>[] {
+  // `newDepth` belongs to the commit statement, not to these — it is applied to the moved
+  // folder's own row by `buildFolderMoveCommitStatement`.
+  const { oldDepth, shift, stamp, now } = plan;
+  const unchanged = moveGuard(input.folderId, stamp);
+  const descendants = sql`(SELECT a.folder_id FROM ${folderAncestors} a WHERE a.ancestor_id = ${input.folderId})`;
+
+  const statements: BatchItem<'sqlite'>[] = [
+    // 1. The descendants' own rows: everything that follows the moved folder rather than
+    //    describing it. `owner_id` deliberately stays put, matching the Mongo pipeline.
+    db
+      .update(folders)
+      .set({
+        depth: sql`${folders.depth} + ${shift}`,
+        driveType: input.driveType,
+        departmentId: input.departmentId,
+        projectId: input.projectId,
+        updatedAt: now,
+      })
+      .where(and(sql`${folders.id} IN ${descendants}`, unchanged)),
+
+    // 2. The moved folder's *old* ancestors drop out of every descendant's chain. Rows at
+    //    `depth >= oldDepth` are the moved folder itself and what lies between, and they stay
+    //    — which is also what keeps the `descendants` sub-select above stable as this runs.
+    db
+      .delete(folderAncestors)
+      .where(
+        and(
+          sql`${folderAncestors.folderId} IN ${descendants}`,
+          lt(folderAncestors.depth, oldDepth),
+          unchanged,
+        ),
+      ),
+
+    // 3. What remains keeps its relative order, shifted to the new depth.
+    db
+      .update(folderAncestors)
+      .set({ depth: sql`${folderAncestors.depth} + ${shift}` })
+      .where(and(sql`${folderAncestors.folderId} IN ${descendants}`, unchanged)),
+  ];
+
+  // 4. The destination's chain is prepended to every descendant. One statement per new
+  //    ancestor, each inserting exactly one row per descendant.
+  input.newPathAncestors.forEach((ancestorId, index) => {
+    statements.push(
+      db
+        .insert(folderAncestors)
+        .select(
+          sql`select a.folder_id, ${ancestorId}, ${index}
+                from ${folderAncestors} a
+               where a.ancestor_id = ${input.folderId} and ${unchanged}`,
+        ),
+    );
+  });
+
+  // 5–6. The moved folder's own chain is replaced outright — it is short and known.
+  statements.push(
+    db.delete(folderAncestors).where(and(eq(folderAncestors.folderId, input.folderId), unchanged)),
+  );
+  input.newPathAncestors.forEach((ancestorId, index) => {
+    statements.push(
+      db
+        .insert(folderAncestors)
+        .select(sql`select ${input.folderId}, ${ancestorId}, ${index} where ${unchanged}`),
+    );
+  });
+
+  return statements;
+}
+
+/**
+ * The moved folder's own row — the statement that invalidates the guard.
+ *
+ * Separate from `buildFolderMoveStatements` so a composed batch can put the file statements
+ * *before* it. Everything guarded must run while the stamp still matches; this is what stops
+ * matching.
+ */
+export function buildFolderMoveCommitStatement(
+  db: Database,
+  input: MoveSubtreeInput,
+  plan: FolderMovePlan,
+): BatchItem<'sqlite'> {
+  return db
+    .update(folders)
+    .set({
+      parentFolderId: input.newParentId,
+      depth: plan.newDepth,
+      driveType: input.driveType,
+      departmentId: input.departmentId,
+      projectId: input.projectId,
+      ownerId: input.ownerId,
+      updatedBy: input.updatedBy,
+      updatedAt: plan.now,
+    })
+    .where(and(eq(folders.id, input.folderId), eq(folders.updatedAt, plan.stamp)));
+}
+
+/** The child-count adjustments, as statements, so they join the move's batch. */
+export function buildChildFolderCountStatement(
+  db: Database,
+  folderId: string,
+  delta: number,
+): BatchItem<'sqlite'> {
+  return db
+    .update(folders)
+    .set({ childFolderCount: sql`${folders.childFolderCount} + ${delta}` })
+    .where(eq(folders.id, folderId));
+}
+
+/** Did the move actually apply? A no-op means the guard failed and the caller should retry. */
+export async function moveDidApply(
+  db: Database,
+  input: MoveSubtreeInput,
+  plan: FolderMovePlan,
+): Promise<boolean> {
+  const [after] = await db
+    .select({ parentFolderId: folders.parentFolderId, depth: folders.depth })
+    .from(folders)
+    .where(eq(folders.id, input.folderId))
+    .limit(1);
+  return after?.parentFolderId === input.newParentId && after.depth === plan.newDepth;
+}
+
+export const MOVE_CONTENTION_MESSAGE =
+  'This folder could not be moved because it kept changing underneath the move. ' +
+  'This usually means two people moved or renamed it at the same time.';
+
+/**
+ * Re-parents a whole subtree atomically — folders only.
+ *
+ * Still the right entry point when nothing else has to move with the folders. A move that must
+ * also carry the *files* inside the subtree goes through `d1-unit-of-work.ts` instead, which
+ * composes these same builders with the file repository's into one batch; the logic is not
+ * duplicated there.
+ *
+ * A no-op is detected by re-reading and the whole operation retried against the new state,
+ * which is what makes two concurrent moves resolve into one winner and one retry rather than a
+ * corrupted subtree.
+ */
+export async function moveSubtree(input: MoveSubtreeInput): Promise<void> {
+  const db = await getD1();
+  await assertMoveIsStructurallyLegal(db, input);
 
   for (let attempt = 0; attempt < MOVE_ATTEMPTS; attempt += 1) {
-    const [current] = await db
-      .select({
-        id: folders.id,
-        depth: folders.depth,
-        updatedAt: folders.updatedAt,
-        parentFolderId: folders.parentFolderId,
-      })
-      .from(folders)
-      .where(eq(folders.id, input.folderId))
-      .limit(1);
+    const plan = await planFolderMove(db, input.folderId, input.newPathAncestors);
 
-    if (!current) throw new ConflictError('The folder being moved no longer exists');
+    await withBatch(db, [
+      ...buildFolderMoveStatements(db, input, plan),
+      buildFolderMoveCommitStatement(db, input, plan),
+    ]);
 
-    const oldDepth = current.depth;
-    const newDepth = input.newPathAncestors.length;
-    const shift = newDepth - oldDepth;
-    const stamp = current.updatedAt;
-    const now = nowIso();
-
-    /** "Nothing has touched the moved folder since the plan was computed." */
-    const unchanged = sql`(SELECT f.updated_at FROM ${folders} f WHERE f.id = ${input.folderId}) = ${stamp}`;
-    const descendants = sql`(SELECT a.folder_id FROM ${folderAncestors} a WHERE a.ancestor_id = ${input.folderId})`;
-
-    const statements: BatchItem<'sqlite'>[] = [
-      // 1. The descendants' own rows: everything that follows the moved folder rather than
-      //    describing it. `owner_id` deliberately stays put, matching the Mongo pipeline.
-      db
-        .update(folders)
-        .set({
-          depth: sql`${folders.depth} + ${shift}`,
-          driveType: input.driveType,
-          departmentId: input.departmentId,
-          projectId: input.projectId,
-          updatedAt: now,
-        })
-        .where(and(sql`${folders.id} IN ${descendants}`, unchanged)),
-
-      // 2. The moved folder's *old* ancestors drop out of every descendant's chain. Rows at
-      //    `depth >= oldDepth` are the moved folder itself and what lies between, and they stay
-      //    — which is also what keeps the `descendants` sub-select above stable as this runs.
-      db
-        .delete(folderAncestors)
-        .where(
-          and(
-            sql`${folderAncestors.folderId} IN ${descendants}`,
-            lt(folderAncestors.depth, oldDepth),
-            unchanged,
-          ),
-        ),
-
-      // 3. What remains keeps its relative order, shifted to the new depth.
-      db
-        .update(folderAncestors)
-        .set({ depth: sql`${folderAncestors.depth} + ${shift}` })
-        .where(and(sql`${folderAncestors.folderId} IN ${descendants}`, unchanged)),
-    ];
-
-    // 4. The destination's chain is prepended to every descendant. One statement per new
-    //    ancestor, each inserting exactly one row per descendant.
-    input.newPathAncestors.forEach((ancestorId, index) => {
-      statements.push(
-        db
-          .insert(folderAncestors)
-          .select(
-            sql`select a.folder_id, ${ancestorId}, ${index}
-                  from ${folderAncestors} a
-                 where a.ancestor_id = ${input.folderId} and ${unchanged}`,
-          ),
-      );
-    });
-
-    // 5–6. The moved folder's own chain is replaced outright — it is short and known.
-    statements.push(
-      db
-        .delete(folderAncestors)
-        .where(and(eq(folderAncestors.folderId, input.folderId), unchanged)),
-    );
-    input.newPathAncestors.forEach((ancestorId, index) => {
-      statements.push(
-        db
-          .insert(folderAncestors)
-          .select(sql`select ${input.folderId}, ${ancestorId}, ${index} where ${unchanged}`),
-      );
-    });
-
-    // 7. Last, because it is what invalidates the guard above.
-    statements.push(
-      db
-        .update(folders)
-        .set({
-          parentFolderId: input.newParentId,
-          depth: newDepth,
-          driveType: input.driveType,
-          departmentId: input.departmentId,
-          projectId: input.projectId,
-          ownerId: input.ownerId,
-          updatedBy: input.updatedBy,
-          updatedAt: now,
-        })
-        .where(and(eq(folders.id, input.folderId), eq(folders.updatedAt, stamp))),
-    );
-
-    await withBatch(db, statements);
-
-    const [after] = await db
-      .select({ parentFolderId: folders.parentFolderId, depth: folders.depth })
-      .from(folders)
-      .where(eq(folders.id, input.folderId))
-      .limit(1);
-
-    if (after?.parentFolderId === input.newParentId && after.depth === newDepth) return;
+    if (await moveDidApply(db, input, plan)) return;
   }
 
-  throw new ConflictError(
-    'This folder could not be moved because it kept changing underneath the move. ' +
-      'This usually means two people moved or renamed it at the same time.',
-  );
+  throw new ConflictError(MOVE_CONTENTION_MESSAGE);
 }
 
 /**
