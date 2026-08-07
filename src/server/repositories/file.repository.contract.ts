@@ -47,6 +47,36 @@ import type { FileCategory } from '@/server/domain/file-types';
 import type { FileStorageProvider } from '@/server/db/storage-fields';
 import type { AclEntry, Actor } from '@/server/permissions/actor';
 
+/* ------------------------------------------------------------------ errors */
+
+/**
+ * Raised when one Drive file id is claimed by versions belonging to more than one file.
+ *
+ * Stated here rather than in either implementation because **both** raise it and callers catch
+ * it without knowing which database answered. It cannot live in `file.repository.mongo.ts`: the
+ * D1 repository would have to import that module to catch it, which would pull Mongoose into
+ * the Worker bundle. This file's only foreign import is a `ClientSession` *type*, which erases
+ * at compile time and leaves nothing in the bundle.
+ *
+ * A unique partial index on `googleDriveFileId` is supposed to make this impossible. If it
+ * happens anyway the mirror has genuinely diverged, and picking whichever file the query
+ * returned first would file a Drive change against an arbitrary one of them — a silent,
+ * unattributable corruption of a research record. Failing loudly is the only honest outcome,
+ * and the message carries what an operator needs to repair it.
+ */
+export class AmbiguousDriveFileError extends Error {
+  constructor(
+    readonly googleDriveFileId: string,
+    readonly fileIds: string[],
+  ) {
+    super(
+      `Google Drive file ${googleDriveFileId} is linked to ${fileIds.length} different files ` +
+        `(${fileIds.join(', ')}). Refusing to guess which one a change belongs to.`,
+    );
+    this.name = 'AmbiguousDriveFileError';
+  }
+}
+
 /* ------------------------------------------------------------------ records */
 
 export interface FileRecord {

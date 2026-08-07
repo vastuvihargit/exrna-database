@@ -53,6 +53,7 @@ import {
 } from '@/server/permissions/visibility';
 import type { ConfidentialityLevel } from '@/server/domain/permissions';
 import type { FileCategory } from '@/server/domain/file-types';
+import { AmbiguousDriveFileError } from './file.repository.contract';
 import type {
   CreateFileInput,
   FileGuard,
@@ -548,26 +549,14 @@ export async function findByIdsInternal(ids: string[]): Promise<FileRecord[]> {
 }
 
 /**
- * Raised when one Drive file id is claimed by versions belonging to more than one file.
+ * Re-exported from the contract, where it moved so that both implementations can raise the
+ * same class. Callers catch it without knowing which database answered, and the D1 repository
+ * cannot import it from here — doing so would pull Mongoose into the Worker bundle.
  *
- * A unique partial index on `fileversions.googleDriveFileId` is supposed to make this
- * impossible. If it happens anyway the mirror has genuinely diverged, and picking whichever
- * file the query happened to return first would file a Drive change against an arbitrary one
- * of them — a silent, unattributable data corruption. Failing loudly is the only honest
- * outcome, and the log line carries what an operator needs to repair it.
+ * Kept as a named export from this module because existing call sites and tests import it from
+ * here.
  */
-export class AmbiguousDriveFileError extends Error {
-  constructor(
-    readonly googleDriveFileId: string,
-    readonly fileIds: string[],
-  ) {
-    super(
-      `Google Drive file ${googleDriveFileId} is linked to ${fileIds.length} different files ` +
-        `(${fileIds.join(', ')}). Refusing to guess which one a change belongs to.`,
-    );
-    this.name = 'AmbiguousDriveFileError';
-  }
-}
+export { AmbiguousDriveFileError };
 
 /**
  * The application file a mirrored Drive file belongs to.
