@@ -146,6 +146,45 @@ export function resourceLookupFilter(actor: Actor): VisibilityFilter {
 }
 
 /**
+ * The part of a lookup predicate MongoDB can express **without** joining to ancestors.
+ *
+ * ── Why this exists, and why it is not `resourceLookupFilter` ───────────────────────────
+ *
+ * A lookup predicate has one hard requirement: it must be a **superset of `canAccess`'s allow
+ * set**. If it is narrower, the repository returns `null`, the service turns that into a 404,
+ * and a user is refused something they are entitled to open.
+ *
+ * `resourceLookupFilter` fails that requirement for any resource whose access is *inherited*.
+ * Its ACL branch matches `permissions` on the document itself, and an inherited grant is not
+ * there — it is on an ancestor folder. Sharing a folder and then opening a file inside it is
+ * the single most common way access is granted in this application, so applying that filter to
+ * a file lookup 404s the ordinary case.
+ *
+ * D1 has no such problem: `file_folder_ancestors` makes "does any in-scope ancestor grant this
+ * actor?" a correlated sub-query, which is exactly what `lookupVisibility()` in
+ * `visibility.d1.ts` does. MongoDB cannot express that in a `find` filter, and resolving it
+ * would mean a second query returning every folder id that grants the actor — unbounded, and
+ * on the hot path of every file open.
+ *
+ * So the MongoDB lookup applies the two guards that **are** implied by `canAccess` allowing the
+ * row, and leaves the rest to `assertCan`, which walks the full ancestor chain immediately
+ * afterwards and makes the actual decision:
+ *
+ *   • **organization isolation** — `canAccess` refuses a foreign tenant outright;
+ *   • **the live deny guard** — `canAccess` refuses on a live denial naming the actor.
+ *
+ * Both are strictly weaker than `canAccess`, so this cannot 404 anything legitimate; and both
+ * remove the cases that matter most for a guessed id — another tenant's file, and a file the
+ * actor was specifically blocked from. It is a real tightening over the old `findOne({_id})`,
+ * which applied neither, without claiming a guarantee this database can honour in one query.
+ */
+export function lookupGuardFilter(actor: Actor): VisibilityFilter {
+  const organizationId = toObjectId(actor.organizationId);
+  const principalIds = actorPrincipalIds(actor);
+  return { $and: [{ organizationId }, aclDenyGuard(principalIds)] };
+}
+
+/**
  * Entries that are live *and* name this actor.
  *
  * `aclGrants()` in `authorize.ts` skips an expired entry before it looks at anything else

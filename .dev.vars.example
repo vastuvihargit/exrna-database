@@ -56,6 +56,11 @@ GOOGLE_CLIENT_SECRET=
 # Migrated so far: users, departments (module 1); roles (module 2);
 # projects, experiments (module 3); folders (module 5).
 #
+# `files` has a flag but no D1 implementation yet (module 6 is in progress). Setting it to
+# "d1" does not fall back to MongoDB - it raises, on purpose. A flag that silently served
+# the old database would make a soak test meaningless and the mistake would only surface
+# later, against the wrong data.
+#
 # `roles` and `users` are best moved together: user.service.ts decorates every user summary
 # with that user's grants, so a directory listing reads both on one request. Ids are preserved
 # across both databases, so a split works — but only for rows that exist in both, which is not
@@ -74,6 +79,13 @@ GOOGLE_CLIENT_SECRET=
 # disagreeing about where a file lives. Safe for a single-module soak; not a combination to
 # leave running once module 6 exists.
 # DATA_SOURCE_FOLDERS=d1
+#
+# Once the D1 file repository lands, enable these two **together**. A folder move rewrites
+# the folder tree and the location of every file inside it; with the two modules on
+# different databases no transaction spans both halves, so a failure part-way through
+# leaves them disagreeing about where a file lives. Folders-on-D1 with files-on-Mongo is a
+# temporary development and soak state, not a configuration to run for long.
+# DATA_SOURCE_FILES=d1
 
 # ── Cloudflare Access (Phase 8) ───────────────────────────────────────────────────────
 # Unused until Phase 8. CF_ACCESS_AUD is the Application Audience tag from the Access

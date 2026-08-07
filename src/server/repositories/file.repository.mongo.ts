@@ -13,19 +13,33 @@
  * Every read below applies exactly the filter its caller used to pass, so the refactor cannot
  * quietly widen or narrow what anybody sees:
  *
- *   findById / findByIds        `resourceLookupFilter`  — single-row lookup, superset of canAccess
+ *   findById / findByIds        `lookupGuardFilter`     — see below
  *   listInFolder / listTrashed  `childVisibilityFilter` — children of an already-authorised folder
  *   search / searchFacets       `resourceVisibilityFilter`
  *   findRelated                 `resourceVisibilityFilter`
  *   projectContentBreakdown     `resourceVisibilityFilter`
  *   listSharedWith              principals only — an explicit grant *is* the definition
  *
- * `findById` is the one behavioural change in this file, and it is a deliberate correction:
- * the old signature took no actor at all and returned any row in the database. It now applies
- * `resourceLookupFilter`, which `visibility.ts` documents as a superset of `canAccess`'s allow
- * set — wide enough that a permission-aware lookup cannot 404 a file the actor may legitimately
- * open, while organization isolation and the live deny guards still apply to everyone.
- * `assertCan` still runs afterwards in `file-access.ts` and still makes the decision.
+ * ── `findById` is the one behavioural change, and it is deliberately a narrow one ───────
+ *
+ * The old signature took no actor at all and returned any row in the database, leaving the
+ * whole decision to `file-access.ts`. It now applies `lookupGuardFilter`: organization
+ * isolation and the live deny guard, both inside the query.
+ *
+ * It deliberately does **not** apply `resourceLookupFilter`. That filter matches the ACL on
+ * the document itself, and a file's access is usually *inherited* from the folder it lives in —
+ * so using it here 404s the ordinary case of "somebody shared a folder with me and I opened a
+ * file inside it". A lookup predicate that is narrower than `canAccess` is not a security
+ * improvement, it is an outage. `lookupGuardFilter` documents the reasoning in full.
+ *
+ * The two guards it does apply are both implied by `canAccess` allowing the row, so nothing
+ * legitimate can 404, while the two cases that matter for a guessed id — another tenant's file,
+ * and one the actor was explicitly denied — can no longer be loaded at all. `assertCan` runs
+ * immediately afterwards with the full ancestor chain and makes the real decision.
+ *
+ * D1 does not have this limitation: `file_folder_ancestors` turns "does an in-scope ancestor
+ * grant this actor?" into a correlated sub-query, which is what `lookupVisibility()` in
+ * `visibility.d1.ts` already does. The full in-query predicate arrives with that implementation.
  */
 import { Types, type FilterQuery } from 'mongoose';
 import { connectToDatabase } from '@/server/db/connection';
@@ -34,7 +48,7 @@ import { getLogger } from '@/server/logging/logger';
 import type { AclEntry, Actor } from '@/server/permissions/actor';
 import {
   childVisibilityFilter,
-  resourceLookupFilter,
+  lookupGuardFilter,
   resourceVisibilityFilter,
 } from '@/server/permissions/visibility';
 import type { ConfidentialityLevel } from '@/server/domain/permissions';
@@ -127,7 +141,7 @@ export async function findById(
   if (!isValidId(id)) return null;
   await connectToDatabase();
   const query = FileModel.findOne({
-    $and: [resourceLookupFilter(actor) as FilterQuery<FileDocument>, { _id: oid(id) }],
+    $and: [lookupGuardFilter(actor) as FilterQuery<FileDocument>, { _id: oid(id) }],
   } as FilterQuery<FileDocument>);
   if (options.includeDeleted) query.setOptions({ withDeleted: true });
   const doc = await query.lean<LeanFile>().exec();
@@ -139,7 +153,7 @@ export async function findByIds(actor: Actor, ids: string[]): Promise<FileRecord
   if (valid.length === 0) return [];
   await connectToDatabase();
   const docs = await FileModel.find({
-    $and: [resourceLookupFilter(actor) as FilterQuery<FileDocument>, { _id: { $in: valid } }],
+    $and: [lookupGuardFilter(actor) as FilterQuery<FileDocument>, { _id: { $in: valid } }],
   } as FilterQuery<FileDocument>)
     .lean<LeanFile[]>()
     .exec();

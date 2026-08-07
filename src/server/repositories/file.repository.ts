@@ -114,7 +114,7 @@ function active(): FileRepository {
 
 /* -------------------------------------------------- permission-aware reads */
 
-export function findById(
+export async function findById(
   actor: Actor,
   id: string,
   options?: { includeDeleted?: boolean },
@@ -122,35 +122,35 @@ export function findById(
   return active().findById(actor, id, options);
 }
 
-export function findByIds(actor: Actor, ids: string[]): Promise<FileRecord[]> {
+export async function findByIds(actor: Actor, ids: string[]): Promise<FileRecord[]> {
   return active().findByIds(actor, ids);
 }
 
-export function listInFolder(input: ListInFolderInput): Promise<FilePage> {
+export async function listInFolder(input: ListInFolderInput): Promise<FilePage> {
   return active().listInFolder(input);
 }
 
-export function listTrashed(input: ListForActorInput): Promise<FilePage> {
+export async function listTrashed(input: ListForActorInput): Promise<FilePage> {
   return active().listTrashed(input);
 }
 
-export function search(input: SearchFilesInput): Promise<FilePage> {
+export async function search(input: SearchFilesInput): Promise<FilePage> {
   return active().search(input);
 }
 
-export function listSharedWith(input: ListSharedWithInput): Promise<FilePage> {
+export async function listSharedWith(input: ListSharedWithInput): Promise<FilePage> {
   return active().listSharedWith(input);
 }
 
-export function searchFacets(actor: Actor): Promise<SearchFacets> {
+export async function searchFacets(actor: Actor): Promise<SearchFacets> {
   return active().searchFacets(actor);
 }
 
-export function findRelated(input: FindRelatedInput): Promise<FileRecord[]> {
+export async function findRelated(input: FindRelatedInput): Promise<FileRecord[]> {
   return active().findRelated(input);
 }
 
-export function projectContentBreakdown(
+export async function projectContentBreakdown(
   actor: Actor,
   projectId: string,
 ): Promise<ProjectContentBreakdown> {
@@ -159,7 +159,7 @@ export function projectContentBreakdown(
 
 /* -------------------------------------------------- structural reads */
 
-export function existsWithName(
+export async function existsWithName(
   folderId: string,
   displayNameLower: string,
   excludeId?: string,
@@ -167,22 +167,22 @@ export function existsWithName(
   return active().existsWithName(folderId, displayNameLower, excludeId);
 }
 
-export function takenNamesInFolder(folderId: string): Promise<Set<string>> {
+export async function takenNamesInFolder(folderId: string): Promise<Set<string>> {
   return active().takenNamesInFolder(folderId);
 }
 
-export function findByChecksumInFolder(
+export async function findByChecksumInFolder(
   folderId: string,
   checksum: string,
 ): Promise<FileRecord | null> {
   return active().findByChecksumInFolder(folderId, checksum);
 }
 
-export function countInFolder(folderId: string): Promise<number> {
+export async function countInFolder(folderId: string): Promise<number> {
   return active().countInFolder(folderId);
 }
 
-export function countForExperiment(experimentId: string): Promise<number> {
+export async function countForExperiment(experimentId: string): Promise<number> {
   return active().countForExperiment(experimentId);
 }
 
@@ -192,7 +192,7 @@ export function countForExperiment(experimentId: string): Promise<number> {
  * ⚠️ Authorization bypass. Trusted server services only — see the contract for the callers
  * that legitimately need one and why an API route never does.
  */
-export function findByIdInternal(
+export async function findByIdInternal(
   id: string,
   options?: { includeDeleted?: boolean },
 ): Promise<FileRecord | null> {
@@ -200,19 +200,19 @@ export function findByIdInternal(
 }
 
 /** ⚠️ Authorization bypass: subtree and batch mutations authorized at the subtree root. */
-export function findByIdsInternal(ids: string[]): Promise<FileRecord[]> {
+export async function findByIdsInternal(ids: string[]): Promise<FileRecord[]> {
   return active().findByIdsInternal(ids);
 }
 
 /** ⚠️ Authorization bypass: the Drive change feed runs as the sync worker, not as a user. */
-export function findByDriveFileIdInternal(
+export async function findByDriveFileIdInternal(
   googleDriveFileId: string,
 ): Promise<FileRecord | null> {
   return active().findByDriveFileIdInternal(googleDriveFileId);
 }
 
 /** ⚠️ Authorization bypass: a storage de-duplication decision, never a listing. */
-export function findByChecksumInternal(
+export async function findByChecksumInternal(
   organizationId: string,
   checksumSha256: string,
 ): Promise<FileRecord | null> {
@@ -220,7 +220,7 @@ export function findByChecksumInternal(
 }
 
 /** ⚠️ Authorization bypass: the retention purge runs as no user at all. */
-export function findExpiredTrashInternal(before: Date, limit?: number): Promise<FileRecord[]> {
+export async function findExpiredTrashInternal(before: Date, limit?: number): Promise<FileRecord[]> {
   return active().findExpiredTrashInternal(before, limit);
 }
 
@@ -230,11 +230,11 @@ export function newId(): string {
   return active().newId();
 }
 
-export function create(input: CreateFileInput, tx?: FileTx): Promise<FileRecord> {
+export async function create(input: CreateFileInput, tx?: FileTx): Promise<FileRecord> {
   return active().create(input, tx);
 }
 
-export function updateById(
+export async function updateById(
   id: string,
   patch: FilePatch,
   tx?: FileTx,
@@ -242,7 +242,7 @@ export function updateById(
   return active().updateById(id, patch, tx);
 }
 
-export function updateByIdWhere(
+export async function updateByIdWhere(
   id: string,
   guard: FileGuard,
   patch: FilePatch,
@@ -251,7 +251,7 @@ export function updateByIdWhere(
   return active().updateByIdWhere(id, guard, patch, tx);
 }
 
-export function setDeleted(
+export async function setDeleted(
   input: { fileId: string; deleted: boolean; userId: string; withFolderId?: string | null },
   tx?: FileTx,
 ): Promise<void> {
@@ -259,43 +259,43 @@ export function setDeleted(
 }
 
 /** ⚠️ Authorization bypass: the Drive change feed acts on nobody's behalf. */
-export function setDeletedBySystem(input: {
+export async function setDeletedBySystem(input: {
   fileId: string;
   deleted: boolean;
 }): Promise<boolean> {
   return active().setDeletedBySystem(input);
 }
 
-export function setSubtreeDeleted(
+export async function setSubtreeDeleted(
   input: { folderId: string; deleted: boolean; userId: string },
   tx?: FileTx,
 ): Promise<number> {
   return active().setSubtreeDeleted(input, tx);
 }
 
-export function reparentSubtree(input: ReparentSubtreeInput, tx?: FileTx): Promise<void> {
+export async function reparentSubtree(input: ReparentSubtreeInput, tx?: FileTx): Promise<void> {
   return active().reparentSubtree(input, tx);
 }
 
-export function setSubtreeStatus(
+export async function setSubtreeStatus(
   input: { folderId: string; status: 'active' | 'archived' },
   tx?: FileTx,
 ): Promise<void> {
   return active().setSubtreeStatus(input, tx);
 }
 
-export function unlinkExperiment(experimentId: string, tx?: FileTx): Promise<number> {
+export async function unlinkExperiment(experimentId: string, tx?: FileTx): Promise<number> {
   return active().unlinkExperiment(experimentId, tx);
 }
 
 /** ⚠️ Authorization bypass: hard delete, reached only by the retention purge and tests. */
-export function purge(fileIds: string[], tx?: FileTx): Promise<number> {
+export async function purge(fileIds: string[], tx?: FileTx): Promise<number> {
   return active().purge(fileIds, tx);
 }
 
 /* -------------------------------------------------- integrity */
 
-export function checkFileHierarchyIntegrity(
+export async function checkFileHierarchyIntegrity(
   organizationId: string,
 ): Promise<FileHierarchyProblem[]> {
   return active().checkFileHierarchyIntegrity(organizationId);

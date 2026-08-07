@@ -93,7 +93,72 @@ contract the triggers were written to; it is asserted by a test rather than left
 
 ---
 
-## 3. Status of this module
+## 3. Call-site mapping
 
-See the final report in the session that lands each commit. This document is written as the
-work proceeds rather than after it, so a half-finished module is visible as such.
+Every production caller of the old repository, and what it became. "Internal" means the call
+sites an authorization bypass, and the column says why that is legitimate.
+
+| Service | Old call | New call | Classification |
+|---|---|---|---|
+| `file-access.ts` | `findById(id)` | `findById(actor, id)` | actor — the user-facing lookup |
+| `file.service.ts` | `listInFolder({visibility})` | `listInFolder({actor})` | actor |
+| `file.service.ts` | `findRelated({visibility})` | `findRelated({actor})` | actor |
+| `file.service.ts` | `listTrashed({visibility})` | `listTrashed({actor})` | actor |
+| `file.service.ts` | `findById(id)` after restore | `findByIdInternal(id)` | internal — re-read of a row this request wrote |
+| `file.service.ts` | `findExpiredTrash` | `findExpiredTrashInternal` | internal — retention purge |
+| `search.service.ts` | `search({visibility})` | `search({actor})` | actor |
+| `search.service.ts` | `searchFacets(vis, org)` | `searchFacets(actor)` | actor |
+| `project.service.ts` | `projectContentBreakdown(vis, id)` | `(actor, id)` | actor |
+| `sharing.service.ts` | `listSharedWith({organizationId})` | `listSharedWith({actor})` | actor |
+| `comment.service.ts` | `loadFileContext(id)` | `loadFileContext(actor, id)` | actor |
+| `drive-sync.service.ts` | `findById(id, {includeDeleted})` ×2 | `findByIdInternal` | internal — sync worker, no user |
+| `approval-integrity.service.ts` | `findById(id, {includeDeleted})` | `findByIdInternal` | internal — background sweep |
+| `storage-migration/local-copies.ts` | `findById(id, {includeDeleted})` | `findByIdInternal` | internal — storage sweep |
+| `upload.service.ts` | `findById(id)` | `findByIdInternal(id)` | internal — describes the upload just finalized |
+| `migration.service.ts` | `findByChecksum` | `findByChecksumInternal` | internal — storage dedupe |
+| `scripts/purge-trash.ts` | `findExpiredTrash` | `findExpiredTrashInternal` | internal — runs as no user |
+
+Every `updateById` call site moved from `$set`/`$inc`/`$unset` to `FilePatch`; the two
+`updateByIdWhere` sites moved to `FileGuard`.
+
+---
+
+## 4. Residual direct `FileModel` usage
+
+Re-audited after the refactor. **No user-facing request service reads `FileModel` directly.**
+What remains, and why:
+
+| File | Classification | Disposition |
+|---|---|---|
+| `repositories/storage-usage.repository.ts` | Quota aggregation over all files | Its own module (storage usage) later in Phase 3 |
+| `services/storage-migration/planner.ts` | Drive byte-migration planner | Drive storage phase |
+| `services/storage-migration/drive-mirror.ts` | Drive mirror bookkeeping | Drive storage phase |
+| `services/storage-migration/pending-transfers.ts` | Transfer queue | Drive storage phase |
+| `services/storage-migration/transfer.ts` | Transfer state writes | Drive storage phase |
+| `scripts/validate-acl-uniqueness.ts` | Pre-migration ACL validation | Script, MongoDB-only by design |
+| `scripts/db/2026-08-01-storage-provider-fields.ts` | One-off backfill | Historical, MongoDB-only |
+
+The four `storage-migration/*` files and `storage-usage.repository.ts` are the real debt: they
+are production code that stays pinned to MongoDB when `DATA_SOURCE_FILES=d1`. They are all part
+of the *Drive byte-migration* subsystem, which has not been migrated and is not in module 6's
+scope — the same disposition the folder module recorded for `folder-mirror.ts`. Nothing in the
+normal drive UI path reaches them.
+
+---
+
+## 5. Status of this module
+
+| Step | State |
+|---|---|
+| Contract and method mapping | done (`05a8257`) |
+| Mongo implementation behind the contract, services rewired, routing flag | done |
+| D1 implementation | **not started** |
+| FTS search, lifecycle views on D1 | not started |
+| Folder+file atomic move (§7 of the brief) | not started |
+
+`DATA_SOURCE_FILES` exists but has no D1 implementation behind it: setting it to `d1` raises
+`D1FileRepositoryUnavailableError` rather than falling back. That is the point — a flag that
+silently served MongoDB would make a soak test worthless.
+
+This document is written as the work proceeds rather than after it, so a half-finished module
+is visible as such.
