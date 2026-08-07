@@ -156,21 +156,46 @@ describe('file repository routing', () => {
     else process.env.DATA_SOURCE_FILES = previous;
   });
 
-  it('refuses to serve MongoDB when D1 was asked for', async () => {
+  it('selects the D1 repository, not MongoDB, once the flag is set', async () => {
     const facade = await import('@/server/repositories/file.repository');
+    const d1 = await import('@/server/repositories/file.repository.d1');
+    const mongo = await import('@/server/repositories/file.repository.mongo');
+
+    expect(facade.d1FileRepository).toBe(d1.d1FileRepository);
+    expect(facade.mongoFileRepository).toBe(mongo.mongoFileRepository);
+    // The two are genuinely different objects, so "routed to D1" is a claim with content.
+    expect(facade.d1FileRepository).not.toBe(facade.mongoFileRepository);
+  });
+
+  /**
+   * The no-fallback guarantee, asserted where it is cheapest to assert.
+   *
+   * This suite has MongoDB and no D1 binding. With the flag set, every call therefore reaches
+   * the D1 repository and fails at `getD1()` — which is exactly the point: a façade that
+   * silently fell back would return the MongoDB row instead, and the test would see a file
+   * rather than a rejection. The D1 repository's own behaviour is proved against a real D1 in
+   * `tests/d1/file-repository.test.ts`.
+   */
+  it('never falls back to MongoDB when D1 cannot answer', async () => {
+    const facade = await import('@/server/repositories/file.repository');
+    const { D1BindingUnavailableError } = await import('@/server/db/d1-context');
     const fileId = await seedFile();
 
-    // Proves the row is readable on the default path first, so the failure below is the
-    // flag and not a missing fixture.
+    // Readable on the default path first, so the failures below are the flag and not a
+    // missing fixture.
     expect(await facade.findById(actor(), fileId)).not.toBeNull();
 
     setDataSourceOverride('files', 'd1');
     await expect(facade.findById(actor(), fileId)).rejects.toBeInstanceOf(
-      facade.D1FileRepositoryUnavailableError,
+      D1BindingUnavailableError,
     );
     // A write must not fall back either.
     await expect(facade.updateById(fileId, { displayName: 'x' })).rejects.toBeInstanceOf(
-      facade.D1FileRepositoryUnavailableError,
+      D1BindingUnavailableError,
+    );
+    // Nor an authorization bypass, which is the path a background job would take.
+    await expect(facade.findByIdInternal(fileId)).rejects.toBeInstanceOf(
+      D1BindingUnavailableError,
     );
   });
 });
@@ -365,5 +390,47 @@ describe('the internal/user-facing split is structural', () => {
       offenders,
       `Internal lookups bypass authorization and must stay in trusted services: ${offenders.join(', ')}`,
     ).toEqual([]);
+  });
+
+  /**
+   * The D1 repository has to run inside `workerd`, which has no Mongoose and no Node built-ins
+   * beyond the `nodejs_compat` set.
+   *
+   * A single `import` of the Mongo implementation would be enough to pull the whole Mongoose
+   * driver into the module graph — and it would not fail the build, only bloat the Worker and
+   * fail at runtime the first time something touched a connection. Asserted statically because
+   * the failure it prevents is invisible until deployment.
+   *
+   * `AmbiguousDriveFileError` lives in the contract for exactly this reason: both engines raise
+   * it, and the contract's only foreign import is a `ClientSession` *type*, which erases.
+   */
+  it('the D1 file repository pulls in neither Mongoose nor the Mongo implementation', async () => {
+    const source = await fsp.readFile(
+      path.resolve(process.cwd(), 'src', 'server', 'repositories', 'file.repository.d1.ts'),
+      'utf8',
+    );
+
+    const imports = [...source.matchAll(/from ['"]([^'"]+)['"]/g)].map((match) => match[1]!);
+
+    expect(imports.filter((specifier) => /mongoose|\.mongo$|db\/connection/.test(specifier))).toEqual(
+      [],
+    );
+    expect(
+      imports.filter((specifier) => specifier.startsWith('node:')),
+      'a node: import would not resolve in workerd',
+    ).toEqual([]);
+  });
+
+  /** The contract is imported by the D1 side, so it must stay free of runtime Mongo too. */
+  it('the contract imports Mongoose only as a type', async () => {
+    const source = await fsp.readFile(
+      path.resolve(process.cwd(), 'src', 'server', 'repositories', 'file.repository.contract.ts'),
+      'utf8',
+    );
+
+    const mongooseImports = [...source.matchAll(/^import\s+(type\s+)?.*from ['"]mongoose['"]/gm)];
+    expect(mongooseImports).toHaveLength(1);
+    // `import type` is erased entirely; a value import would put the driver in the bundle.
+    expect(mongooseImports[0]![1], 'must be `import type`').toBeTruthy();
   });
 });

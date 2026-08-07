@@ -189,19 +189,153 @@ case above, and deterministic failure on duplicate linkage.
 
 ---
 
-## 6. Status of this module
+## 6. The D1 implementation
+
+`file.repository.d1.ts` implements all 31 contract methods. `DATA_SOURCE_FILES=d1` now resolves
+to it; `D1FileRepositoryUnavailableError` is gone.
+
+### 6.1 Tables
+
+`files`, `file_folder_ancestors`, `file_metadata`, `resource_tags`, `resource_permissions`, plus
+`folders`/`folder_ancestors` (structural checks and subtree rebuilds), `file_versions` (the Drive
+id join only) and `files_fts`.
+
+### 6.2 Authorization
+
+Every actor-facing read applies a predicate from `visibility.d1.ts` **inside** the SQL — the same
+predicate for the rows and for the `COUNT(*)` that produces `total`, built once and used twice.
+Nothing is filtered in JavaScript.
+
+| Read | Predicate |
+|---|---|
+| `findById`, `findByIds` | `lookupVisibility('file', actor)` |
+| `listInFolder`, `listTrashed` | `childVisibility('file', actor)` |
+| `search`, `searchFacets`, `findRelated`, `projectContentBreakdown` | `resourceVisibility('file', actor)` |
+| `listSharedWith` | live non-deny entries naming the actor's principals |
+
+That mapping is identical to the Mongo implementation's, so the flag cannot change who sees what
+— with one exception, which is a **tightening**:
+
+`findById` on MongoDB applies only `lookupGuardFilter` (organization isolation and the live deny
+guard), because MongoDB cannot check an ancestor's ACL inside a `find` filter and a narrower
+predicate would 404 the ordinary inherited-access case. D1 has `file_folder_ancestors`, so
+`lookupVisibility` applies in full: inherited grants, inheritance boundaries, role scope and the
+confidentiality gate all run in the query. A guessed id cannot load a row the actor has no route
+to. `assertCan` still makes the real decision afterwards on both engines.
+
+### 6.3 One deliberate behavioural divergence
+
+`applySoftDeleteFilter` hooks `find`, `findOne`, `findOneAndUpdate`, `countDocuments`,
+`updateMany` and `updateOne` — but **not** `aggregate`. On MongoDB, `searchFacets` and four of
+the five `projectContentBreakdown` figures therefore count trashed files, while the fifth
+(`linkedToExperiment`, a `countDocuments`) excludes them. The dashboard disagrees with itself.
+
+D1 excludes soft-deleted rows everywhere, consistently. Reproducing the inconsistency would mean
+carrying a known reporting bug into the new engine and then defending it in the Phase 6
+comparison — the same reasoning that reversed the plan to reproduce the ACL leak in module 4.
+
+**Outstanding:** the Mongo side should be fixed to match. It is a live dashboard, so it is
+recorded here rather than changed in a session whose remit was the D1 implementation.
+
+### 6.4 FTS synchronisation — a correctness fix
+
+The Phase 2 triggers fire on `files` only. `trg_files_fts_update` re-reads tags and metadata when
+it runs, but a write touching *only* `file_metadata` or *only* `resource_tags` fires no trigger at
+all. Editing a sample id or a tag left `files_fts` holding the previous value: the new term
+matched nothing, and the old term still matched.
+
+`refreshFileFts(db, fileId, content)` emits a DELETE and an INSERT that join the **same batch** as
+the write that made them necessary, so the index cannot be left stale by a later failure. It is
+appended by `create` and by any patch touching `displayName`, `originalFilename`, `tags`,
+`metadataSet`, `metadataUnset` or `status`. `content: null` deletes without reinserting,
+reproducing the trigger's `WHERE deleted_at IS NULL`, so a trashed file leaves the index entirely.
+
+DELETE-then-INSERT rather than UPDATE because `files_fts` is a standalone FTS5 table with no
+unique constraint on `file_id` — an INSERT alone accumulates a row per write and every search
+returns the file once per stale copy. The pair is idempotent, so it is also safe after a
+statement whose trigger already rebuilt the row.
+
+Two implementation constraints are worth recording:
+
+* **A D1 batch cannot carry parameterised raw SQL.** `SQLiteD1Session.batch` reads
+  `preparedQuery.stmt` for any query with bound parameters, and `db.run(sql\`...\`)` does not set
+  it — the batch dies with "cannot read properties of undefined". Only query-builder statements
+  work. That ruled out the `INSERT ... SELECT` form, so `files_fts` is declared as a local
+  drizzle table (deliberately *not* in `schema/index.ts`, or drizzle-kit would try to create it)
+  and the indexed text is computed in JavaScript by `ftsContentOf`, which mirrors the trigger's
+  expressions. **If `trg_files_fts_update` changes, `ftsContentOf` must change with it.**
+* **`meta.changes` is not a matched-row count.** It includes rows written by triggers and by
+  `ON DELETE CASCADE`. Purging one file reported 6; restoring one reported 4. Those numbers reach
+  callers and audit entries, so `setSubtreeDeleted`, `purge`, `unlinkExperiment` and
+  `setDeletedBySystem` read the matching ids first and count those.
+
+### 6.5 `file_folder_ancestors`
+
+The chain is root → containing folder, with the **containing folder last** — `folderPathAncestors`
+has always ended with `folderId`, `checkFileHierarchyIntegrity` asserts it, and the inheritance
+predicate depends on it (a file inherits from the folder it is in, which it can only do if that
+folder is one of its ancestor rows). A file in `Root/Project/Experiment/Results` gets four rows,
+at depths 0–3.
+
+`create` writes the base row and the chain in one `db.batch()`; a file whose ancestor rows did not
+land would be invisible to every subtree query *and* to the inherited-deny guard, so it would be
+more visible than intended, not less.
+
+`reparentSubtree` rebuilds each affected file's chain rather than shifting depths. The obvious
+implementation needs each file's current depth of the moved folder, and that value changes as the
+same statement updates it — a correlated sub-query reading the table being written. So the suffix
+comes from `folder_ancestors`, which the statement does not write, and which gives the same answer
+before and after `moveSubtree` because a move does not change the structure *below* the moved
+folder.
+
+`checkFileHierarchyIntegrity` additionally verifies that depths are the contiguous run `0..n-1` —
+meaningless for an array, load-bearing for a closure table, because `boundaryDepth()` compares
+depths and a gap silently changes which ancestors are in scope.
+
+### 6.6 What the shared unit-of-work must call
+
+Not built in this session (§13 of the brief). `folder.service.ts` currently does:
+
+```text
+folderRepository.moveSubtree(...)     // batch 1 — folders + folder_ancestors
+fileRepository.reparentSubtree(...)   // batch 2 — files + file_folder_ancestors
+```
+
+Two batches, so a crash between them leaves folders moved and files pointing at the old chain.
+The shared `d1-unit-of-work.ts` must compose, in one batch and in this order:
+
+1. `folders` UPDATE (parent, drive type, department, project, owner) with the optimistic guard;
+2. `folder_ancestors` rewrite for the moved folder and every descendant;
+3. `files` UPDATE for the subtree (drive type, department, project);
+4. `file_folder_ancestors` rewrite for every file in the subtree;
+5. no FTS refresh — a move changes no indexed column.
+
+Step 4 currently reads `folder_ancestors` *after* step 2 has run. Inside one batch it cannot, so
+the composed version must compute both chain sets in JavaScript before the batch opens, from the
+folder chains it already read. Both repositories need to expose their statement builders rather
+than only their `await`-ing methods; neither does yet.
+
+Note also that `reparentSubtree` emits one statement per (file, ancestor) pair. Chains are single
+digits deep, but a very large subtree will need chunking before this is used on production-scale
+data.
+
+---
+
+## 7. Status of this module
 
 | Step | State |
 |---|---|
 | Contract and method mapping | done (`05a8257`) |
-| Mongo implementation behind the contract, services rewired, routing flag | done |
-| D1 implementation | **not started** |
-| FTS search, lifecycle views on D1 | not started |
-| Folder+file atomic move (§7 of the brief) | not started |
+| Mongo implementation behind the contract, services rewired, routing flag | done (`c8d0010`, `b8b4c1d`) |
+| Drive-id lookup boundary tested on both engines | done (`4ac4d0d`) |
+| D1 implementation, FTS refresh, D1 routing | done |
+| Folder+file atomic move / shared unit-of-work | **not started** — §6.6 |
+| Mongo `aggregate` soft-delete inconsistency | **not fixed** — §6.3 |
+| File-version domain on D1 | not started |
+| Dedicated D1 search module | not started (module 8) |
 
-`DATA_SOURCE_FILES` exists but has no D1 implementation behind it: setting it to `d1` raises
-`D1FileRepositoryUnavailableError` rather than falling back. That is the point — a flag that
-silently served MongoDB would make a soak test worthless.
+Production configuration is unchanged: `DATA_SOURCE_FILES` is unset, so MongoDB serves every
+request. Nothing silently substitutes one database for the other in either direction.
 
 This document is written as the work proceeds rather than after it, so a half-finished module
 is visible as such.
