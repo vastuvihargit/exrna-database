@@ -146,7 +146,50 @@ normal drive UI path reaches them.
 
 ---
 
-## 5. Status of this module
+## 5. The Drive-id lookup, and the one place organization scoping is absent
+
+`findByDriveFileIdInternal(googleDriveFileId)` resolves
+
+```text
+file_versions.googleDriveFileId → file_versions.fileId → files._id
+```
+
+No Drive id is stored on `files`, and none is being added to simplify this: the rule that a
+`File` holds no storage location is the reason the column does not exist, and duplicating it
+would create a second copy to keep in step. Reading `file_versions` here is a *join*, not the
+start of file-version migration — no version-domain behaviour (creation, approval, restoration,
+history) is implemented in this module.
+
+**The lookup takes no `organizationId`, deliberately.** It is the one method in this contract
+with no tenant filter, so the reasoning is recorded rather than left to be rediscovered:
+
+- A Google Drive id is unique across the entire mirror. The unique partial index on
+  `file_versions.googleDriveFileId` carries no organization component, so one id resolves to at
+  most one version regardless of tenant.
+- The Drive change feed starts from a Drive id with **no organization in hand**. Scoping the
+  lookup would make another tenant's change resolve to `null`, be filed as an unmanaged item,
+  and the mirror's disagreement would never be reported — the failure the lookup exists to
+  prevent.
+- Isolation is therefore the *caller's* obligation, and `FileRecord.organizationId` is returned
+  so the caller can discharge it. The method is an authorization bypass reached only by the sync
+  worker; the architectural tests assert no API route imports an implementation or calls a
+  bypass.
+
+Ambiguity fails rather than guesses. The query reads **two** rows, not one: a `findOne` cannot
+distinguish "resolved" from "ambiguous". Two distinct `fileId`s for one Drive id logs the
+integrity problem and raises `AmbiguousDriveFileError`, because picking one arbitrarily would
+file a Drive change against the wrong research record.
+
+Trashed files resolve on purpose — a change arriving for a file trashed on this side is still
+ours.
+
+Five tests cover it (`tests/security/file-repository-boundary.test.ts`): resolution through
+`file_versions`, unknown and empty ids returning `null`, the trashed case, the cross-organization
+case above, and deterministic failure on duplicate linkage.
+
+---
+
+## 6. Status of this module
 
 | Step | State |
 |---|---|

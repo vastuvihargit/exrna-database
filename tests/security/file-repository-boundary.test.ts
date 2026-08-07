@@ -97,11 +97,15 @@ async function seedFile(
   return String(id);
 }
 
-async function seedVersion(fileId: string, googleDriveFileId: string | null): Promise<void> {
+async function seedVersion(
+  fileId: string,
+  googleDriveFileId: string | null,
+  organizationId: Types.ObjectId = ORG,
+): Promise<void> {
   const { FileVersionModel } = await import('@/server/db/models');
   await FileVersionModel.create([
     {
-      organizationId: ORG,
+      organizationId,
       fileId: new Types.ObjectId(fileId),
       versionNumber: 1,
       storageKey: `originals/${fileId}/v1`,
@@ -265,6 +269,27 @@ describe('findByDriveFileIdInternal', () => {
     const found = await facade.findByDriveFileIdInternal('drive-trashed');
     expect(found?.id).toBe(fileId);
     expect(found?.deletedAt).not.toBeNull();
+  });
+
+  it('resolves across organizations, because the Drive id space is not per-organization', async () => {
+    const facade = await import('@/server/repositories/file.repository');
+    const fileId = await seedFile({ organizationId: OTHER_ORG, ownerId: STRANGER });
+    await seedVersion(fileId, 'drive-other-org', OTHER_ORG);
+
+    // Asserted rather than assumed, because it is the one place in this contract where an
+    // organization filter is deliberately absent. A Google Drive id is unique across the whole
+    // mirror — the unique index on `file_versions.googleDriveFileId` carries no organization
+    // component — and the change feed starts from a Drive id with no organization in hand. Were
+    // this scoped, a change for another tenant's file would resolve to null, be filed as an
+    // unmanaged item, and the mirror's disagreement would go unreported.
+    //
+    // Isolation is therefore the caller's obligation, not this lookup's, and the record carries
+    // the `organizationId` a caller needs to discharge it. `findByDriveFileIdInternal` is an
+    // authorization bypass reached only by the sync worker; no user-facing route reaches it,
+    // which the architectural assertions below enforce.
+    const found = await facade.findByDriveFileIdInternal('drive-other-org');
+    expect(found?.id).toBe(fileId);
+    expect(found?.organizationId).toBe(String(OTHER_ORG));
   });
 
   it('fails deterministically when one Drive id is claimed by two files', async () => {
