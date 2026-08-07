@@ -153,6 +153,7 @@ export interface AclEntryWrite extends AclEntry {
 export interface FilePatch {
   displayName?: string;
   originalFilename?: string;
+  category?: FileCategory;
   folderId?: string;
   /** Ordered root → parent. Rewrites `file_folder_ancestors` wholesale in D1. */
   folderPathAncestors?: string[];
@@ -201,6 +202,12 @@ export interface FileGuard {
   approvalStatus?: string;
   status?: string;
   folderId?: string;
+  /**
+   * The Drive change feed's rename guard: apply the incoming name only while the local name
+   * is still the one the change was computed against, so a rename made here in the meantime
+   * is not silently overwritten by a stale Drive event.
+   */
+  displayName?: string;
 }
 
 export interface ReparentSubtreeInput {

@@ -326,7 +326,7 @@ export async function listSharedWithMe(
 
   const [files, folders] = await Promise.all([
     fileRepository.listSharedWith({
-      organizationId: actor.organizationId,
+      actor,
       principalIds,
       excludeOwnerId: actor.userId,
       page: input.page,
@@ -577,11 +577,9 @@ async function writeAcl(
   const updated =
     targetType === 'file'
       ? await fileRepository.updateById(targetId, {
-          $set: {
-            permissions,
-            updatedBy: actorUserId,
-            ...(inheritPermissions !== undefined ? { inheritPermissions } : {}),
-          },
+          permissions,
+          updatedBy: actorUserId,
+          ...(inheritPermissions !== undefined ? { inheritPermissions } : {}),
         })
       : await folderRepository.updateById(targetId, {
           permissions,

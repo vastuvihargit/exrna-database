@@ -38,11 +38,20 @@ export function fileResource(file: FileRecord): ResourceRef {
   };
 }
 
+/**
+ * The file and the folder chain a permission decision needs.
+ *
+ * Takes an `Actor` because `findById` is permission-aware: the lookup applies
+ * `resourceLookupFilter`, a superset of `canAccess`, so an id the actor has no route to does
+ * not load at all. `assertCan` below still makes the decision — this only stops a guessed id
+ * from reading the row in the first place.
+ */
 export async function loadFileContext(
+  actor: Actor,
   fileId: string,
   options: { includeDeleted?: boolean } = {},
 ): Promise<FileContext | null> {
-  const file = await fileRepository.findById(fileId, options);
+  const file = await fileRepository.findById(actor, fileId, options);
   if (!file) return null;
 
   // folderPathAncestors already ends with the containing folder, so this one query
@@ -74,7 +83,7 @@ export async function requireFile(
   permission: Permission,
   options: { includeDeleted?: boolean } = {},
 ): Promise<FileContext> {
-  const context = await loadFileContext(fileId, options);
+  const context = await loadFileContext(actor, fileId, options);
   if (!context) throw new NotFoundError();
 
   assertCan(actor, permission, fileResource(context.file), {

@@ -126,7 +126,7 @@ export async function submitForReview(
 
     await fileRepository.updateById(
       fileId,
-      { $set: { reviewStatus: 'submitted', approvalStatus: 'pending', updatedBy: actor.userId } },
+      { reviewStatus: 'submitted', approvalStatus: 'pending', updatedBy: actor.userId },
       session,
     );
 
@@ -315,12 +315,10 @@ export async function decide(
       await fileRepository.updateById(
         review.fileId,
         {
-          $set: {
-            reviewStatus: 'approved',
-            approvalStatus: 'approved',
-            approvedVersionId: review.versionId,
-            updatedBy: actor.userId,
-          },
+          reviewStatus: 'approved',
+          approvalStatus: 'approved',
+          approvedVersionId: review.versionId,
+          updatedBy: actor.userId,
         },
         session,
       );
@@ -328,9 +326,7 @@ export async function decide(
       await versionRepository.updateFlags(review.versionId, { $set: { label: 'draft' } }, session);
       await fileRepository.updateById(
         review.fileId,
-        {
-          $set: { reviewStatus: 'rejected', approvalStatus: 'rejected', updatedBy: actor.userId },
-        },
+        { reviewStatus: 'rejected', approvalStatus: 'rejected', updatedBy: actor.userId },
         session,
       );
     } else if (close?.status === 'changes_requested') {
@@ -341,15 +337,13 @@ export async function decide(
       );
       await fileRepository.updateById(
         review.fileId,
-        {
-          $set: { reviewStatus: 'changes_requested', approvalStatus: 'none', updatedBy: actor.userId },
-        },
+        { reviewStatus: 'changes_requested', approvalStatus: 'none', updatedBy: actor.userId },
         session,
       );
     } else {
       await fileRepository.updateById(
         review.fileId,
-        { $set: { reviewStatus: 'in_review', updatedBy: actor.userId } },
+        { reviewStatus: 'in_review', updatedBy: actor.userId },
         session,
       );
     }
@@ -456,7 +450,7 @@ export async function cancelReview(
     await versionRepository.updateFlags(review.versionId, { $set: { label: 'draft' } }, session);
     await fileRepository.updateById(
       review.fileId,
-      { $set: { reviewStatus: 'draft', approvalStatus: 'none', updatedBy: actor.userId } },
+      { reviewStatus: 'draft', approvalStatus: 'none', updatedBy: actor.userId },
       session,
     );
   });

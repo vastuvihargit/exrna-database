@@ -770,7 +770,10 @@ async function importItem(
 
     // Deduplication on *our* checksum, measured while streaming — never Drive's MD5.
     if (job.options.skipDuplicates) {
-      const existing = await fileRepository.findByChecksum(job.organizationId, stored.checksumSha256);
+      const existing = await fileRepository.findByChecksumInternal(
+        job.organizationId,
+        stored.checksumSha256,
+      );
       if (existing) {
         await storage.deleteFile(staging.key, staging.area).catch(() => undefined);
         await migrationRepository.updateItem(item.id, {
@@ -870,7 +873,7 @@ async function importItem(
         await versionRepository.setCurrent(file.id, version.id, session);
         await fileRepository.updateById(
           file.id,
-          { $set: { currentVersionId: version.id }, $inc: { versionCount: 1 } },
+          { currentVersionId: version.id, versionCountDelta: 1 },
           session,
         );
 

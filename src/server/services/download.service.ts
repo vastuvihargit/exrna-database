@@ -85,7 +85,7 @@ export async function download(
 
   // Counted once per request, including ranged ones: a resumed download is still one
   // download, and the audit trail is what makes "who took this data" answerable.
-  await fileRepository.updateById(fileId, { $inc: { downloadCount: 1 } });
+  await fileRepository.updateById(fileId, { downloadCountDelta: 1 });
 
   await auditService.recordForActor(actor, meta, {
     action: 'file.download',

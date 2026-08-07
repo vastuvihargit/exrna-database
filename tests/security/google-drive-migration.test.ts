@@ -227,8 +227,8 @@ describe('importing', () => {
     expect(mirrored, 'the Drive folder should have been mirrored').toBeTruthy();
 
     const files = await fileRepository.listInFolder({
+      actor: admin,
       folderId: mirrored!.id,
-      visibility: {},
       page: 1,
       pageSize: 10,
       sort: 'displayName',
@@ -460,8 +460,8 @@ describe('importing', () => {
     // "A failed upload does not create a valid file record" — the same promise, applied
     // to an import.
     const files = await fileRepository.listInFolder({
+      actor: admin,
       folderId: rootFolderId,
-      visibility: {},
       page: 1,
       pageSize: 50,
       sort: 'displayName',

@@ -121,20 +121,18 @@ export async function restoreVersion(
       await fileRepository.updateById(
         fileId,
         {
-          $set: {
-            currentVersionId: version.id,
-            sizeBytes: source.fileSize,
-            mimeType: source.mimeType,
-            checksumSha256: source.checksumSha256,
-            originalFilename: source.originalFilename,
-            updatedBy: actor.userId,
-            // Same rule as a fresh upload: the file's content changed, so the review
-            // cycle restarts. The previously approved version keeps its own flags.
-            reviewStatus: 'draft',
-            approvalStatus: 'none',
-            approvedVersionId: null,
-          },
-          $inc: { versionCount: 1 },
+          currentVersionId: version.id,
+          sizeBytes: source.fileSize,
+          mimeType: source.mimeType,
+          checksumSha256: source.checksumSha256,
+          originalFilename: source.originalFilename,
+          updatedBy: actor.userId,
+          // Same rule as a fresh upload: the file's content changed, so the review
+          // cycle restarts. The previously approved version keeps its own flags.
+          reviewStatus: 'draft',
+          approvalStatus: 'none',
+          approvedVersionId: null,
+          versionCountDelta: 1,
         },
         dbSession,
       );

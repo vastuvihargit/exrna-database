@@ -14,14 +14,13 @@ import { isPreviewable, type FileCategory } from '@/server/domain/file-types';
 import { CONFIDENTIALITY_RANK, type ConfidentialityLevel } from '@/server/domain/permissions';
 import { validateResearchMetadata } from '@/server/domain/research-metadata';
 import { actorClearance, type Actor } from '@/server/permissions/actor';
-import { childVisibilityFilter, resourceVisibilityFilter } from '@/server/permissions/visibility';
 import { can } from '@/server/permissions/authorize';
 import { auditService } from '@/server/audit/audit.service';
 import * as activityRepository from '@/server/repositories/activity.repository';
 import * as commentRepository from '@/server/repositories/comment.repository';
 import * as notificationRepository from '@/server/repositories/notification.repository';
 import * as fileRepository from '@/server/repositories/file.repository';
-import type { FileRecord, FileSortField } from '@/server/repositories/file.repository';
+import type { FilePatch, FileRecord, FileSortField } from '@/server/repositories/file.repository';
 import * as versionRepository from '@/server/repositories/file-version.repository';
 import * as folderRepository from '@/server/repositories/folder.repository';
 import type { FolderRecord } from '@/server/repositories/folder.repository';
@@ -98,8 +97,8 @@ export async function listInFolder(
   const folder = await requireFolder(actor, folderId, 'file.view');
 
   const { items, total } = await fileRepository.listInFolder({
+    actor,
     folderId,
-    visibility: childVisibilityFilter(actor),
     ...(input.search ? { searchPrefix: input.search } : {}),
     page: input.page,
     pageSize: input.pageSize,
@@ -172,12 +171,11 @@ export async function renameFile(
     apply: mirror.apply,
     revert: mirror.revert,
     commit: async () => {
+      // `displayNameLower` is written by the repository alongside `displayName`, so the
+      // two cannot disagree.
       const result = await fileRepository.updateById(fileId, {
-        $set: {
-          displayName,
-          displayNameLower: displayName.toLowerCase(),
-          updatedBy: actor.userId,
-        },
+        displayName,
+        updatedBy: actor.userId,
       });
       if (!result) throw new NotFoundError();
       return result;
@@ -252,15 +250,13 @@ export async function moveFile(
     const moved = await fileRepository.updateById(
       fileId,
       {
-        $set: {
-          folderId: target.folder.id,
-          folderPathAncestors: [...target.folder.pathAncestors, target.folder.id],
-          driveType: target.folder.driveType,
-          departmentId: target.folder.departmentId,
-          projectId: target.folder.projectId,
-          ownerId: target.folder.driveType === 'my' ? target.folder.ownerId : context.file.ownerId,
-          updatedBy: actor.userId,
-        },
+        folderId: target.folder.id,
+        folderPathAncestors: [...target.folder.pathAncestors, target.folder.id],
+        driveType: target.folder.driveType,
+        departmentId: target.folder.departmentId,
+        projectId: target.folder.projectId,
+        ownerId: target.folder.driveType === 'my' ? target.folder.ownerId : context.file.ownerId,
+        updatedBy: actor.userId,
       },
       session,
     );
@@ -358,7 +354,7 @@ export async function copyFile(
   const target = await requireFolder(actor, targetFolderId, 'file.upload');
   const created = await performCopy(actor, context, target.folder, meta);
 
-  const refreshed = await loadFileContext(created.id);
+  const refreshed = await loadFileContext(actor, created.id);
   return toView(refreshed ?? { ...context, file: created }, actor, false);
 }
 
@@ -385,8 +381,8 @@ export async function copyFilesForFolderCopy(
     if (!targetFolder) continue;
 
     const { items } = await fileRepository.listInFolder({
+      actor,
       folderId: sourceFolderId,
-      visibility: childVisibilityFilter(actor),
       page: 1,
       pageSize: 500,
       sort: 'displayName',
@@ -394,7 +390,7 @@ export async function copyFilesForFolderCopy(
     });
 
     for (const file of items) {
-      const context = await loadFileContext(file.id);
+      const context = await loadFileContext(actor, file.id);
       if (!context) continue;
       if (!can(actor, 'resource.copy', fileResource(file), { ancestorAcls: context.ancestorAcls })) {
         skipped += 1;
@@ -522,7 +518,7 @@ async function performCopy(
 
       await fileRepository.updateById(
         file.id,
-        { $set: { currentVersionId: version.id }, $inc: { versionCount: 1 } },
+        { currentVersionId: version.id, versionCountDelta: 1 },
         session,
       );
       await folderRepository.updateById(target.folder.id, { fileCountDelta: 1 }, session);
@@ -576,8 +572,7 @@ export async function updateFile(
   const context = await requireFile(actor, fileId, 'metadata.edit');
   assertNotApproved(context, 'edited');
 
-  const update: Record<string, unknown> = { updatedBy: actor.userId };
-  const unset: Record<string, ''> = {};
+  const update: FilePatch = { updatedBy: actor.userId };
 
   if (input.tags !== undefined) {
     // Deduplicated case-insensitively: "qPCR" and "qpcr" as separate tags would split
@@ -640,14 +635,11 @@ export async function updateFile(
     // Keys are checked against the research-metadata allow-list, so nothing
     // caller-controlled reaches a dotted path or a `$`-prefixed key in the document.
     const { set, unset: cleared } = validateResearchMetadata(input.metadata);
-    for (const [key, value] of Object.entries(set)) update[`metadata.${key}`] = value;
-    for (const key of cleared) unset[`metadata.${key}`] = '';
+    update.metadataSet = set;
+    if (cleared.length > 0) update.metadataUnset = [...cleared];
   }
 
-  const updated = await fileRepository.updateById(fileId, {
-    $set: update,
-    ...(Object.keys(unset).length > 0 ? { $unset: unset } : {}),
-  });
+  const updated = await fileRepository.updateById(fileId, update);
   if (!updated) throw new NotFoundError();
 
   // Counters are adjusted after the file row is written, and failure to adjust one is not
@@ -708,8 +700,7 @@ export async function listRelated(
     typeof file.metadata.experimentCode === 'string' ? file.metadata.experimentCode : null;
 
   const candidates = await fileRepository.findRelated({
-    visibility: resourceVisibilityFilter(actor),
-    organizationId: actor.organizationId,
+    actor,
     excludeFileId: fileId,
     experimentId: file.experimentId,
     sampleId,
@@ -846,7 +837,9 @@ export async function restoreFile(
       }),
   });
 
-  const restored = await fileRepository.findById(fileId);
+  // Internal: re-reading the row this request just restored, whose permission was
+  // asserted at the top of the request.
+  const restored = await fileRepository.findByIdInternal(fileId);
   if (!restored) throw new NotFoundError();
 
   await record(actor, meta, restored, 'resource.restore', { severity: 'notice' });
@@ -887,15 +880,14 @@ export async function listTrash(
   input: { page: number; pageSize: number },
 ): Promise<{ items: FileView[]; total: number }> {
   const { items, total } = await fileRepository.listTrashed({
-    organizationId: actor.organizationId,
-    visibility: childVisibilityFilter(actor),
+    actor,
     page: input.page,
     pageSize: input.pageSize,
   });
 
   const views = await Promise.all(
     items.map(async (item) => {
-      const context = await loadFileContext(item.id, { includeDeleted: true });
+      const context = await loadFileContext(actor, item.id, { includeDeleted: true });
       return context ? toView(context, actor, false) : null;
     }),
   );
@@ -914,7 +906,7 @@ export async function listTrash(
 export async function purgeExpiredTrash(): Promise<{ files: number; bytes: number }> {
   const env = getEnv();
   const cutoff = new Date(Date.now() - env.TRASH_RETENTION_DAYS * 24 * 60 * 60 * 1000);
-  const expired = await fileRepository.findExpiredTrash(cutoff);
+  const expired = await fileRepository.findExpiredTrashInternal(cutoff);
   if (expired.length === 0) return { files: 0, bytes: 0 };
 
   const ids = expired.map((file) => file.id);
@@ -957,7 +949,7 @@ export async function purgeExpiredTrash(): Promise<{ files: number; bytes: numbe
 /* --------------------------------------------------------------- helpers */
 
 async function resolveMany(actor: Actor, ids: string[]): Promise<FileView[]> {
-  const contexts = await Promise.all(ids.map((id) => loadFileContext(id)));
+  const contexts = await Promise.all(ids.map((id) => loadFileContext(actor, id)));
   const starred = await starRepository.starredIdsAmong(actor.userId, 'file', ids);
   const views: FileView[] = [];
 

@@ -10,7 +10,6 @@ import { sanitizeDisplayName } from '@/server/domain/naming';
 import type { ConfidentialityLevel } from '@/server/domain/permissions';
 import type { Actor } from '@/server/permissions/actor';
 import { actorHasCompanyWideRead } from '@/server/permissions/actor';
-import { resourceVisibilityFilter } from '@/server/permissions/visibility';
 import { auditService } from '@/server/audit/audit.service';
 import * as activityRepository from '@/server/repositories/activity.repository';
 import type { ActivityRecord } from '@/server/repositories/activity.repository';
@@ -270,7 +269,6 @@ export interface ProjectOverview {
  */
 export async function overview(actor: Actor, projectId: string): Promise<ProjectOverview> {
   const project = await getById(actor, projectId);
-  const visibility = resourceVisibilityFilter(actor);
 
   const [department, memberRecords, content, experimentCounts, recentExperiments, activity] =
     await Promise.all([
@@ -278,7 +276,7 @@ export async function overview(actor: Actor, projectId: string): Promise<Project
       userRepository.findByIds(
         [...new Set([...project.memberUserIds, ...(project.leadUserId ? [project.leadUserId] : [])])],
       ),
-      fileRepository.projectContentBreakdown(visibility, project.id),
+      fileRepository.projectContentBreakdown(actor, project.id),
       experimentRepository.countByStatusForProject(project.id),
       experimentRepository.listForProject(project.id, 8),
       activityRepository.listForProject(project.id, 20),

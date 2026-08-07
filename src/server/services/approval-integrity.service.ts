@@ -254,7 +254,9 @@ async function supersedeApproval(input: {
 }): Promise<void> {
   const { binding, current, reason } = input;
 
-  const file = await fileRepository.findById(binding.fileId, { includeDeleted: true });
+  // Internal: the approval-integrity sweep is a background job with no actor, and it must see
+  // trashed files because an approval that drifted still has to be withdrawn.
+  const file = await fileRepository.findByIdInternal(binding.fileId, { includeDeleted: true });
   if (!file) {
     getLogger().warn(
       { versionId: binding.versionId, fileId: binding.fileId },
@@ -290,11 +292,9 @@ async function supersedeApproval(input: {
       binding.fileId,
       { approvedVersionId: binding.versionId },
       {
-        $set: {
-          reviewStatus: 'changes_requested',
-          approvalStatus: 'none',
-          approvedVersionId: null,
-        },
+        reviewStatus: 'changes_requested',
+        approvalStatus: 'none',
+        approvedVersionId: null,
       },
       session,
     );

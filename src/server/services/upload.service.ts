@@ -471,18 +471,16 @@ async function buildFileFromSession(
       await fileRepository.updateById(
         fileId,
         {
-          $set: {
-            currentVersionId: version.id,
-            sizeBytes: measuredSize,
-            mimeType: session.resolvedMimeType,
-            checksumSha256: checksum,
-            originalFilename: session.declaredFilename,
-            updatedBy: actor.userId,
-            // A new version resets the review cycle: an approved file that changes is
-            // no longer an approved file (docs/phase-0/05, versioning rules).
-            ...(isNewFile ? {} : { reviewStatus: 'draft', approvalStatus: 'none' }),
-          },
-          $inc: { versionCount: 1 },
+          currentVersionId: version.id,
+          sizeBytes: measuredSize,
+          mimeType: session.resolvedMimeType,
+          checksumSha256: checksum,
+          originalFilename: session.declaredFilename,
+          updatedBy: actor.userId,
+          // A new version resets the review cycle: an approved file that changes is
+          // no longer an approved file (docs/phase-0/05, versioning rules).
+          ...(isNewFile ? {} : { reviewStatus: 'draft', approvalStatus: 'none' }),
+          versionCountDelta: 1,
         },
         dbSession,
       );
@@ -911,7 +909,9 @@ async function describeExistingResult(
   versionId: string,
 ): Promise<FinalizedUpload> {
   const [file, version] = await Promise.all([
-    fileRepository.findById(fileId),
+    // Internal: describing the upload this request just finalized, whose permission was
+    // asserted when the session was opened.
+    fileRepository.findByIdInternal(fileId),
     versionRepository.findById(versionId),
   ]);
   if (!file || !version) throw new NotFoundError();

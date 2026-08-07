@@ -397,7 +397,8 @@ describe('version restore appends rather than rewinds', () => {
 
     // Simulate the state Phase 8 produces: the current version is signed off.
     await fileRepository.updateById(uploaded.fileId, {
-      $set: { approvalStatus: 'approved', reviewStatus: 'approved' },
+      approvalStatus: 'approved',
+      reviewStatus: 'approved',
     });
     await versionRepository.updateFlags(versions[0]!.id, {
       $set: { isApproved: true, label: 'approved' },

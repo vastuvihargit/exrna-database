@@ -25,7 +25,7 @@ async function main() {
   const expiredFolders = await folderRepository.findExpiredTrashInternal(cutoff, 1000);
   // Files are purged in the same pass because they hold the bytes: a trashed file whose
   // folder was never trashed would otherwise sit on disk and against a quota forever.
-  const expiredFiles = await fileRepository.findExpiredTrash(cutoff, 1000);
+  const expiredFiles = await fileRepository.findExpiredTrashInternal(cutoff, 1000);
 
   console.log(
     `Retention: ${env.TRASH_RETENTION_DAYS} days (deleted on or before ${cutoff.toISOString()})`,

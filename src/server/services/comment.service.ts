@@ -431,7 +431,7 @@ export const commentService = {
 
 /** Exported for the file-details panel's unread badge. */
 export async function commentCount(actor: Actor, fileId: string): Promise<number> {
-  const context = await loadFileContext(fileId);
+  const context = await loadFileContext(actor, fileId);
   if (!context) return 0;
   if (!can(actor, 'file.view', fileResource(context.file), { ancestorAcls: context.ancestorAcls })) {
     return 0;

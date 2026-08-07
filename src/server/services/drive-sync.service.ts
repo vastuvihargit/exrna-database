@@ -437,7 +437,9 @@ async function markMissing(
   summary.missing += 1;
   summary.conflicts += 1;
 
-  const file = await fileRepository.findById(fileId, { includeDeleted: true });
+  // Internal: the Drive change feed runs as the sync worker, not as a user, and must see
+  // files that have since been trashed here.
+  const file = await fileRepository.findByIdInternal(fileId, { includeDeleted: true });
 
   await auditService.recordSystem({
     action: 'drive_storage.file_missing',
@@ -465,7 +467,9 @@ async function applyFileChange(
     return;
   }
 
-  const file = await fileRepository.findById(version.fileId, { includeDeleted: true });
+  // Internal: same reason - a Drive change names a version, and the owning file may be
+  // trashed here without the change ceasing to be ours.
+  const file = await fileRepository.findByIdInternal(version.fileId, { includeDeleted: true });
   if (!file) {
     getLogger().warn(
       { versionId: version.versionId, fileId: version.fileId },
@@ -551,7 +555,9 @@ async function applyRename(
   const updated = await fileRepository.updateByIdWhere(
     file.id,
     { displayName: previous },
-    { $set: { displayName: driveFile.name, displayNameLower: driveFile.name.toLowerCase() } },
+    // `displayNameLower` is written by the repository alongside `displayName`; the two must
+    // not be able to disagree, so callers no longer set it themselves.
+    { displayName: driveFile.name },
   );
   if (!updated) return;
 

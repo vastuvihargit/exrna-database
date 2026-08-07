@@ -406,7 +406,9 @@ async function recordLocalCopyEvent(
   candidate: LocalCopyCandidate,
   audit?: SweepInput['audit'],
 ): Promise<void> {
-  const file = await fileRepository.findById(candidate.fileId, { includeDeleted: true });
+  // Internal: the local-copy sweep is a storage job that runs as no user, and it must see
+  // trashed files because their bytes still occupy the volume it is reclaiming.
+  const file = await fileRepository.findByIdInternal(candidate.fileId, { includeDeleted: true });
 
   const event = {
     action:
