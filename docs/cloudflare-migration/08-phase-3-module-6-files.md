@@ -292,32 +292,22 @@ folder.
 meaningless for an array, load-bearing for a closure table, because `boundaryDepth()` compares
 depths and a gap silently changes which ancestors are in scope.
 
-### 6.6 What the shared unit-of-work must call
+### 6.6 The shared unit-of-work — **done**, see `09-phase-3-module-7-atomic-moves.md`
 
-Not built in this session (§13 of the brief). `folder.service.ts` currently does:
+A folder move on D1 is now **one batch**. `src/server/db/d1-unit-of-work.ts` composes both
+repositories' statement builders; `folder.service.ts` calls it whenever both modules are on D1,
+and refuses the move outright when they are split across databases.
 
-```text
-folderRepository.moveSubtree(...)     // batch 1 — folders + folder_ancestors
-fileRepository.reparentSubtree(...)   // batch 2 — files + file_folder_ancestors
-```
+The two changes this required in module 6's code:
 
-Two batches, so a crash between them leaves folders moved and files pointing at the old chain.
-The shared `d1-unit-of-work.ts` must compose, in one batch and in this order:
-
-1. `folders` UPDATE (parent, drive type, department, project, owner) with the optimistic guard;
-2. `folder_ancestors` rewrite for the moved folder and every descendant;
-3. `files` UPDATE for the subtree (drive type, department, project);
-4. `file_folder_ancestors` rewrite for every file in the subtree;
-5. no FTS refresh — a move changes no indexed column.
-
-Step 4 currently reads `folder_ancestors` *after* step 2 has run. Inside one batch it cannot, so
-the composed version must compute both chain sets in JavaScript before the batch opens, from the
-folder chains it already read. Both repositories need to expose their statement builders rather
-than only their `await`-ing methods; neither does yet.
-
-Note also that `reparentSubtree` emits one statement per (file, ancestor) pair. Chains are single
-digits deep, but a very large subtree will need chunking before this is used on production-scale
-data.
+* `reparentSubtree` was rebuilt around `INSERT ... SELECT` over `files.folder_id`, so it emits
+  one statement per (folder, depth) instead of one per (file, ancestor). The batch no longer
+  grows with the file count at all — the chunking this section used to warn about is not needed,
+  because a folder with a million files costs the same as a folder with one.
+* the planning half was split out as `planFileReparent`, and the building half as
+  `buildFileReparentStatements`, so the unit-of-work can supply chains computed in memory while
+  the standalone path keeps reading them from `folder_ancestors`. One implementation, two
+  sources of the same input.
 
 ---
 
@@ -329,7 +319,7 @@ data.
 | Mongo implementation behind the contract, services rewired, routing flag | done (`c8d0010`, `b8b4c1d`) |
 | Drive-id lookup boundary tested on both engines | done (`4ac4d0d`) |
 | D1 implementation, FTS refresh, D1 routing | done |
-| Folder+file atomic move / shared unit-of-work | **not started** — §6.6 |
+| Folder+file atomic move / shared unit-of-work | done — `09-phase-3-module-7-atomic-moves.md` |
 | Mongo `aggregate` soft-delete inconsistency | **not fixed** — §6.3 |
 | File-version domain on D1 | not started |
 | Dedicated D1 search module | not started (module 8) |

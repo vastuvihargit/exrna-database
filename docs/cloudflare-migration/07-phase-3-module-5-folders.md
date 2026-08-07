@@ -102,11 +102,17 @@ mutation*. That is real atomicity and it is still needed while `files` is on Mon
 handle stays on the contract (`FolderTx`) and the Mongo implementation uses it exactly as before.
 
 D1 does not honour it, and does not pretend to. Every D1 mutation here is internally atomic
-through `db.batch()` — the guarantee the session was providing for *these* statements. What
-cannot be reproduced while the two modules sit on different engines is atomicity **across**
-them: with `DATA_SOURCE_FOLDERS=d1` a folder move writes `folders` in D1 and `files` in MongoDB,
-and no transaction spans both. That is a property of the mixed window, it is why the flag must
-not be enabled in production before module 6, and it closes when the file repository moves.
+through `db.batch()` — the guarantee the session was providing for *these* statements.
+
+**Update (module 7).** Atomicity *across* folders and files is now provided on D1 as well, by
+`src/server/db/d1-unit-of-work.ts`: a folder move composes both repositories' statement builders
+into a single batch. `moveSubtree` below is still the folders-only path and is unchanged; what
+the service calls for a real move is the composed one. See
+`09-phase-3-module-7-atomic-moves.md`.
+
+The mixed window it describes has not been made safe — it has been **closed by refusal**. With
+`DATA_SOURCE_FOLDERS` and `DATA_SOURCE_FILES` set to different values, a folder move returns 409
+rather than writing `folders` in one database and `files` in another. Reads are unaffected.
 
 ---
 
@@ -278,7 +284,8 @@ correct signal.
 
 | Item | Phase |
 |---|---|
-| Cross-store atomicity for folder+file mutations (move, trash, restore) | 3, module 6 — closes when files move |
+| Cross-store atomicity for folder+file **moves** | done — 3, module 7 (`d1-unit-of-work.ts`) |
+| Cross-store atomicity for folder+file **trash / restore / archive** | still two batches on D1 — see module 7 doc §11 |
 | `folder-mirror.ts`, `drive-mirror.ts` and `storage-migration/planner.ts` read `FolderModel` directly and are MongoDB-only | Drive storage phase |
 | `(file_id, depth)` index on `file_folder_ancestors` if file listings become hot | measure first |
 | `checkHierarchyIntegrity` behind an admin endpoint or a scheduled job | 6 |

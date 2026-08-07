@@ -73,23 +73,21 @@ GOOGLE_CLIENT_SECRET=
 # DATA_SOURCE_ROLES=d1
 # DATA_SOURCE_PROJECTS=d1
 # DATA_SOURCE_EXPERIMENTS=d1
-# `folders` stands alone, but only until `files` moves. A folder move rewrites the folder
-# tree and the files inside it, and no transaction spans two databases — so while this is
-# "d1" and DATA_SOURCE_FILES is not, a failure part-way through a move can leave the two
-# disagreeing about where a file lives. Safe for a single-module soak; not a combination to
-# leave running once module 6 exists.
+# `folders` and `files` must be set together. A folder move rewrites the folder tree and the
+# files inside it, and no transaction spans two databases — so rather than committing one half
+# to each, a folder move is **refused with a 409** whenever these two flags disagree. Reads are
+# unaffected. Setting only this one is still fine for a read-only soak of the folder module.
 # DATA_SOURCE_FOLDERS=d1
 #
-# The D1 file repository exists as of Phase 3 module 6, so this flag now selects it rather
-# than failing. Enable it **together with** DATA_SOURCE_FOLDERS. A folder move rewrites the
-# folder tree and the location of every file inside it; with the two modules on different
-# databases no transaction spans both halves, so a failure part-way through leaves them
-# disagreeing about where a file lives. Folders-on-D1 with files-on-Mongo is a temporary
-# development and soak state, not a configuration to run for long.
+# The D1 file repository exists as of Phase 3 module 6, so this flag selects it rather than
+# failing. Set it **together with** DATA_SOURCE_FOLDERS: as of module 7 a folder move is one
+# atomic D1 batch covering folders and files, and a configuration with the two modules on
+# different databases **refuses folder moves outright** (409) rather than committing one half
+# to each. That is deliberate — no transaction spans MongoDB and D1. Reads still work under a
+# split configuration; only hierarchy mutations are blocked.
 #
-# Even with both on D1 the move is still two batches until the shared unit-of-work lands —
-# see §6.6 of docs/cloudflare-migration/08-phase-3-module-6-files.md. The window is much
-# smaller than a cross-database one, but it is not yet zero.
+# With both on d1 the move is genuinely atomic: see
+# docs/cloudflare-migration/09-phase-3-module-7-atomic-moves.md.
 # DATA_SOURCE_FILES=d1
 
 # ── Cloudflare Access (Phase 8) ───────────────────────────────────────────────────────
