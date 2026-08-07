@@ -5,12 +5,15 @@
  * variable, a typo, and a misspelled module name all resolve to it (`data-source.ts`), so the
  * only way to read files from anywhere else is to ask for it by name.
  *
- * **There is no fallback.** Asking for D1 today does not quietly serve MongoDB — the D1
- * implementation does not exist yet, so the request fails with a message that says exactly
- * that. A silent fallback would mean an operator believing they were soaking D1 while every
- * read came from MongoDB, and the first symptom would be a migration signed off on evidence
- * that was never collected. The same reasoning applies once the implementation lands: a D1
- * error propagates rather than being retried against MongoDB.
+ * **There is no fallback.** A D1 error propagates rather than being retried against MongoDB.
+ * A silent fallback would mean an operator believing they were soaking D1 while some or all
+ * reads came from MongoDB, and the first symptom would be a migration signed off on evidence
+ * that was never collected.
+ *
+ * Until Phase 3 module 6 landed `file.repository.d1.ts`, asking for D1 raised
+ * `D1FileRepositoryUnavailableError` for the same reason. The implementation now exists, so the
+ * flag resolves normally and that error is gone; what has not changed is that nothing silently
+ * substitutes one database for the other.
  *
  * The dispatch is per call rather than cached at module load, so flipping the variable takes
  * effect on the next request without a restart.
@@ -19,9 +22,9 @@
  * answer "which database served this?" from the logs of an incident, not enough to be noise.
  */
 import { getLogger } from '@/server/logging/logger';
-import { AppError } from '@/server/errors/app-error';
 import { isD1 } from './data-source';
 import { mongoFileRepository } from './file.repository.mongo';
+import { d1FileRepository } from './file.repository.d1';
 import type {
   AclEntryWrite,
   CreateFileInput,
@@ -66,32 +69,7 @@ export type {
 };
 
 /** Re-exported so a test can assert the two paths agree without importing both by path. */
-export { mongoFileRepository };
-
-/**
- * Raised when `DATA_SOURCE_FILES=d1` is set before module 6 has landed its implementation.
- *
- * Deliberately a hard failure rather than a warning-and-fallback. The flag exists so an
- * operator can move one module at a time and *observe* the result; serving MongoDB while the
- * logs say "files: d1" would make that observation worthless, and the mistake would only
- * surface much later as a migration verified against the wrong database.
- */
-export class D1FileRepositoryUnavailableError extends AppError {
-  constructor() {
-    super(
-      'INTERNAL_ERROR',
-      'The file service is not available. Please contact an administrator.',
-      500,
-      {
-        details: {
-          reason:
-            'DATA_SOURCE_FILES=d1 but the D1 file repository is not implemented yet ' +
-            '(Phase 3, module 6). Unset DATA_SOURCE_FILES to use MongoDB.',
-        },
-      },
-    );
-  }
-}
+export { mongoFileRepository, d1FileRepository };
 
 let announced: 'mongo' | 'd1' | null = null;
 
@@ -102,14 +80,7 @@ function active(): FileRepository {
     announced = selected;
     getLogger().info({ module: 'files', dataSource: selected }, 'File repository selected');
   }
-  if (d1) {
-    getLogger().error(
-      { module: 'files' },
-      'DATA_SOURCE_FILES=d1 but the D1 file repository has not been implemented yet',
-    );
-    throw new D1FileRepositoryUnavailableError();
-  }
-  return mongoFileRepository;
+  return d1 ? d1FileRepository : mongoFileRepository;
 }
 
 /* -------------------------------------------------- permission-aware reads */

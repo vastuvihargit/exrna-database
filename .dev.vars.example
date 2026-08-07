@@ -80,11 +80,16 @@ GOOGLE_CLIENT_SECRET=
 # leave running once module 6 exists.
 # DATA_SOURCE_FOLDERS=d1
 #
-# Once the D1 file repository lands, enable these two **together**. A folder move rewrites
-# the folder tree and the location of every file inside it; with the two modules on
-# different databases no transaction spans both halves, so a failure part-way through
-# leaves them disagreeing about where a file lives. Folders-on-D1 with files-on-Mongo is a
-# temporary development and soak state, not a configuration to run for long.
+# The D1 file repository exists as of Phase 3 module 6, so this flag now selects it rather
+# than failing. Enable it **together with** DATA_SOURCE_FOLDERS. A folder move rewrites the
+# folder tree and the location of every file inside it; with the two modules on different
+# databases no transaction spans both halves, so a failure part-way through leaves them
+# disagreeing about where a file lives. Folders-on-D1 with files-on-Mongo is a temporary
+# development and soak state, not a configuration to run for long.
+#
+# Even with both on D1 the move is still two batches until the shared unit-of-work lands —
+# see §6.6 of docs/cloudflare-migration/08-phase-3-module-6-files.md. The window is much
+# smaller than a cross-database one, but it is not yet zero.
 # DATA_SOURCE_FILES=d1
 
 # ── Cloudflare Access (Phase 8) ───────────────────────────────────────────────────────
