@@ -27,6 +27,53 @@ tests/security/folder-management.test.ts  + 4 MongoDB parity tests
 
 ---
 
+## 1a. Method mapping
+
+Every public method on the MongoDB repository, and what it became. The names are identical on
+both sides — the contract was extracted from the MongoDB implementation rather than invented —
+so the column that carries information is not "D1 method" but the three after it.
+
+"Visibility" is the predicate applied **inside** the query: `lookup` is `lookupVisibility()`
+(single-row, a superset of `canAccess`), `child` is `childVisibility()`, `resource` is
+`resourceVisibility()`. "—" means the method takes no actor, and the next column says why that
+is safe.
+
+| MongoDB method | D1 method | Tables | Visibility | Atomic | Tests |
+|---|---|---|---|---|---|
+| `findById` | same | `folders`, `folder_ancestors`, `resource_permissions` | `lookup` | — | 1–18, 20, 21 |
+| `findByIds` | same | as above | `lookup` | — | 25, 26 |
+| `listChildrenOf` | same | as above | `child` | — | 22, 23, 23b, archived |
+| `countChildrenOf` | same | `folders`, `resource_permissions` | `child` | — | 22, 23 |
+| `listTrashed` | same | as above | `child` | — | 19, 27 |
+| `listArchived` | same | as above | `child` | — | archived listing |
+| `search` | same | as above + `folder_ancestors` | `resource` | — | 24, 24b, 24c |
+| `listSharedWith` | same | as above | principals + live-grant `EXISTS` | — | 28 |
+| `existsWithName` | same | `folders` | — structural; name collision within one parent, no row returned | — | duplicate names |
+| `findChildByName` | same | `folders` | — caller has authorised the parent | — | duplicate names |
+| `takenChildNames` | same | `folders` | — returns names only, inside an authorised parent | — | taken names |
+| `countDescendants` | same | `folders`, `folder_ancestors` | — subtree mutation authorised at its root | — | descendants |
+| `findByIdInternal` | same | `folders`, `folder_ancestors` | **bypass** — §4 | — | 20, 21, Drive mirror |
+| `findByIdsInternal` | same | as above | **bypass** — the ancestor chain must be complete | — | boundary tests |
+| `findByDriveFolderIdInternal` | same | as above | **bypass** — Drive change feed | — | mirrored-folder test |
+| `findByRootKeyInternal` | same | as above | **bypass** — drive already authorised | — | roots |
+| `findByRootKeysInternal` | same | as above | **bypass** — as above | — | roots |
+| `listDescendantsInternal` | same | `folders`, `folder_ancestors` | **bypass** — subtree mutations | — | descendants |
+| `findExpiredTrashInternal` | same | `folders` | **bypass** — purge runs as no user | — | retention cursor |
+| `create` | same | `folders`, `folder_ancestors` | service authorises; repo enforces parent + tenancy | `batch` | ancestor chain, bad parent |
+| `ensureRoot` | same | `folders` | — system roots | unique index | roots created once |
+| `updateById` | same | `folders`, `resource_permissions` | service authorises | `batch` | rename, ACL replace |
+| `adjustChildFolderCount` | same | `folders` | service authorises | single stmt | counter |
+| `moveSubtree` | same | `folders`, `folder_ancestors` | service authorises both ends; repo restates the structural refusals | `batch` + guard | all move tests |
+| `setSubtreeDeleted` | same | `folders`, `folder_ancestors` | service authorises | `batch` | trash/restore |
+| `setSubtreeStatus` | same | `folders`, `folder_ancestors` | service authorises | `batch` | archive |
+| `purge` | same | `folders`, `folder_ancestors` | **bypass** — retention job | `batch` | purge |
+| `checkHierarchyIntegrity` | same | `folders`, `folder_ancestors` | admin/test tooling | — | 6 checker tests |
+
+`toRecord` and `isValidId` are MongoDB-local helpers (BSON hydration and `ObjectId` validation).
+Neither has a D1 counterpart and neither is part of the contract.
+
+---
+
 ## 2. Three signatures could not survive the move, and why
 
 ### 2.1 Reads take an `Actor`, not a filter fragment

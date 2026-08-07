@@ -54,7 +54,7 @@ GOOGLE_CLIENT_SECRET=
 # per call, not cached at startup.
 #
 # Migrated so far: users, departments (module 1); roles (module 2);
-# projects, experiments (module 3).
+# projects, experiments (module 3); folders (module 5).
 #
 # `roles` and `users` are best moved together: user.service.ts decorates every user summary
 # with that user's grants, so a directory listing reads both on one request. Ids are preserved
@@ -68,6 +68,12 @@ GOOGLE_CLIENT_SECRET=
 # DATA_SOURCE_ROLES=d1
 # DATA_SOURCE_PROJECTS=d1
 # DATA_SOURCE_EXPERIMENTS=d1
+# `folders` stands alone, but only until `files` moves. A folder move rewrites the folder
+# tree and the files inside it, and no transaction spans two databases — so while this is
+# "d1" and DATA_SOURCE_FILES is not, a failure part-way through a move can leave the two
+# disagreeing about where a file lives. Safe for a single-module soak; not a combination to
+# leave running once module 6 exists.
+# DATA_SOURCE_FOLDERS=d1
 
 # ── Cloudflare Access (Phase 8) ───────────────────────────────────────────────────────
 # Unused until Phase 8. CF_ACCESS_AUD is the Application Audience tag from the Access
