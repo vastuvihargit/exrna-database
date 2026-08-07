@@ -20,6 +20,7 @@ import {
 } from '@/server/errors/app-error';
 import { MAX_FOLDER_DEPTH } from '@/server/db/models';
 import { withTransaction } from '@/server/db/connection';
+import { hierarchyMutationEngine, moveFolderSubtreeWithFiles } from '@/server/db/d1-unit-of-work';
 import { isValidDisplayName, nextAvailableName, sanitizeDisplayName } from '@/server/domain/naming';
 import type { ConfidentialityLevel } from '@/server/domain/permissions';
 import type { Actor } from '@/server/permissions/actor';
@@ -435,40 +436,62 @@ export async function moveFolder(
     commit: () => moveFolderRecords(),
   });
 
+  /**
+   * The hierarchy write, dispatched on which databases are actually serving.
+   *
+   * A folder move rewrites two hierarchies that must agree — the folder tree and every
+   * contained file's ancestor chain — and the mechanism that keeps them in step is different
+   * for each engine. MongoDB has an interactive transaction; D1 has one prebuilt batch. There
+   * is no mechanism at all that spans both, which is why a split configuration is refused
+   * rather than attempted.
+   */
   async function moveFolderRecords(): Promise<void> {
-    await withTransaction(async (session) => {
-    await folderRepository.moveSubtree(
-      {
-        folderId,
-        newParentId: target.folder.id,
-        newPathAncestors: [...target.folder.pathAncestors, target.folder.id],
-        driveType: target.folder.driveType,
-        departmentId: target.folder.departmentId,
-        projectId: target.folder.projectId,
-        // Moving into a personal drive transfers ownership to that drive's owner;
-        // anywhere else the folder keeps its own owner.
-        ownerId: target.folder.driveType === 'my' ? target.folder.ownerId : context.folder.ownerId,
-        updatedBy: actor.userId,
-      },
-      session,
-    );
-    // Files carry a denormalized copy of their folder's ancestor path, so they move
-    // with it in the same transaction — otherwise a subtree search would miss them.
-    await fileRepository.reparentSubtree(
-      {
-        folderId,
-        newPathAncestorsForFolder: [...target.folder.pathAncestors, target.folder.id],
-        driveType: target.folder.driveType,
-        departmentId: target.folder.departmentId,
-        projectId: target.folder.projectId,
-      },
-      session,
-    );
+    const moveInput = {
+      folderId,
+      newParentId: target.folder.id,
+      newPathAncestors: [...target.folder.pathAncestors, target.folder.id],
+      driveType: target.folder.driveType,
+      departmentId: target.folder.departmentId,
+      projectId: target.folder.projectId,
+      // Moving into a personal drive transfers ownership to that drive's owner;
+      // anywhere else the folder keeps its own owner.
+      ownerId: target.folder.driveType === 'my' ? target.folder.ownerId : context.folder.ownerId,
+      updatedBy: actor.userId,
+    };
 
-    if (context.folder.parentFolderId) {
-      await folderRepository.adjustChildFolderCount(context.folder.parentFolderId, -1, session);
+    // Fails closed on a split configuration. Committing the folder half to one database and
+    // then attempting the file half against another is the exact inconsistency this design
+    // removes, with a wider window. Reads are unaffected; only this mutation is refused.
+    if (hierarchyMutationEngine() === 'd1') {
+      // One batch: folders, folder_ancestors, files, file_folder_ancestors and both child
+      // counts commit together or not at all. No Mongo session is opened — `withTransaction`
+      // would start one and it would govern none of these statements.
+      await moveFolderSubtreeWithFiles({
+        ...moveInput,
+        previousParentId: context.folder.parentFolderId,
+      });
+      return;
     }
-    await folderRepository.adjustChildFolderCount(target.folder.id, 1, session);
+
+    await withTransaction(async (session) => {
+      await folderRepository.moveSubtree(moveInput, session);
+      // Files carry a denormalized copy of their folder's ancestor path, so they move
+      // with it in the same transaction — otherwise a subtree search would miss them.
+      await fileRepository.reparentSubtree(
+        {
+          folderId,
+          newPathAncestorsForFolder: [...target.folder.pathAncestors, target.folder.id],
+          driveType: target.folder.driveType,
+          departmentId: target.folder.departmentId,
+          projectId: target.folder.projectId,
+        },
+        session,
+      );
+
+      if (context.folder.parentFolderId) {
+        await folderRepository.adjustChildFolderCount(context.folder.parentFolderId, -1, session);
+      }
+      await folderRepository.adjustChildFolderCount(target.folder.id, 1, session);
     });
   }
 
