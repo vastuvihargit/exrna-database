@@ -15,6 +15,9 @@
 AUTH_SECRET=replace-me-with-at-least-32-characters
 SESSION_SECRET=replace-me-with-a-different-32-plus-characters
 
+# `npm run cf:preview` runs with NODE_ENV=production, and the environment schema requires https
+# there — so this http value makes *every* route return 500 with "APP_URL must use https://
+# in production", `/api/health` included. Switch to https://localhost:8788 before previewing.
 APP_URL=http://localhost:8787
 
 # ── Company access ────────────────────────────────────────────────────────────────────

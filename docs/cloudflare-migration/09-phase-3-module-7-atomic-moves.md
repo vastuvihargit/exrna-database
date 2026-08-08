@@ -243,7 +243,39 @@ shift to compute — so both are simpler than the move.
 
 ---
 
-## 12. Status
+## 12. Verification
+
+Run against the finished module, on the `cloudflare-migration` branch with a clean tree.
+
+| Gate | Result |
+|---|---|
+| `npm run typecheck` | pass |
+| `npm run lint` | pass |
+| `npm run test:mongo` | 49 files, 722 tests, all pass |
+| `npm run test:d1` | 9 files, 369 tests, all pass — includes the 23 in `hierarchy-unit-of-work.test.ts` |
+| `npm run cf:build` | pass — `.open-next/worker.js` produced |
+| `npm run cf:preview`, both flags on D1 | module graph loads in `workerd` |
+
+**The preview check, precisely.** `DATA_SOURCE_FOLDERS=d1` and `DATA_SOURCE_FILES=d1` in
+`.dev.vars`, worker booted on 127.0.0.1, then `GET /api/health` → **200** and
+`POST /api/folders/:id/move` → **401 `UNAUTHENTICATED`**. The 401 is the point: the request
+reached the authentication layer, so the folder service and both D1 repositories resolved and
+instantiated inside `workerd`. No authenticated move was performed — that needs a seeded
+identity and is not claimed here. Atomicity itself is proven by the integration tests, which run
+against real D1, not by this check.
+
+**One preview papercut, not a code defect.** `cf:preview` runs with `NODE_ENV=production`, and
+the environment schema requires `APP_URL` to be `https://` in production. The `APP_URL=http://…`
+that `.dev.vars.example` ships therefore makes *every* route return 500 with
+`APP_URL must use https:// in production` — including `/api/health`, which is misleading when
+what you are trying to verify is a module graph. Set `APP_URL=https://localhost:8788` in
+`.dev.vars` before `cf:preview`. This predates module 7 and affects any preview run.
+
+`.dev.vars` was restored afterwards; no data-source flag is set in any committed file.
+
+---
+
+## 13. Status
 
 | Step | State |
 |---|---|
