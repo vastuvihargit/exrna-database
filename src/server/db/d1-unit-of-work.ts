@@ -58,6 +58,10 @@ import {
   buildChildFolderCountStatement,
   buildFolderMoveCommitStatement,
   buildFolderMoveStatements,
+  buildFolderSubtreeDeletedStatements,
+  buildFolderSubtreeStatusStatements,
+  countFolderSubtreeStatus,
+  countFolderSubtreeSweep,
   moveDidApply,
   moveGuard,
   planFolderMove,
@@ -65,12 +69,20 @@ import {
 } from '@/server/repositories/folder.repository.d1';
 import {
   buildFileReparentStatements,
+  buildFileSubtreeDeletedStatements,
+  buildFileSubtreeStatusStatements,
+  countFileSubtreeStatus,
+  countFileSubtreeSweep,
   type FolderChain,
 } from '@/server/repositories/file.repository.d1';
 import type { MoveSubtreeInput } from '@/server/repositories/folder.repository.contract';
 
 /** How many times a contended move re-plans before giving up. Matches the folder repository. */
 const MOVE_ATTEMPTS = 3;
+
+function nowIso(): string {
+  return new Date().toISOString();
+}
 
 /* ------------------------------------------------------------------ safety limits */
 
@@ -143,28 +155,53 @@ export class SubtreeTooLargeError extends ValidationError {
 }
 
 /**
- * Raised when folders and files are configured on different databases and a move is attempted.
+ * Every folder operation that changes folder *and* file rows together.
  *
- * **Fails closed, deliberately.** No transaction spans MongoDB and D1, so a folder move under a
- * split configuration cannot be made atomic by any means available here — it would commit the
- * folder half to one database and then attempt the file half against another, which is the
- * original bug with a wider gap. Reads under a split configuration are unaffected; only
- * hierarchy *mutations* are refused.
+ * Named rather than boolean so the refusal, the log line and the audit trail all say which
+ * operation was declined. Adding one here without giving it an atomic implementation is a type
+ * error at the switch in the service, which is the point.
  */
-export class SplitDataSourceMoveError extends AppError {
-  constructor(folders: string, files: string) {
+export type HierarchyOperation = 'move' | 'trash' | 'restore' | 'archive' | 'unarchive';
+
+/** How each operation reads in a sentence addressed to the person who attempted it. */
+const OPERATION_VERB: Record<HierarchyOperation, string> = {
+  move: 'moved',
+  trash: 'deleted',
+  restore: 'restored',
+  archive: 'archived',
+  unarchive: 'unarchived',
+};
+
+/**
+ * Raised when folders and files are on different databases and a cascading mutation is attempted.
+ *
+ * **Fails closed, deliberately.** No transaction spans MongoDB and D1, so a cascading folder
+ * operation under a split configuration cannot be made atomic by any means available here — it
+ * would commit the folder half to one database and then attempt the file half against another,
+ * which is the original bug with a wider gap. Reads under a split configuration are unaffected;
+ * only cascading *mutations* are refused.
+ */
+export class SplitDataSourceHierarchyError extends AppError {
+  constructor(
+    readonly operation: HierarchyOperation,
+    folders: string,
+    files: string,
+  ) {
     super(
       'CONFLICT',
-      'Folders cannot be moved while the system is switching databases. Please try again later, ' +
-        'or contact an administrator.',
+      `Folders cannot be ${OPERATION_VERB[operation]} while the system is switching databases. ` +
+        'Please try again later, or contact an administrator.',
       409,
       {
         details: {
+          operation,
+          folders,
+          files,
           reason:
-            `DATA_SOURCE_FOLDERS=${folders} and DATA_SOURCE_FILES=${files}. A folder move ` +
-            'rewrites folder and file hierarchy together and no transaction spans two ' +
-            'databases, so the move is refused rather than committed half-way. Set both flags ' +
-            'to the same value.',
+            `DATA_SOURCE_FOLDERS=${folders} and DATA_SOURCE_FILES=${files}. A folder ${operation} ` +
+            'changes folder and file rows together and no transaction spans two databases, so ' +
+            'the operation is refused rather than committed half-way. Set both flags to the ' +
+            'same value.',
         },
       },
     );
@@ -172,14 +209,14 @@ export class SplitDataSourceMoveError extends AppError {
 }
 
 /**
- * Which engine a hierarchy mutation should use, or a refusal.
+ * Which engine a cascading hierarchy mutation should use, or a refusal.
  *
- * Called before any folder move, on both engines. The two flags moving independently is a
- * deliberate property of the migration — one module at a time — but a folder move is the one
- * operation that spans both modules, so it is also the one operation that cannot tolerate them
- * disagreeing.
+ * The single decision point for every operation in `HierarchyOperation`, on both engines. The
+ * two flags moving independently is a deliberate property of the migration — one module at a
+ * time — but these are the operations that span both modules, so they are the ones that cannot
+ * tolerate the flags disagreeing.
  */
-export function hierarchyMutationEngine(): 'd1' | 'mongo' {
+export function hierarchyMutationEngine(operation: HierarchyOperation): 'd1' | 'mongo' {
   const foldersOnD1 = isD1('folders');
   const filesOnD1 = isD1('files');
 
@@ -187,10 +224,10 @@ export function hierarchyMutationEngine(): 'd1' | 'mongo' {
     const folders = foldersOnD1 ? 'd1' : 'mongo';
     const files = filesOnD1 ? 'd1' : 'mongo';
     getLogger().error(
-      { module: 'hierarchy', folders, files },
-      'Refusing a hierarchy mutation because folders and files are on different databases',
+      { module: 'hierarchy', operation, folders, files },
+      `Refusing a folder ${operation} because folders and files are on different databases`,
     );
-    throw new SplitDataSourceMoveError(folders, files);
+    throw new SplitDataSourceHierarchyError(operation, folders, files);
   }
 
   return foldersOnD1 ? 'd1' : 'mongo';
@@ -394,6 +431,125 @@ export async function moveFolderSubtreeWithFiles(input: HierarchyMoveInput): Pro
   }
 
   throw new ConflictError(MOVE_CONTENTION_MESSAGE);
+}
+
+/* ------------------------------------------------------------------ lifecycle */
+
+/**
+ * What a lifecycle sweep changed, counted before it ran.
+ *
+ * Both numbers reach an audit entry, so both are read with the sweep's own predicate rather
+ * than from `meta.changes` — which counts the FTS trigger's writes and the side tables' cascades
+ * as well, and reported 6 for one purged file.
+ */
+export interface LifecycleCounts {
+  folders: number;
+  files: number;
+}
+
+export interface SubtreeSweepInput {
+  folderId: string;
+  userId: string;
+  /** The parent whose child count moves with the sweep, if the folder has one. */
+  parentFolderId: string | null;
+}
+
+/**
+ * Trashes or restores a folder subtree and every file in it, as one D1 batch.
+ *
+ * ── Why this needs no `updated_at` guard ────────────────────────────────────────────────
+ *
+ * The move does, because its statements carry values a prior read supplied — a depth shift that
+ * is wrong if the folder moved in between, and applying half a shift to a closure table produces
+ * a quietly malformed tree. Nothing here is like that. Every statement is set-wise and its
+ * predicate is evaluated by SQLite at execution time, so the batch acts on whatever the subtree
+ * actually is when it runs. The only values read in advance are the two *counts*, and a count
+ * that raced is a slightly stale audit number, not a corrupt hierarchy.
+ *
+ * The order is folders, then files, then the child-count adjustment. Nothing depends on it —
+ * no statement here reads a table another one writes — but it matches the order the Mongo
+ * transaction uses, so the two engines read the same way.
+ */
+async function sweepFolderSubtreeWithFiles(
+  input: SubtreeSweepInput,
+  deleted: boolean,
+): Promise<LifecycleCounts> {
+  const db = await getD1();
+  const now = nowIso();
+
+  // Before the writes, with the same predicates the writes use.
+  const [folderCount, fileCount] = await Promise.all([
+    countFolderSubtreeSweep(db, { folderId: input.folderId, deleted }),
+    countFileSubtreeSweep(db, { folderId: input.folderId, deleted }),
+  ]);
+
+  const statements: BatchItem<'sqlite'>[] = [
+    ...buildFolderSubtreeDeletedStatements(db, {
+      folderId: input.folderId,
+      deleted,
+      userId: input.userId,
+      now,
+    }),
+    ...buildFileSubtreeDeletedStatements(db, {
+      folderId: input.folderId,
+      deleted,
+      userId: input.userId,
+      now,
+    }),
+  ];
+
+  // Trashing removes the folder from its parent's child count; restoring puts it back.
+  if (input.parentFolderId) {
+    statements.push(buildChildFolderCountStatement(db, input.parentFolderId, deleted ? -1 : 1));
+  }
+
+  await withBatch(db, statements);
+
+  return { folders: folderCount, files: fileCount };
+}
+
+/** Moves a folder subtree and every live file in it to the trash, atomically. */
+export function trashFolderSubtreeWithFiles(input: SubtreeSweepInput): Promise<LifecycleCounts> {
+  return sweepFolderSubtreeWithFiles(input, true);
+}
+
+/**
+ * Restores a folder subtree and exactly the files that this trash operation swept in, atomically.
+ *
+ * A file trashed on its own *before* the folder was trashed carries a different
+ * `trashed_with_folder_id` — usually null — so the restore predicate does not match it and it
+ * stays in the trash. That rule lives in the builders, shared with the standalone path.
+ */
+export function restoreFolderSubtreeWithFiles(input: SubtreeSweepInput): Promise<LifecycleCounts> {
+  return sweepFolderSubtreeWithFiles(input, false);
+}
+
+/**
+ * Archives or unarchives a folder subtree and every live file in it, as one D1 batch.
+ *
+ * Trashed files keep `status = 'trashed'` throughout — archive and trash are separate
+ * lifecycles, and the file half's `live()` predicate is the line between them. No child-count
+ * adjustment: archiving does not remove a folder from its parent.
+ */
+export async function setFolderSubtreeStatusWithFiles(input: {
+  folderId: string;
+  status: 'active' | 'archived';
+  userId: string;
+}): Promise<LifecycleCounts> {
+  const db = await getD1();
+  const now = nowIso();
+
+  const [folderCount, fileCount] = await Promise.all([
+    countFolderSubtreeStatus(db, input.folderId),
+    countFileSubtreeStatus(db, input.folderId),
+  ]);
+
+  await withBatch(db, [
+    ...buildFolderSubtreeStatusStatements(db, { ...input, now }),
+    ...buildFileSubtreeStatusStatements(db, { folderId: input.folderId, status: input.status, now }),
+  ]);
+
+  return { folders: folderCount, files: fileCount };
 }
 
 /**

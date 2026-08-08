@@ -27,7 +27,7 @@ import {
   hierarchyMutationEngine,
   moveFolderSubtreeWithFiles,
   planHierarchyMoveForTesting,
-  SplitDataSourceMoveError,
+  SplitDataSourceHierarchyError,
   SubtreeTooLargeError,
   MAX_BATCH_STATEMENTS,
   MAX_MOVE_FOLDERS,
@@ -734,37 +734,38 @@ describe('hierarchy mutations never span two databases', () => {
   it('selects D1 when both modules are on D1', () => {
     setDataSourceOverride('folders', 'd1');
     setDataSourceOverride('files', 'd1');
-    expect(hierarchyMutationEngine()).toBe('d1');
+    expect(hierarchyMutationEngine('move')).toBe('d1');
   });
 
   it('selects Mongo when both modules are on Mongo', () => {
     setDataSourceOverride('folders', 'mongo');
     setDataSourceOverride('files', 'mongo');
-    expect(hierarchyMutationEngine()).toBe('mongo');
+    expect(hierarchyMutationEngine('move')).toBe('mongo');
   });
 
   it('refuses when folders are on D1 and files are not', () => {
     setDataSourceOverride('folders', 'd1');
     setDataSourceOverride('files', 'mongo');
-    expect(() => hierarchyMutationEngine()).toThrow(SplitDataSourceMoveError);
+    expect(() => hierarchyMutationEngine('move')).toThrow(SplitDataSourceHierarchyError);
   });
 
   it('refuses when files are on D1 and folders are not', () => {
     setDataSourceOverride('folders', 'mongo');
     setDataSourceOverride('files', 'd1');
-    expect(() => hierarchyMutationEngine()).toThrow(SplitDataSourceMoveError);
+    expect(() => hierarchyMutationEngine('move')).toThrow(SplitDataSourceHierarchyError);
   });
 
   it('the refusal is a 409 that names both flags, and never a silent fallback', () => {
     setDataSourceOverride('folders', 'd1');
     setDataSourceOverride('files', 'mongo');
     try {
-      hierarchyMutationEngine();
+      hierarchyMutationEngine('move');
       throw new Error('should have refused');
     } catch (error) {
-      const refusal = error as SplitDataSourceMoveError;
-      expect(refusal).toBeInstanceOf(SplitDataSourceMoveError);
+      const refusal = error as SplitDataSourceHierarchyError;
+      expect(refusal).toBeInstanceOf(SplitDataSourceHierarchyError);
       expect(refusal.status).toBe(409);
+      expect(refusal.operation).toBe('move');
       expect(JSON.stringify(refusal.details)).toContain('DATA_SOURCE_FOLDERS=d1');
       expect(JSON.stringify(refusal.details)).toContain('DATA_SOURCE_FILES=mongo');
     }

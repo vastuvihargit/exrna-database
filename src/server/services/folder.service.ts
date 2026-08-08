@@ -20,7 +20,13 @@ import {
 } from '@/server/errors/app-error';
 import { MAX_FOLDER_DEPTH } from '@/server/db/models';
 import { withTransaction } from '@/server/db/connection';
-import { hierarchyMutationEngine, moveFolderSubtreeWithFiles } from '@/server/db/d1-unit-of-work';
+import {
+  hierarchyMutationEngine,
+  moveFolderSubtreeWithFiles,
+  restoreFolderSubtreeWithFiles,
+  setFolderSubtreeStatusWithFiles,
+  trashFolderSubtreeWithFiles,
+} from '@/server/db/d1-unit-of-work';
 import { isValidDisplayName, nextAvailableName, sanitizeDisplayName } from '@/server/domain/naming';
 import type { ConfidentialityLevel } from '@/server/domain/permissions';
 import type { Actor } from '@/server/permissions/actor';
@@ -462,7 +468,7 @@ export async function moveFolder(
     // Fails closed on a split configuration. Committing the folder half to one database and
     // then attempting the file half against another is the exact inconsistency this design
     // removes, with a wider window. Reads are unaffected; only this mutation is refused.
-    if (hierarchyMutationEngine() === 'd1') {
+    if (hierarchyMutationEngine('move') === 'd1') {
       // One batch: folders, folder_ancestors, files, file_folder_ancestors and both child
       // counts commit together or not at all. No Mongo session is opened — `withTransaction`
       // would start one and it would govern none of these statements.
@@ -650,6 +656,16 @@ export async function trashFolder(
   });
 
   async function trashFolderRecords(): Promise<{ folders: number; files: number }> {
+    // Fails closed on a split configuration, exactly as a move does: the folder half would
+    // commit to one database and the file half to another.
+    if (hierarchyMutationEngine('trash') === 'd1') {
+      return trashFolderSubtreeWithFiles({
+        folderId,
+        userId: actor.userId,
+        parentFolderId: context.folder.parentFolderId,
+      });
+    }
+
     return withTransaction(async (session) => {
     const count = await folderRepository.setSubtreeDeleted(
       { folderId, deleted: true, userId: actor.userId },
@@ -729,6 +745,15 @@ export async function restoreFolder(
   });
 
   async function restoreFolderRecords(): Promise<number> {
+    if (hierarchyMutationEngine('restore') === 'd1') {
+      const counts = await restoreFolderSubtreeWithFiles({
+        folderId,
+        userId: actor.userId,
+        parentFolderId: context.folder.parentFolderId,
+      });
+      return counts.folders;
+    }
+
     return withTransaction(async (session) => {
     const count = await folderRepository.setSubtreeDeleted(
       { folderId, deleted: false, userId: actor.userId },
@@ -765,16 +790,16 @@ export async function setArchived(
   const context = await requireFolder(actor, folderId, archived ? 'resource.archive' : 'resource.restore');
   assertMutable(context.folder);
 
-  await withTransaction(async (session) => {
-    await folderRepository.setSubtreeStatus(
-      { folderId, status: archived ? 'archived' : 'active', userId: actor.userId },
-      session,
-    );
-    await fileRepository.setSubtreeStatus(
-      { folderId, status: archived ? 'archived' : 'active' },
-      session,
-    );
-  });
+  const status = archived ? ('archived' as const) : ('active' as const);
+
+  if (hierarchyMutationEngine(archived ? 'archive' : 'unarchive') === 'd1') {
+    await setFolderSubtreeStatusWithFiles({ folderId, status, userId: actor.userId });
+  } else {
+    await withTransaction(async (session) => {
+      await folderRepository.setSubtreeStatus({ folderId, status, userId: actor.userId }, session);
+      await fileRepository.setSubtreeStatus({ folderId, status }, session);
+    });
+  }
 
   const updated = await folderRepository.findByIdInternal(folderId);
   if (!updated) throw new NotFoundError();
