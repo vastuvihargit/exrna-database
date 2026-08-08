@@ -15,6 +15,7 @@ import { Readable } from 'stream';
 
 import { getEnv } from '@/server/config/env';
 import { withTransaction } from '@/server/db/connection';
+import { createVersionWithFile, versionMutationEngine } from '@/server/db/d1-unit-of-work';
 import {
   ConflictError,
   NotFoundError,
@@ -447,43 +448,63 @@ async function buildFileFromSession(
         );
       }
 
-      const version = await versionRepository.create(
-        {
-          organizationId: folder.organizationId,
-          fileId,
-          versionNumber,
-          storageKey: destination.key,
-          storageArea: destination.area,
-          relativeStoragePath: `${destination.area}/${destination.key}`,
-          storedFilename: physicalName,
-          originalFilename: session.declaredFilename,
-          fileSize: measuredSize,
-          mimeType: session.resolvedMimeType,
-          extension: session.extension,
-          checksumSha256: checksum,
-          uploadedBy: actor.userId,
-          ...(session.versionNote ? { versionNote: session.versionNote } : {}),
-        },
-        dbSession,
-      );
-
-      await versionRepository.setCurrent(fileId, version.id, dbSession);
-      await fileRepository.updateById(
+      const versionFields = {
+        organizationId: folder.organizationId,
         fileId,
-        {
-          currentVersionId: version.id,
-          sizeBytes: measuredSize,
-          mimeType: session.resolvedMimeType,
-          checksumSha256: checksum,
-          originalFilename: session.declaredFilename,
-          updatedBy: actor.userId,
-          // A new version resets the review cycle: an approved file that changes is
-          // no longer an approved file (docs/phase-0/05, versioning rules).
-          ...(isNewFile ? {} : { reviewStatus: 'draft', approvalStatus: 'none' }),
-          versionCountDelta: 1,
-        },
-        dbSession,
-      );
+        storageKey: destination.key,
+        storageArea: destination.area,
+        relativeStoragePath: `${destination.area}/${destination.key}`,
+        storedFilename: physicalName,
+        originalFilename: session.declaredFilename,
+        fileSize: measuredSize,
+        mimeType: session.resolvedMimeType,
+        extension: session.extension,
+        // Measured while streaming the upload, never taken from the client.
+        checksumSha256: checksum,
+        uploadedBy: actor.userId,
+        ...(session.versionNote ? { versionNote: session.versionNote } : {}),
+      };
+
+      const fileFields = {
+        sizeBytes: measuredSize,
+        mimeType: session.resolvedMimeType,
+        checksumSha256: checksum,
+        originalFilename: session.declaredFilename,
+        updatedBy: actor.userId,
+        // A new version resets the review cycle: an approved file that changes is
+        // no longer an approved file (docs/phase-0/05, versioning rules).
+        ...(isNewFile ? {} : { reviewStatus: 'draft' as const, approvalStatus: 'none' as const }),
+        versionCountDelta: 1,
+      };
+
+      /**
+       * On D1 the version row, `is_current`, and the file's `current_version_id` commit as one
+       * batch — `withTransaction` is a MongoDB session and governs none of them. The version
+       * number is assigned inside that batch against the unique index, so two uploads racing
+       * on the same file cannot both take it.
+       */
+      const version =
+        versionMutationEngine() === 'd1'
+          ? await createVersionWithFile({ version: versionFields, file: fileFields }).then(
+              async ({ versionId }) => {
+                const stored = await versionRepository.findById(versionId);
+                if (!stored) throw new NotFoundError();
+                return stored;
+              },
+            )
+          : await (async () => {
+              const created = await versionRepository.create(
+                { ...versionFields, versionNumber },
+                dbSession,
+              );
+              await versionRepository.setCurrent(fileId, created.id, dbSession);
+              await fileRepository.updateById(
+                fileId,
+                { ...fileFields, currentVersionId: created.id },
+                dbSession,
+              );
+              return created;
+            })();
 
       if (isNewFile) {
         await folderRepository.updateById(folder.id, { fileCountDelta: 1 }, dbSession);

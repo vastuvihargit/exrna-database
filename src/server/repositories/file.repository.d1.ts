@@ -1406,6 +1406,38 @@ export async function updateByIdWhere(
   if (!id) return null;
   const db = await getD1();
 
+  const statements = await planFileUpdate(db, id, guard, patch);
+  if (statements === null) return null;
+  // An empty patch is a no-op read rather than an error: callers assemble patches
+  // conditionally, and an UPDATE with no columns is not a statement.
+  if (statements.length === 0) return findByIdInternal(id);
+
+  await withBatch(db, statements);
+  return findByIdInternal(id);
+}
+
+/**
+ * The statements a file update needs — built, not executed.
+ *
+ * Split out of `updateByIdWhere` so `d1-unit-of-work.ts` can put a file update in the *same*
+ * batch as something else. Creating a version is the case that needs it: the new
+ * `file_versions` row and the `files.current_version_id` that points at it have to land
+ * together, and two batches cannot promise that.
+ *
+ * Returns `null` when the guard matched nothing — the caller reads that as "somebody else
+ * changed it first" — and `[]` when the patch asks for nothing.
+ *
+ * The read this performs is deliberately outside the batch, which is the same constraint every
+ * other composed operation works under: D1 fixes a batch before it runs, so anything the
+ * statements need to know has to be read first. The `files` UPDATE still carries the guard, so
+ * the base row cannot be written against state it was not computed for.
+ */
+export async function planFileUpdate(
+  db: Database,
+  id: string,
+  guard: FileGuard,
+  patch: FilePatch,
+): Promise<BatchItem<'sqlite'>[] | null> {
   const conditions: SQL[] = [eq(files.id, id), live()];
   if (guard.approvedVersionId !== undefined) {
     conditions.push(
@@ -1443,9 +1475,7 @@ export async function updateByIdWhere(
   const now = nowIso();
   const statements = patchStatements(db, id, existing.organizationId, patch, where, now);
 
-  // An empty patch is a no-op read rather than an error: callers assemble patches
-  // conditionally, and an UPDATE with no columns is not a statement.
-  if (statements.length === 0) return findByIdInternal(id);
+  if (statements.length === 0) return [];
 
   if (touchesSearchableContent(patch)) {
     const metadata = { ...existing.metadata, ...(patch.metadataSet ?? {}) };
@@ -1465,8 +1495,7 @@ export async function updateByIdWhere(
     );
   }
 
-  await withBatch(db, statements);
-  return findByIdInternal(id);
+  return statements;
 }
 
 export async function setDeleted(

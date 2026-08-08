@@ -43,7 +43,10 @@ import { auditService } from '@/server/audit/audit.service';
 import * as fileRepository from '@/server/repositories/file.repository';
 import * as notificationRepository from '@/server/repositories/notification.repository';
 import * as versionRepository from '@/server/repositories/file-version.repository';
-import type { VersionApprovalBinding } from '@/server/repositories/file-version.repository';
+import type {
+  VersionApprovalBinding,
+  VersionPatch,
+} from '@/server/repositories/file-version.repository';
 import { getObjectStore } from '@/server/storage';
 import { isDriveStorageEnabled } from '@/server/storage/google';
 import type {
@@ -137,7 +140,7 @@ export async function fingerprintForReview(versionId: string): Promise<{
 export function approvalBindingUpdate(fingerprint: {
   revisionId: string | null;
   contentModifiedAt: Date | null;
-}): Record<string, unknown> {
+}): VersionPatch {
   return {
     approvedRevisionId: fingerprint.revisionId,
     approvedContentModifiedAt: fingerprint.contentModifiedAt,
@@ -212,12 +215,10 @@ async function checkBinding(binding: VersionApprovalBinding): Promise<ApprovalCh
    */
   if (!binding.approvedRevisionId) {
     await versionRepository.updateFlags(versionId, {
-      $set: {
-        approvedRevisionId: current.revisionId,
-        approvedContentModifiedAt: current.modifiedAt,
-        googleDriveRevisionId: current.revisionId,
-        googleDriveModifiedTime: current.modifiedAt,
-      },
+      approvedRevisionId: current.revisionId,
+      approvedContentModifiedAt: current.modifiedAt,
+      googleDriveRevisionId: current.revisionId,
+      googleDriveModifiedTime: current.modifiedAt,
     });
     return { versionId, fileId, outcome: 'unchanged' };
   }
@@ -269,18 +270,16 @@ async function supersedeApproval(input: {
     await versionRepository.updateFlags(
       binding.versionId,
       {
-        $set: {
-          // Cleared because this is what the badge and the approved-files list read.
-          // `approvedBy` and `approvedAt` stay: who signed, and when, remains true.
-          isApproved: false,
-          label: 'changes_requested',
-          approvalSupersededAt: new Date(),
-          approvalSupersededReason: reason.slice(0, 300),
-          // The version now tracks the content that is actually there.
-          googleDriveRevisionId: current.revisionId,
-          googleDriveModifiedTime: current.modifiedAt,
-          ...(current.md5 ? { googleDriveMd5: current.md5 } : {}),
-        },
+        // Cleared because this is what the badge and the approved-files list read.
+        // `approvedBy` and `approvedAt` stay: who signed, and when, remains true.
+        isApproved: false,
+        label: 'changes_requested',
+        approvalSupersededAt: new Date(),
+        approvalSupersededReason: reason.slice(0, 300),
+        // The version now tracks the content that is actually there.
+        googleDriveRevisionId: current.revisionId,
+        googleDriveModifiedTime: current.modifiedAt,
+        ...(current.md5 ? { googleDriveMd5: current.md5 } : {}),
       },
       session,
     );

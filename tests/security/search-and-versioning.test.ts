@@ -14,6 +14,7 @@ import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { startTestDb, stopTestDb, type TestDb } from '../helpers/test-db';
 import { actorFor, seedFixture, TEST_META, type Fixture } from '../helpers/fixtures';
 import type { Actor } from '@/server/permissions/actor';
+import type { VersionPatch } from '@/server/repositories/file-version.repository.contract';
 
 let db: TestDb;
 let fixture: Fixture;
@@ -401,7 +402,8 @@ describe('version restore appends rather than rewinds', () => {
       reviewStatus: 'approved',
     });
     await versionRepository.updateFlags(versions[0]!.id, {
-      $set: { isApproved: true, label: 'approved' },
+      isApproved: true,
+      label: 'approved',
     });
 
     await versionService.restoreVersion(alice, uploaded.fileId, { versionId: first.id }, TEST_META);
@@ -449,15 +451,20 @@ describe('stored versions stay immutable', () => {
     const uploaded = await upload(alice, folderId, 'frozen.pdf', pdfOfSize('frozen'));
     const current = await versionRepository.findCurrent(uploaded.fileId);
 
-    // The model's pre-hook is the last line of defence: even a direct repository call
-    // cannot repoint a version at different bytes.
-    await expect(
-      versionRepository.updateFlags(current!.id, { $set: { storageKey: 'somewhere/else' } }),
-    ).rejects.toThrow(/immutable/i);
+    /**
+     * Two layers now stop a version being repointed at different bytes.
+     *
+     * `VersionPatch` has no `storageKey` and no `checksumSha256`, so the ordinary way to
+     * attempt this stopped compiling when the patch became typed — which is the better place
+     * to catch it. The cast here defeats that deliberately, to prove the model's pre-hook is
+     * still underneath it: the type is the fence, the hook is the last line of defence, and a
+     * future caller reaching for `as unknown` must still be refused at runtime.
+     */
+    const bypassTyping = (fields: Record<string, unknown>) =>
+      versionRepository.updateFlags(current!.id, fields as VersionPatch);
 
-    await expect(
-      versionRepository.updateFlags(current!.id, { $set: { checksumSha256: 'f'.repeat(64) } }),
-    ).rejects.toThrow(/immutable/i);
+    await expect(bypassTyping({ storageKey: 'somewhere/else' })).rejects.toThrow(/immutable/i);
+    await expect(bypassTyping({ checksumSha256: 'f'.repeat(64) })).rejects.toThrow(/immutable/i);
   });
 
   it('allows a version note to be corrected', async () => {

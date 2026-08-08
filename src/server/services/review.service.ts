@@ -130,7 +130,7 @@ export async function submitForReview(
       session,
     );
 
-    await versionRepository.updateFlags(versionId, { $set: { label: 'under_review' } }, session);
+    await versionRepository.updateFlags(versionId, { label: 'under_review' }, session);
 
     return created;
   });
@@ -300,15 +300,13 @@ export async function decide(
       await versionRepository.updateFlags(
         review.versionId,
         {
-          $set: {
-            label: 'approved',
-            isApproved: true,
-            approvedBy: actor.userId,
-            approvedAt: new Date(),
-            // Records the exact remote state this signature covers, so a later change to it
-            // is detectable rather than invisible. All nulls for a local version.
-            ...approvalBindingUpdate(current),
-          },
+          label: 'approved',
+          isApproved: true,
+          approvedBy: actor.userId,
+          approvedAt: new Date(),
+          // Records the exact remote state this signature covers, so a later change to it
+          // is detectable rather than invisible. All nulls for a local version.
+          ...approvalBindingUpdate(current),
         },
         session,
       );
@@ -323,7 +321,7 @@ export async function decide(
         session,
       );
     } else if (close?.status === 'rejected') {
-      await versionRepository.updateFlags(review.versionId, { $set: { label: 'draft' } }, session);
+      await versionRepository.updateFlags(review.versionId, { label: 'draft' }, session);
       await fileRepository.updateById(
         review.fileId,
         { reviewStatus: 'rejected', approvalStatus: 'rejected', updatedBy: actor.userId },
@@ -332,7 +330,7 @@ export async function decide(
     } else if (close?.status === 'changes_requested') {
       await versionRepository.updateFlags(
         review.versionId,
-        { $set: { label: 'changes_requested' } },
+        { label: 'changes_requested' },
         session,
       );
       await fileRepository.updateById(
@@ -447,7 +445,7 @@ export async function cancelReview(
 
   await withTransaction(async (session) => {
     await reviewRepository.cancel(reviewId, session);
-    await versionRepository.updateFlags(review.versionId, { $set: { label: 'draft' } }, session);
+    await versionRepository.updateFlags(review.versionId, { label: 'draft' }, session);
     await fileRepository.updateById(
       review.fileId,
       { reviewStatus: 'draft', approvalStatus: 'none', updatedBy: actor.userId },

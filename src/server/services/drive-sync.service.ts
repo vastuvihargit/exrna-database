@@ -649,12 +649,10 @@ async function applyContent(
   if (fingerprint.revisionId === version.googleDriveRevisionId) return; // nothing really moved
 
   await versionRepository.updateFlags(version.versionId, {
-    $set: {
-      googleDriveRevisionId: fingerprint.revisionId,
-      googleDriveModifiedTime: fingerprint.modifiedAt,
-      ...(fingerprint.md5 ? { googleDriveMd5: fingerprint.md5 } : {}),
-      lastSyncedAt: new Date(),
-    },
+    googleDriveRevisionId: fingerprint.revisionId,
+    googleDriveModifiedTime: fingerprint.modifiedAt,
+    ...(fingerprint.md5 ? { googleDriveMd5: fingerprint.md5 } : {}),
+    lastSyncedAt: new Date(),
   });
 
   summary.contentUpdated += 1;

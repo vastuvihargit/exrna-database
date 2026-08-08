@@ -73,8 +73,17 @@ import {
   buildFileSubtreeStatusStatements,
   countFileSubtreeStatus,
   countFileSubtreeSweep,
+  planFileUpdate,
   type FolderChain,
 } from '@/server/repositories/file.repository.d1';
+import {
+  buildCreateVersionStatement,
+  buildSetCurrentStatements,
+  newId as newVersionId,
+  nextVersionNumber,
+} from '@/server/repositories/file-version.repository.d1';
+import type { CreateVersionInput } from '@/server/repositories/file-version.repository.contract';
+import type { FilePatch } from '@/server/repositories/file.repository.contract';
 import type { MoveSubtreeInput } from '@/server/repositories/folder.repository.contract';
 
 /** How many times a contended move re-plans before giving up. Matches the folder repository. */
@@ -550,6 +559,169 @@ export async function setFolderSubtreeStatusWithFiles(input: {
   ]);
 
   return { folders: folderCount, files: fileCount };
+}
+
+/* ------------------------------------------------------------------ versions */
+
+/**
+ * Raised when a version could not be given a number that nothing else had taken.
+ *
+ * Only reachable under sustained concurrent uploads to the *same file*, and only after
+ * `VERSION_NUMBER_ATTEMPTS` tries. A conflict rather than an internal error: the correct client
+ * behaviour is to try again.
+ */
+export class VersionNumberContentionError extends ConflictError {
+  constructor(readonly fileId: string) {
+    super('Another upload for this file completed first. Please try again.');
+  }
+}
+
+/** How many times a contended version insert re-reads its number before giving up. */
+const VERSION_NUMBER_ATTEMPTS = 5;
+
+/**
+ * Does an error mean "that (file_id, version_number) already exists"?
+ *
+ * D1 surfaces a constraint violation as a message rather than as a code, and the message names
+ * the index. Matching on the text is unpleasant but it is what the driver gives; matching on
+ * *any* constraint failure would be worse, because it would silently retry a genuine foreign
+ * key problem five times and then report contention.
+ */
+function isVersionNumberCollision(error: unknown): boolean {
+  const message = error instanceof Error ? error.message : String(error);
+  return (
+    /UNIQUE constraint failed/i.test(message) &&
+    /file_versions\.(file_id|version_number)|ux_file_versions_number/i.test(message)
+  );
+}
+
+export interface CreateVersionWithFileInput {
+  /** Everything about the new version except its number, which this function assigns. */
+  version: Omit<CreateVersionInput, 'versionNumber'> & { id?: string };
+  /** How the parent file changes to point at it. `currentVersionId` is set here, not by callers. */
+  file: Omit<FilePatch, 'currentVersionId'>;
+}
+
+/**
+ * Creates a version and repoints its file at it, as one D1 batch.
+ *
+ * ── Why this is not two repository calls ────────────────────────────────────────────────
+ *
+ * "Which version is current" is stored twice — `files.current_version_id` and
+ * `file_versions.is_current` — and an upload writes both, plus the file's size, checksum,
+ * mime type and review state. The services wrapped that in `withTransaction`, which on D1 is a
+ * MongoDB session governing nothing. A failure between the two left a file whose
+ * `current_version_id` names a version that does not exist, or a version marked current that
+ * the file does not point at. Downloads read the pointer; the version list reads the flag; the
+ * two disagreeing is a file that shows one thing and serves another.
+ *
+ * ── The number ──────────────────────────────────────────────────────────────────────────
+ *
+ * `MAX(version_number) + 1` is read outside the batch, so two concurrent uploads can propose
+ * the same number. Rather than lock, this lets the unique index on `(file_id, version_number)`
+ * be the authority: the loser's INSERT fails, **the whole batch rolls back** — so no half-made
+ * version and no repointed file — and it re-reads and tries again. The database decides, and
+ * the losing attempt leaves nothing behind. That is why v4/v4 cannot happen and why a gap
+ * cannot open either.
+ */
+export async function createVersionWithFile(
+  input: CreateVersionWithFileInput,
+): Promise<{ versionId: string; versionNumber: number }> {
+  const db = await getD1();
+  const fileId = input.version.fileId;
+
+  for (let attempt = 0; attempt < VERSION_NUMBER_ATTEMPTS; attempt += 1) {
+    const versionNumber = await nextVersionNumber(fileId);
+    // A fresh id per attempt. Reusing one across a failed insert would risk resurrecting a
+    // half-written row if the failure were ever something other than the unique index.
+    const versionId = input.version.id ?? newVersionId();
+
+    const fileStatements = await planFileUpdate(
+      db,
+      fileId,
+      {},
+      { ...input.file, currentVersionId: versionId } as FilePatch,
+    );
+    if (fileStatements === null) {
+      throw new ConflictError('That file no longer exists');
+    }
+
+    const statements: BatchItem<'sqlite'>[] = [
+      buildCreateVersionStatement(db, { ...input.version, id: versionId, versionNumber }),
+      ...buildSetCurrentStatements(db, fileId, versionId),
+      ...fileStatements,
+    ];
+
+    try {
+      await withBatch(db, statements);
+      return { versionId, versionNumber };
+    } catch (error) {
+      if (!isVersionNumberCollision(error)) throw error;
+      getLogger().warn(
+        { module: 'fileVersions', fileId, versionNumber, attempt: attempt + 1 },
+        'Version number was taken by a concurrent upload; re-reading and retrying',
+      );
+    }
+  }
+
+  throw new VersionNumberContentionError(fileId);
+}
+
+/**
+ * Which engine may serve a *version write*, or a refusal.
+ *
+ * Creating a version touches `file_versions` and `files` together, so the two modules cannot be
+ * on different databases: no transaction spans them, and the failure mode is the one this
+ * module exists to prevent — a version row in one database and a `current_version_id` in
+ * another, permanently disagreeing.
+ *
+ * Reads are unaffected and deliberately not routed through this. A split configuration can
+ * still list history and resolve storage locations; only writes are refused.
+ */
+export function versionMutationEngine(): 'd1' | 'mongo' {
+  const versionsOnD1 = isD1('fileVersions');
+  const filesOnD1 = isD1('files');
+
+  if (versionsOnD1 !== filesOnD1) {
+    const versions = versionsOnD1 ? 'd1' : 'mongo';
+    const files = filesOnD1 ? 'd1' : 'mongo';
+    getLogger().error(
+      { module: 'fileVersions', versions, files },
+      'Refusing a version write because files and file versions are on different databases',
+    );
+    throw new SplitDataSourceVersionError(versions, files);
+  }
+
+  return versionsOnD1 ? 'd1' : 'mongo';
+}
+
+/**
+ * Raised when files and versions are on different databases and a version write is attempted.
+ *
+ * Fails closed for the same reason `SplitDataSourceHierarchyError` does, and separately from it
+ * because the pair of modules is different: a folder move needs folders and files to agree, a
+ * version write needs files and versions to.
+ */
+export class SplitDataSourceVersionError extends AppError {
+  constructor(versions: string, files: string) {
+    super(
+      'CONFLICT',
+      'New versions cannot be saved while the system is switching databases. Please try again ' +
+        'later, or contact an administrator.',
+      409,
+      {
+        details: {
+          versions,
+          files,
+          reason:
+            `DATA_SOURCE_FILE_VERSIONS=${versions} and DATA_SOURCE_FILES=${files}. Creating a ` +
+            'version writes the version row and the file that points at it together, and no ' +
+            'transaction spans two databases, so the write is refused rather than committed ' +
+            'half-way. Set both flags to the same value.',
+        },
+      },
+    );
+  }
 }
 
 /**
