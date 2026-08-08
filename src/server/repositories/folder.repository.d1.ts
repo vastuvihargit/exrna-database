@@ -1089,13 +1089,136 @@ export async function moveSubtree(input: MoveSubtreeInput): Promise<void> {
   throw new ConflictError(MOVE_CONTENTION_MESSAGE);
 }
 
+/** Every folder beneath `folderId`, as a sub-select rather than a bound id list. */
+function descendantsOf(folderId: string): SQL {
+  return sql`(SELECT a.folder_id FROM ${folderAncestors} a WHERE a.ancestor_id = ${folderId})`;
+}
+
+/** Which descendants a sweep will touch — the predicate, shared by the count and the write. */
+function sweptDescendants(folderId: string, deleted: boolean): SQL {
+  return deleted
+    ? and(sql`${folders.id} IN ${descendantsOf(folderId)}`, isNull(folders.deletedAt))!
+    : // Only the folders this trash operation took down. One trashed on its own beforehand
+      // carries a different `trashed_with_folder_id` and must stay in the trash.
+      and(
+        sql`${folders.id} IN ${descendantsOf(folderId)}`,
+        eq(folders.trashedWithFolderId, folderId),
+        isNotNull(folders.deletedAt),
+      )!;
+}
+
+/**
+ * The statements that trash or restore a folder subtree — built, not executed.
+ *
+ * `trashed_with_folder_id` records which deletion swept a descendant in, so restoring the parent
+ * restores exactly that set — and not folders the user had trashed individually beforehand,
+ * which must stay in the trash. Behaviour is matched to the Mongo implementation statement for
+ * statement.
+ *
+ * Two statements, both set-wise, so the count is **independent of subtree size**: the descendant
+ * set is a sub-select, never a bound id list, and cannot run into SQLite's parameter ceiling
+ * however large the tree is.
+ */
+export function buildFolderSubtreeDeletedStatements(
+  db: Database,
+  input: { folderId: string; deleted: boolean; userId: string; now: string },
+): BatchItem<'sqlite'>[] {
+  const { folderId, deleted, userId, now } = input;
+
+  const fields = deleted
+    ? { deletedAt: now, deletedBy: userId, status: 'trashed' as const, updatedAt: now }
+    : {
+        deletedAt: null,
+        deletedBy: null,
+        status: 'active' as const,
+        trashedWithFolderId: null,
+        updatedAt: now,
+      };
+
+  return [
+    // The folder the user acted on. Its own `trashed_with_folder_id` stays null — nothing swept
+    // it in, so a restore of some ancestor must not pick it up.
+    db
+      .update(folders)
+      .set(deleted ? { ...fields, trashedWithFolderId: null } : fields)
+      .where(
+        and(
+          eq(folders.id, folderId),
+          deleted ? isNull(folders.deletedAt) : isNotNull(folders.deletedAt),
+        ),
+      ),
+
+    db
+      .update(folders)
+      .set(deleted ? { ...fields, trashedWithFolderId: folderId } : fields)
+      .where(sweptDescendants(folderId, deleted)),
+  ];
+}
+
+/**
+ * How many folders a sweep will actually change, counted before it runs.
+ *
+ * `+ 1` for the folder itself **whether or not its own row matches** — trashing an
+ * already-trashed folder has always reported 1, and that number reaches an audit entry. The
+ * quirk is preserved deliberately rather than quietly corrected.
+ *
+ * Counted with the sweep's own predicate rather than read back from `meta.changes`, for the
+ * reason `matchingIds` documents on the file side: `changes` counts trigger and cascade writes
+ * too, and this number is business data.
+ */
+export async function countFolderSubtreeSweep(
+  db: Database,
+  input: { folderId: string; deleted: boolean },
+): Promise<number> {
+  const [row] = await db
+    .select({ value: count() })
+    .from(folders)
+    .where(sweptDescendants(input.folderId, input.deleted));
+  return (row?.value ?? 0) + 1;
+}
+
+/** The statements that archive or unarchive a folder subtree — built, not executed. */
+export function buildFolderSubtreeStatusStatements(
+  db: Database,
+  input: { folderId: string; status: 'active' | 'archived'; userId: string; now: string },
+): BatchItem<'sqlite'>[] {
+  const { folderId, status, userId, now } = input;
+
+  return [
+    db
+      .update(folders)
+      .set({
+        status,
+        archivedAt: status === 'archived' ? now : null,
+        updatedBy: userId,
+        updatedAt: now,
+      })
+      .where(eq(folders.id, folderId)),
+
+    // Descendants change status but keep `archived_at` null. That is what marks the one folder
+    // the user actually archived, so the Archive view lists it and not its whole subtree.
+    db
+      .update(folders)
+      .set({ status, updatedAt: now })
+      .where(sql`${folders.id} IN ${descendantsOf(folderId)}`),
+  ];
+}
+
+/** How many folders a status change covers: every descendant, plus the folder itself. */
+export async function countFolderSubtreeStatus(db: Database, folderId: string): Promise<number> {
+  const [row] = await db
+    .select({ value: count() })
+    .from(folders)
+    .where(sql`${folders.id} IN ${descendantsOf(folderId)}`);
+  return (row?.value ?? 0) + 1;
+}
+
 /**
  * Trashes or restores a folder together with its subtree.
  *
- * `trashed_with_folder_id` records which deletion swept a descendant in, so restoring the
- * parent restores exactly that set — and not folders the user had trashed individually
- * beforehand, which must stay in the trash. Behaviour, including the returned count, is
- * matched to the Mongo implementation statement for statement.
+ * The folder half only. `folder.service.ts` on D1 goes through
+ * `trashFolderSubtreeWithFiles` / `restoreFolderSubtreeWithFiles` instead, which compose these
+ * same statements with the file half into one batch.
  */
 export async function setSubtreeDeleted(input: {
   folderId: string;
@@ -1103,68 +1226,9 @@ export async function setSubtreeDeleted(input: {
   userId: string;
 }): Promise<number> {
   const db = await getD1();
-  const now = nowIso();
-  const descendants = sql`(SELECT a.folder_id FROM ${folderAncestors} a WHERE a.ancestor_id = ${input.folderId})`;
-
-  if (input.deleted) {
-    const [, swept] = await withBatch(db, [
-      db
-        .update(folders)
-        .set({
-          deletedAt: now,
-          deletedBy: input.userId,
-          status: 'trashed',
-          trashedWithFolderId: null,
-          updatedAt: now,
-        })
-        .where(and(eq(folders.id, input.folderId), isNull(folders.deletedAt))),
-      db
-        .update(folders)
-        .set({
-          deletedAt: now,
-          deletedBy: input.userId,
-          status: 'trashed',
-          trashedWithFolderId: input.folderId,
-          updatedAt: now,
-        })
-        .where(and(sql`${folders.id} IN ${descendants}`, isNull(folders.deletedAt)))
-        .returning({ id: folders.id }),
-    ]);
-
-    return (swept as { id: string }[]).length + 1;
-  }
-
-  const [, restored] = await withBatch(db, [
-    db
-      .update(folders)
-      .set({
-        deletedAt: null,
-        deletedBy: null,
-        status: 'active',
-        trashedWithFolderId: null,
-        updatedAt: now,
-      })
-      .where(and(eq(folders.id, input.folderId), isNotNull(folders.deletedAt))),
-    db
-      .update(folders)
-      .set({
-        deletedAt: null,
-        deletedBy: null,
-        status: 'active',
-        trashedWithFolderId: null,
-        updatedAt: now,
-      })
-      .where(
-        and(
-          sql`${folders.id} IN ${descendants}`,
-          eq(folders.trashedWithFolderId, input.folderId),
-          isNotNull(folders.deletedAt),
-        ),
-      )
-      .returning({ id: folders.id }),
-  ]);
-
-  return (restored as { id: string }[]).length + 1;
+  const affected = await countFolderSubtreeSweep(db, input);
+  await withBatch(db, buildFolderSubtreeDeletedStatements(db, { ...input, now: nowIso() }));
+  return affected;
 }
 
 export async function setSubtreeStatus(input: {
@@ -1173,25 +1237,9 @@ export async function setSubtreeStatus(input: {
   userId: string;
 }): Promise<number> {
   const db = await getD1();
-  const now = nowIso();
-  const archivedAt = input.status === 'archived' ? now : null;
-  const descendants = sql`(SELECT a.folder_id FROM ${folderAncestors} a WHERE a.ancestor_id = ${input.folderId})`;
-
-  const [, changed] = await withBatch(db, [
-    db
-      .update(folders)
-      .set({ status: input.status, archivedAt, updatedBy: input.userId, updatedAt: now })
-      .where(eq(folders.id, input.folderId)),
-    // Descendants change status but keep `archived_at` null. That is what marks the one folder
-    // the user actually archived, so the Archive view lists it and not its whole subtree.
-    db
-      .update(folders)
-      .set({ status: input.status, updatedAt: now })
-      .where(sql`${folders.id} IN ${descendants}`)
-      .returning({ id: folders.id }),
-  ]);
-
-  return (changed as { id: string }[]).length + 1;
+  const affected = await countFolderSubtreeStatus(db, input.folderId);
+  await withBatch(db, buildFolderSubtreeStatusStatements(db, { ...input, now: nowIso() }));
+  return affected;
 }
 
 /** Hard delete, used only by the trash-retention purge job and by tests. */

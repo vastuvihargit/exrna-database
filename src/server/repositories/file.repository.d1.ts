@@ -69,9 +69,12 @@
  * commit or none do. A file whose ancestor rows did not land would be invisible to every
  * subtree query and every inheritance check, so the base row and its chain land together.
  *
- * What one batch cannot span is two *repositories*. A folder move that also reparents files is
- * two calls today; composing them into one batch is the shared unit-of-work described in §13 of
- * the module document, and is the next step rather than this one.
+ * What one batch cannot span is two *repositories* — and a folder move, trash, restore or
+ * archive has to change both. Those operations therefore do not run from here: the mutation
+ * logic is exposed as statement *builders* (`buildFileReparentStatements`,
+ * `buildFileSubtreeDeletedStatements`, `buildFileSubtreeStatusStatements`) which
+ * `d1-unit-of-work.ts` composes with the folder half into a single batch. The self-executing
+ * methods beside them remain for the standalone callers and share the same builders.
  */
 import {
   and,
@@ -1567,48 +1570,100 @@ async function matchingIds(db: Database, where: SQL): Promise<string[]> {
   return rows.map((row) => row.id);
 }
 
-/** Trashes or restores every file inside a folder subtree, alongside the folder move. */
+/** Which files a subtree sweep will touch — the predicate, shared by the count and the write. */
+function sweptFiles(folderId: string, deleted: boolean): SQL {
+  return deleted
+    ? and(underFolder(folderId), isNull(files.deletedAt))!
+    : // Only the files this folder took down with it — one trashed on its own beforehand must
+      // stay in the trash when the folder comes back.
+      and(
+        underFolder(folderId),
+        eq(files.trashedWithFolderId, folderId),
+        isNotNull(files.deletedAt),
+      )!;
+}
+
+/**
+ * The statement that trashes or restores every file in a folder subtree — built, not executed.
+ *
+ * ── Set-wise, not by id list ────────────────────────────────────────────────────────────
+ *
+ * The predicate is the same one the count reads, rather than the ids that count returned.
+ * Binding the ids would put one parameter per *file* on the statement, and SQLite's default
+ * ceiling is 999 — so the previous form could not trash a folder holding a thousand files at
+ * all, and nothing in the code said so. Set-wise, the file count does not enter the statement.
+ *
+ * Safe against the composed batch because no lifecycle statement changes folder membership:
+ * `underFolder` reads `files.folder_id` and `file_folder_ancestors`, neither of which this batch
+ * writes, so the predicate selects the same set before and after.
+ *
+ * The UPDATE fires `trg_files_fts_update`, which is how a trashed file leaves `files_fts` and a
+ * restored one returns to it. That is the existing indexing contract, not an addition.
+ */
+export function buildFileSubtreeDeletedStatements(
+  db: Database,
+  input: { folderId: string; deleted: boolean; userId: string; now: string },
+): BatchItem<'sqlite'>[] {
+  const { folderId, deleted, userId, now } = input;
+
+  return [
+    db
+      .update(files)
+      .set(
+        deleted
+          ? {
+              deletedAt: now,
+              deletedBy: userId,
+              status: 'trashed',
+              trashedWithFolderId: folderId,
+              updatedAt: now,
+            }
+          : {
+              deletedAt: null,
+              deletedBy: null,
+              status: 'active',
+              trashedWithFolderId: null,
+              updatedAt: now,
+            },
+      )
+      .where(sweptFiles(folderId, deleted)),
+  ];
+}
+
+/**
+ * How many files a sweep will change, counted before it runs.
+ *
+ * The same discipline as `matchingIds` and for the same reason — this number reaches an audit
+ * entry, and `meta.changes` would inflate it with the FTS trigger's writes. A `count()` rather
+ * than the id list because only the total is wanted, and the id list of a large subtree is a lot
+ * of rows to carry for a number.
+ */
+export async function countFileSubtreeSweep(
+  db: Database,
+  input: { folderId: string; deleted: boolean },
+): Promise<number> {
+  const [row] = await db
+    .select({ value: count() })
+    .from(files)
+    .where(sweptFiles(input.folderId, input.deleted));
+  return row?.value ?? 0;
+}
+
+/**
+ * Trashes or restores every file inside a folder subtree.
+ *
+ * The file half only. On D1 `folder.service.ts` goes through the composed lifecycle operations
+ * in `d1-unit-of-work.ts`, which build these same statements into the folder half's batch.
+ */
 export async function setSubtreeDeleted(
   input: { folderId: string; deleted: boolean; userId: string },
 ): Promise<number> {
   const db = await getD1();
-  const now = nowIso();
+  const affected = await countFileSubtreeSweep(db, input);
+  if (affected === 0) return 0;
 
-  const where = input.deleted
-    ? and(underFolder(input.folderId), isNull(files.deletedAt))!
-    : // Only the files this folder took down with it — one trashed on its own beforehand must
-      // stay in the trash when the folder comes back.
-      and(
-        underFolder(input.folderId),
-        eq(files.trashedWithFolderId, input.folderId),
-        isNotNull(files.deletedAt),
-      )!;
-
-  const ids = await matchingIds(db, where);
-  if (ids.length === 0) return 0;
-
-  await db
-    .update(files)
-    .set(
-      input.deleted
-        ? {
-            deletedAt: now,
-            deletedBy: input.userId,
-            status: 'trashed',
-            trashedWithFolderId: input.folderId,
-            updatedAt: now,
-          }
-        : {
-            deletedAt: null,
-            deletedBy: null,
-            status: 'active',
-            trashedWithFolderId: null,
-            updatedAt: now,
-          },
-    )
-    .where(inArray(files.id, ids));
-
-  return ids.length;
+  await withBatch(db, buildFileSubtreeDeletedStatements(db, { ...input, now: nowIso() }));
+  return affected;
 }
 
 /**
@@ -1765,14 +1820,39 @@ export function buildFileReparentStatements(
   return statements;
 }
 
+/**
+ * The statement that archives or unarchives every live file in a folder subtree.
+ *
+ * `live()` matters: a file already in the trash keeps `status = 'trashed'` through an archive of
+ * the folder around it, and comes back as trashed rather than archived. Archive and trash are
+ * separate lifecycles and this is the line between them.
+ */
+export function buildFileSubtreeStatusStatements(
+  db: Database,
+  input: { folderId: string; status: 'active' | 'archived'; now: string },
+): BatchItem<'sqlite'>[] {
+  return [
+    db
+      .update(files)
+      .set({ status: input.status, updatedAt: input.now })
+      .where(and(underFolder(input.folderId), live())),
+  ];
+}
+
+/** How many live files a status change covers. */
+export async function countFileSubtreeStatus(db: Database, folderId: string): Promise<number> {
+  const [row] = await db
+    .select({ value: count() })
+    .from(files)
+    .where(and(underFolder(folderId), live()));
+  return row?.value ?? 0;
+}
+
 export async function setSubtreeStatus(
   input: { folderId: string; status: 'active' | 'archived' },
 ): Promise<void> {
   const db = await getD1();
-  await db
-    .update(files)
-    .set({ status: input.status, updatedAt: nowIso() })
-    .where(and(underFolder(input.folderId), live()));
+  await withBatch(db, buildFileSubtreeStatusStatements(db, { ...input, now: nowIso() }));
 }
 
 /** Clears the experiment link on every file pointing at an experiment. */
@@ -1844,7 +1924,19 @@ export async function checkFileHierarchyIntegrity(
         depth: fileFolderAncestors.depth,
       })
       .from(fileFolderAncestors)
-      .where(inArray(fileFolderAncestors.fileId, rows.map((row) => row.id)))
+      // A sub-select, not the ids just read: binding them is one parameter per file, and past
+      // 999 SQLite refuses the statement outright — so the checker used to die on exactly the
+      // large organizations where an integrity problem matters most. Found by the test that
+      // sweeps 1200 files and then asks whether the result is intact.
+      .where(
+        inArray(
+          fileFolderAncestors.fileId,
+          db
+            .select({ id: files.id })
+            .from(files)
+            .where(eq(files.organizationId, organizationId)),
+        ),
+      )
       .orderBy(asc(fileFolderAncestors.fileId), asc(fileFolderAncestors.depth));
 
     for (const row of ancestorRows) {
