@@ -219,27 +219,15 @@ sequence with the window reopened.
 
 ---
 
-## 11. The same window still exists for trash, restore and archive
+## 11. Trash, restore and archive — closed in module 8
 
-Scoped out of this session, which was specifically about the move, but it is the same defect and
-it should not be discovered again from scratch. `folder.service.ts` still does two sequential
-D1 batches in three other places:
+At the time of this module those three operations still ran as two sequential D1 batches, for the
+same reason and with the same defect. **That is no longer true**: module 8 gave each of them a
+composed operation in the same unit-of-work, built from the same kind of statement builders. See
+`10-phase-3-module-8-atomic-lifecycle.md`.
 
-| Operation | Line | Calls |
-|---|---|---|
-| trash a folder | ~654 | `folderRepository.setSubtreeDeleted` then `fileRepository.setSubtreeDeleted` |
-| restore a folder | ~733 | the same pair with `deleted: false` |
-| archive / unarchive | ~769 | `folderRepository.setSubtreeStatus` then `fileRepository.setSubtreeStatus` |
-
-The consequence is milder than for a move — these change `status` and `deleted_at`, not the
-closure table, so a half-applied trash leaves files visible in a trashed folder rather than
-mis-inheriting an ACL. But a folder in the trash whose files still read as active is still wrong,
-and `listTrashed` will disagree with the folder listing.
-
-The fix is mechanical now that the pattern exists: extract `buildSubtreeDeletedStatements` and
-`buildSubtreeStatusStatements` in both repositories and add two more composed operations
-alongside `moveFolderSubtreeWithFiles`. Neither needs the ordering trick — there is no depth
-shift to compute — so both are simpler than the move.
+As predicted here, none of them needed the move's ordering trick — there is no depth shift to
+compute, so no `updated_at` guard either, and all three are simpler than the move.
 
 ---
 

@@ -320,9 +320,16 @@ The two changes this required in module 6's code:
 | Drive-id lookup boundary tested on both engines | done (`4ac4d0d`) |
 | D1 implementation, FTS refresh, D1 routing | done |
 | Folder+file atomic move / shared unit-of-work | done — `09-phase-3-module-7-atomic-moves.md` |
+| Folder+file atomic trash / restore / archive | done — `10-phase-3-module-8-atomic-lifecycle.md` |
 | Mongo `aggregate` soft-delete inconsistency | **not fixed** — §6.3 |
 | File-version domain on D1 | not started |
-| Dedicated D1 search module | not started (module 8) |
+| Dedicated D1 search module | not started |
+
+`setSubtreeDeleted` and `setSubtreeStatus` in the table above still exist and still work
+standalone, but on D1 the folder service no longer calls them directly — it goes through the
+composed operations in `d1-unit-of-work.ts`, which build the same statements into the folder
+half's batch. Both now emit **set-wise** statements rather than binding one parameter per file;
+the previous form could not have swept a folder holding more than 999 files.
 
 Production configuration is unchanged: `DATA_SOURCE_FILES` is unset, so MongoDB serves every
 request. Nothing silently substitutes one database for the other in either direction.

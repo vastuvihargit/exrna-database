@@ -285,7 +285,7 @@ correct signal.
 | Item | Phase |
 |---|---|
 | Cross-store atomicity for folder+file **moves** | done — 3, module 7 (`d1-unit-of-work.ts`) |
-| Cross-store atomicity for folder+file **trash / restore / archive** | still two batches on D1 — see module 7 doc §11 |
+| Cross-store atomicity for folder+file **trash / restore / archive** | done — 3, module 8 (`d1-unit-of-work.ts`) |
 | `folder-mirror.ts`, `drive-mirror.ts` and `storage-migration/planner.ts` read `FolderModel` directly and are MongoDB-only | Drive storage phase |
 | `(file_id, depth)` index on `file_folder_ancestors` if file listings become hot | measure first |
 | `checkHierarchyIntegrity` behind an admin endpoint or a scheduled job | 6 |
