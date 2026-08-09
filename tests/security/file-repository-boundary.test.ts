@@ -433,4 +433,76 @@ describe('the internal/user-facing split is structural', () => {
     // `import type` is erased entirely; a value import would put the driver in the bundle.
     expect(mongooseImports[0]![1], 'must be `import type`').toBeTruthy();
   });
+
+  /**
+   * The same three rules for the version module, which arrived after the ones above.
+   *
+   * The version repository is reached from the *upload* path, so a Node-only import here would
+   * fail on the busiest write in the product, and only once deployed.
+   */
+  const workerSafe = [
+    'file-version.repository.d1.ts',
+    'file-version.validator.d1.ts',
+  ] as const;
+
+  for (const filename of workerSafe) {
+    it(`${filename} pulls in neither Mongoose nor Node built-ins`, async () => {
+      const source = await fsp.readFile(
+        path.resolve(process.cwd(), 'src', 'server', 'repositories', filename),
+        'utf8',
+      );
+      const imports = [...source.matchAll(/from ['"]([^'"]+)['"]/g)].map((match) => match[1]!);
+
+      expect(
+        imports.filter((specifier) => /mongoose|\.mongo$|db\/connection|db\/models/.test(specifier)),
+        'a Mongo import would pull the whole driver into the Worker bundle',
+      ).toEqual([]);
+      expect(
+        imports.filter((specifier) => specifier.startsWith('node:')),
+        'a node: import would not resolve in workerd',
+      ).toEqual([]);
+    });
+  }
+
+  it('the file-version contract imports Mongoose only as a type', async () => {
+    const source = await fsp.readFile(
+      path.resolve(
+        process.cwd(),
+        'src',
+        'server',
+        'repositories',
+        'file-version.repository.contract.ts',
+      ),
+      'utf8',
+    );
+
+    const mongooseImports = [...source.matchAll(/^import\s+(type\s+)?.*from ['"]mongoose['"]/gm)];
+    expect(mongooseImports).toHaveLength(1);
+    expect(mongooseImports[0]![1], 'must be `import type`').toBeTruthy();
+  });
+
+  /**
+   * The contract also reaches for `ProcessingStatus` and `VersionLabel`, which live in the
+   * Mongoose *model* file. A value import of that would drag a schema — and therefore the
+   * driver — into the Worker; a type import erases. Worth pinning, because the specifier looks
+   * innocuous next to the others.
+   */
+  it('the file-version contract imports the model file only as a type', async () => {
+    const source = await fsp.readFile(
+      path.resolve(
+        process.cwd(),
+        'src',
+        'server',
+        'repositories',
+        'file-version.repository.contract.ts',
+      ),
+      'utf8',
+    );
+
+    const modelImports = [
+      ...source.matchAll(/^import\s+(type\s+)?.*from ['"][^'"]*file-version\.model['"]/gm),
+    ];
+    expect(modelImports).toHaveLength(1);
+    expect(modelImports[0]![1], 'must be `import type`').toBeTruthy();
+  });
 });

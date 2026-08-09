@@ -1,8 +1,8 @@
 # Phase 3, module 9 — file versions on D1
 
-**Status: partially complete.** The repository, its routing, the atomic version write and the
-migration validator exist and typecheck; the D1 test suite for them does not yet. §12 says
-exactly what is done and what is not. Nothing here is enabled in production.
+**Status: complete.** The repository, its routing, the atomic version write and the migration
+validator are implemented and proven by execution — 37 tests against real D1, and every gate in
+§12.1 run to completion. Nothing here is enabled in production.
 
 ---
 
@@ -209,26 +209,115 @@ is built from the patch's keys) and is covered by the existing Mongo suite.
 
 ---
 
-## 12. Status — what is done and what is not
+## 12. Verification
 
-| Step | State |
-|---|---|
-| Method mapping and contract (20 methods) | done |
-| Mongo implementation behind the contract | done |
-| `VersionPatch` replacing raw Mongo update documents | done |
-| Routing on `DATA_SOURCE_FILE_VERSIONS` | done |
-| D1 implementation, full surface | done |
-| Atomic `createVersionWithFile` + numbering retry | done |
-| `planFileUpdate` extracted so the file half composes | done |
-| Split-provider version writes fail closed | done |
-| Service wiring (upload, restore) | done |
-| Read-only migration validator | done |
-| Typecheck | passing |
-| Mongo suite | passing |
-| **D1 test suite for versions** | **not written** |
-| **Concurrency / rollback / parity tests** | **not written** |
-| **`workerd` preview with the versions flag** | **not run** |
-| **Lint, worker build re-run after the last edits** | **not run** |
+`tests/d1/file-version-repository.test.ts` — **37 tests, all passing** against real D1 through
+the Miniflare harness. No repository behaviour is mocked; every assertion goes through
+`file-version.repository.d1.ts` and `createVersionWithFile()`.
+
+### The two that justify the harness
+
+**Concurrent numbering.** Two `createVersionWithFile` calls are held at a barrier until both have
+read the *same* `nextVersionNumber`, then released together. Without the barrier the test would
+pass for the wrong reason — `await` boundaries usually let the first insert land before the
+second reads, so the retry path would never run. The test asserts the read count exceeded two,
+which is how it knows a collision actually happened and the retry actually recovered. Result:
+numbers `[1, 2]`, both versions present, exactly one current, `version_count` 2, no orphan.
+
+**Rollback, both halves.** Injected by real constraint violation, never by mocking `withBatch`:
+
+| Poisoned half | How | Asserted |
+|---|---|---|
+| version INSERT | `uploaded_by` naming a user that does not exist | file pointer, `version_count` and previous `is_current` all unchanged; no partial version |
+| file UPDATE | an extra `files.folder_id` naming a folder that does not exist | the **valid** new version row is absent; the file half is unchanged |
+
+The second is the one that matters: the version INSERT was valid and would have committed alone.
+
+### Everything else covered
+
+Sequential numbering and `version_count`; manual duplicate `(file_id, version_number)` rejected;
+`assertCurrentVersionInvariant` after every creation; approval surviving a new version with
+`approvedBy`/`approvedAt`/`approvedRevisionId` intact while the *file's* pointer clears; restore
+producing v4 from v1 with `restored_from_version_id` and the source checksum, v1 untouched;
+checksum and storage key unwritable through `updateFlags` even when the type is cast away; the
+read surface including paging and storage locations; Drive-id resolution, duplicate rejection,
+and ambiguity failing loudly with the index dropped; `setCurrent` in isolation; purge counts and
+idempotence; all four provider combinations; and the validator's checks with a re-run proving it
+changed nothing.
+
+### Two findings from writing the tests
+
+**`setCurrent()` alone breaks the invariant, by design.** It moves `is_current` and leaves
+`files.current_version_id` pointing elsewhere. That is correct for its one caller but wrong for
+an upload, so there is now a test pinning the behaviour with a comment saying not to reach for
+it as a shortcut.
+
+**The orphan check cannot be provoked on D1.** `file_versions.file_id` is a real foreign key, so
+a version whose file is missing is neither insertable nor createable by deleting the parent —
+both are refused, and a test asserts the refusal. `missing_parent_file` stays in the validator
+because it targets a *copy of the Mongo corpus* loaded before constraints are enforced, which is
+precisely the case it was written for. Faking the corruption to make the test green would have
+proven nothing.
+
+### Authorization, which this module does not own
+
+A version id is not a capability, and the version repository takes no `Actor` on either engine.
+The boundary is one level up and is always the same two lines:
+
+```ts
+const context = await requireFile(actor, fileId, <permission>);
+if (!version || version.fileId !== fileId) throw new NotFoundError();
+```
+
+`tests/security/search-and-versioning.test.ts` — *a version id is not a capability* — pushes
+every service that accepts a caller-supplied version id (`download`, `restoreVersion`,
+`updateVersionNote`, `listVersions`) through the six ways access can be absent: a version
+belonging to another file the actor **does** own (the case where `requireFile` passes and only
+the second line stands between the caller and somebody else's bytes), a fully-privileged actor
+in another organization, an explicit deny over a working share, a broken inheritance boundary
+with the parent folder still shared, and an expired grant written straight onto the ACL because
+`sharingService.share` correctly refuses a past expiry.
+
+`tests/security/file-repository-boundary.test.ts` adds the structural half: neither
+`file-version.repository.d1.ts` nor `file-version.validator.d1.ts` imports Mongoose or a `node:`
+built-in, and the contract imports both `mongoose` and `file-version.model` as types only — a
+value import of the model file would drag a schema, and therefore the driver, into the Worker
+bundle on the busiest write in the product.
+
+### 12.1 Gates
+
+Run 2026-08-09 on the migration branch, in this order, nothing skipped.
+
+| Gate | Command | Result |
+|---|---|---|
+| Module suite | `vitest run --config vitest.d1.config.ts tests/d1/file-version-repository.test.ts` | **37 passed** |
+| Full D1 suite | `npm run test:d1` | **430 passed**, 11 files |
+| Full Mongo suite | `npm run test:mongo` | **732 passed**, 49 files |
+| Typecheck | `npm run typecheck` | clean |
+| Lint | `npm run lint` | clean (one pre-existing unused-variable warning in a test) |
+| Worker build | `npm run cf:build` | bundle written to `.open-next/worker.js` |
+| Worker preview | `npm run cf:preview` with eight `DATA_SOURCE_*` flags on `d1` | boots and serves |
+
+**The preview check, precisely.** `.dev.vars` carried `DATA_SOURCE_USERS`, `_DEPARTMENTS`,
+`_ROLES`, `_PROJECTS`, `_EXPERIMENTS`, `_FOLDERS`, `_FILES` and `_FILE_VERSIONS` all set to
+`d1` — the whole migrated set, not just this module's flag, because a version write reaches the
+file repository and a module graph that loads one but not the other proves nothing.
+
+`workerd` served `/login` at 16,432 bytes (byte-identical to Phase 1), `/api/health` 200,
+`/api/version` 200, and `/api/health/ready` 200. Every route whose handler imports a D1
+repository — `/api/drives`, `/api/search`, `/api/recent`, `/api/starred`, `/api/trash`,
+`/api/shared`, `/api/files/:id/versions` — returned **401 UNAUTHENTICATED**, which is the
+result that matters: a 500 would mean the module graph failed to resolve in `workerd`, and a 401
+means it resolved and the authentication layer ran. The `DB` binding was confirmed present
+through the local explorer API.
+
+Two observations from the preview, neither a defect in this module and both recorded for later
+phases: `/api/health/ready` reports `storage.provider: "local"` inside a Worker that has no
+filesystem, and the same one-line papercut Phase 3 module 7 recorded — `cf:preview` runs with
+`NODE_ENV=production`, so `APP_URL` must be `https://` in `.dev.vars` or every route 500s on the
+environment schema before reaching any handler.
+
+`workerd` processes were terminated and `.dev.vars` restored to its committed shape afterwards.
 
 Production configuration is unchanged: every data-source flag is unset and MongoDB serves every
 request.
