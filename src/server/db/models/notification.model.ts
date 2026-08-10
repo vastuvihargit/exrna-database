@@ -47,6 +47,16 @@ const notificationSchema = new Schema(
     message: { type: String, required: true, maxlength: 500 },
 
     readAt: { type: Date, default: null },
+
+    /**
+     * Set only by paths whose delivery is at-least-once — today, Queue consumers.
+     *
+     * The sparse unique index below is what makes a redelivery a no-op rather than a duplicate
+     * row in somebody's bell menu. Rows written inline from a request carry null: there is no
+     * retry to deduplicate, and a shared key would collapse two genuinely separate events (the
+     * same person sharing the same file with you twice) into one.
+     */
+    dedupeKey: { type: String, default: null, maxlength: 200 },
   },
   baseSchemaOptions,
 );
@@ -55,6 +65,25 @@ const notificationSchema = new Schema(
 notificationSchema.index({ userId: 1, readAt: 1, createdAt: -1 });
 notificationSchema.index({ userId: 1, createdAt: -1 });
 notificationSchema.index({ entityType: 1, entityId: 1 });
+/**
+ * Partial, not sparse.
+ *
+ * `sparse: true` excludes documents where the field is *absent*. It does not exclude documents
+ * where the field is present and null — and every notification written by an inline path stores
+ * an explicit `dedupeKey: null`, because the schema gives it that default. A sparse unique index
+ * therefore indexes all of them, decides they are all the same key, and rejects the second
+ * notification anybody ever receives.
+ *
+ * `partialFilterExpression` on `$type: 'string'` indexes only the rows that carry a real key,
+ * which is what the D1 side expresses as `WHERE dedupe_key IS NOT NULL`.
+ *
+ * This index is the deduplication — not a `findOne` in the repository, which would be a
+ * read-then-write race between two concurrent redeliveries of the same message.
+ */
+notificationSchema.index(
+  { dedupeKey: 1 },
+  { unique: true, partialFilterExpression: { dedupeKey: { $type: 'string' } } },
+);
 
 export type NotificationDocument = InferSchemaType<typeof notificationSchema>;
 

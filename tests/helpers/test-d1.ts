@@ -130,6 +130,7 @@ export async function startTestD1(): Promise<D1Database> {
     '0001_fts_triggers_and_seed.sql',
     '0002_fix_user_roles_active_uniqueness.sql',
     '0003_user_roles_scope_invariant.sql',
+    '0004_notification_dedupe_key.sql',
   ]) {
     const file = path.join(MIGRATIONS_DIR, name);
     const statements = splitStatements(fs.readFileSync(file, 'utf8'));

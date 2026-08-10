@@ -29,6 +29,13 @@
       "when": 1785996132008,
       "tag": "0003_user_roles_scope_invariant",
       "breakpoints": true
+    },
+    {
+      "idx": 4,
+      "version": "6",
+      "when": 1786000000000,
+      "tag": "0004_notification_dedupe_key",
+      "breakpoints": true
     }
   ]
 }

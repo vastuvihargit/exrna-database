@@ -265,6 +265,15 @@ export const notifications = sqliteTable(
     message: text('message').notNull(),
     readAt: text('read_at'),
 
+    /**
+     * Set only by Queue consumers, where delivery is at-least-once.
+     *
+     * A unique partial index in migration 0004 turns a redelivery into a no-op instead of a
+     * duplicate row. NULL means "written inline from a request", which cannot retry and so has
+     * nothing to deduplicate — see the migration for why those rows are not backfilled.
+     */
+    dedupeKey: text('dedupe_key'),
+
     ...timestampColumns,
   },
   (table) => [
@@ -272,5 +281,11 @@ export const notifications = sqliteTable(
     index('ix_notifications_unread').on(table.userId, table.readAt, table.createdAt),
     index('ix_notifications_user').on(table.userId, table.createdAt),
     index('ix_notifications_entity').on(table.entityType, table.entityId),
+    /**
+     * Not partial, deliberately: SQLite treats every NULL as distinct in a unique index, so the
+     * many inline-written rows that carry NULL do not collide. Migration 0004 explains why the
+     * MongoDB index has to be partial and this one must not be.
+     */
+    uniqueIndex('ux_notifications_dedupe_key').on(table.dedupeKey),
   ],
 );
