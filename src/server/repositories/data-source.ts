@@ -47,6 +47,7 @@ export const DATA_SOURCE_MODULES = [
   'storageUsage',
   'activities',
   'comments',
+  'driveSync',
   'uploadSessions',
   'collaboration',
   'jobs',
@@ -160,7 +161,8 @@ export const DATA_SOURCE_DEPENDENCIES: Partial<Record<DataSourceModule, DataSour
   activities: ['organizations', 'users', 'folders', 'projects'],
   /** `comments.version_id` is a foreign key, so a comment cannot outrun its version. */
   comments: ['organizations', 'users', 'files', 'fileVersions'],
-  uploadSessions: ['organizations', 'users', 'folders'],
+  /** `result_file_id` and `result_version_id` are foreign keys, as are the folder and owner. */
+  uploadSessions: ['organizations', 'users', 'folders', 'files', 'fileVersions'],
   collaboration: ['organizations', 'users', 'files'],
   jobs: ['organizations', 'users'],
   appSettings: ['organizations'],

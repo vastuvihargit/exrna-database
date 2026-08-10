@@ -431,7 +431,7 @@ describe('chunked and resumable uploads', () => {
       TEST_META,
     );
     // Pretend the client agreed to more chunks than it sent.
-    await sessionRepository.update(ticket.sessionId, { $set: { totalChunks: 3 } });
+    await sessionRepository.update(ticket.sessionId, { totalChunks: 3 });
 
     await expect(uploadService.finalize(alice, ticket.sessionId, TEST_META)).rejects.toThrow();
   });
@@ -528,7 +528,7 @@ describe('abandoned uploads', () => {
     expect(await storage.fileExists(quarantine.key, quarantine.area)).toBe(true);
 
     await sessionRepository.update(ticket.sessionId, {
-      $set: { expiresAt: new Date(Date.now() - 3600_000) },
+      expiresAt: new Date(Date.now() - 3600_000),
     });
 
     const { sessions } = await uploadService.cleanupExpired();
@@ -549,7 +549,7 @@ describe('abandoned uploads', () => {
       TEST_META,
     );
     await sessionRepository.update(ticket.sessionId, {
-      $set: { expiresAt: new Date(Date.now() - 1000) },
+      expiresAt: new Date(Date.now() - 1000),
     });
 
     await expect(

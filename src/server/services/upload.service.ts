@@ -227,12 +227,10 @@ export async function receiveStream(
     });
 
     await sessionRepository.update(sessionId, {
-      $set: {
-        status: 'uploading',
-        receivedBytes: stored.size,
-        checksumSha256: stored.checksumSha256,
-        quarantineKey: quarantine.key,
-      },
+      status: 'uploading',
+      receivedBytes: stored.size,
+      checksumSha256: stored.checksumSha256,
+      quarantineKey: quarantine.key,
     });
 
     return { receivedBytes: stored.size, checksumSha256: stored.checksumSha256 };
@@ -528,14 +526,12 @@ async function buildFileFromSession(
       await sessionRepository.update(
         session.id,
         {
-          $set: {
-            status: 'ready',
-            receivedBytes: measuredSize,
-            checksumSha256: checksum,
-            quarantineKey: null,
-            resultFileId: fileId,
-            resultVersionId: version.id,
-          },
+          status: 'ready',
+          receivedBytes: measuredSize,
+          checksumSha256: checksum,
+          quarantineKey: null,
+          resultFileId: fileId,
+          resultVersionId: version.id,
         },
         dbSession,
       );
@@ -694,9 +690,7 @@ export async function abort(actor: Actor, sessionId: string): Promise<void> {
   }
 
   await discardBytes(session);
-  await sessionRepository.update(sessionId, {
-    $set: { status: 'aborted', quarantineKey: null },
-  });
+  await sessionRepository.update(sessionId, { status: 'aborted', quarantineKey: null });
 }
 
 export async function getStatus(
@@ -872,7 +866,9 @@ async function assembleChunks(
 
   const checksumSha256 = hash.digest('hex');
   await sessionRepository.update(session.id, {
-    $set: { receivedBytes: size, checksumSha256, quarantineKey: quarantine.key },
+    receivedBytes: size,
+    checksumSha256,
+    quarantineKey: quarantine.key,
   });
   return { size, checksumSha256 };
 }
@@ -911,7 +907,9 @@ async function rejectSession(
 ): Promise<void> {
   await discardBytes(session);
   await sessionRepository.update(session.id, {
-    $set: { status: 'rejected', failureReason: reason.slice(0, 500), quarantineKey: null },
+    status: 'rejected',
+    failureReason: reason.slice(0, 500),
+    quarantineKey: null,
   });
 
   await auditService.recordForActor(actor, meta, {

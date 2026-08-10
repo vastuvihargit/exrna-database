@@ -1,8 +1,10 @@
 /**
- * Phase 3, module 14 — login history, application settings and storage accounting.
+ * Phase 3, module 14 — the support repositories.
  *
- * Three small repositories with one thing in common: each has a failure mode that is silent
- * rather than loud, and the assertions below are aimed at those rather than at the happy paths.
+ * Login history, application settings, storage accounting, the activity timeline, comments and
+ * upload sessions. Six repositories with one thing in common: each has a failure mode that is
+ * silent rather than loud, and the assertions here are aimed at those rather than the happy
+ * paths.
  *
  *   • **Login history must never fail a login.** It is written on every attempt, including the
  *     failing ones, and on D1 it carries two foreign keys — one of which (`user_id`) is null by
@@ -15,6 +17,19 @@
  *   • **Concurrent deltas must not lose bytes.** Two uploads that both read-modify-write leave
  *     the loser's bytes on disk and invisible to the quota — silent, cumulative, and discovered
  *     only when a volume fills.
+ *
+ *   • **A re-sent chunk must change nothing at all.** Counting its bytes twice makes a resumable
+ *     upload report more received than it holds, and finalize early.
+ *
+ *   • **Exactly one caller may finalize an upload.** The status transition is the lock; two
+ *     winners would build two versions from one upload.
+ *
+ *   • **A sweep must count what it removed.** D1 reports cascaded deletions in `meta.changes`,
+ *     so a naive count roughly doubles — and that number is what an operator reads to decide
+ *     whether retention is working.
+ *
+ * The engine-parity blocks run both implementations through the same contract. The `d1` blocks
+ * cover the places where D1 is genuinely not a transliteration of the Mongo query.
  */
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from 'vitest';
 import type { D1Database } from '@cloudflare/workers-types';
@@ -42,6 +57,7 @@ import {
 } from '@/server/repositories/activity.repository';
 import type { ActivityRepository } from '@/server/repositories/activity.repository.contract';
 import { d1CommentRepository } from '@/server/repositories/comment.repository';
+import { d1UploadSessionRepository } from '@/server/repositories/upload-session.repository';
 import { clearDataSourceOverrides } from '@/server/repositories/data-source';
 import { UserModel, DepartmentModel } from '@/server/db/models';
 
@@ -244,6 +260,7 @@ const D1_RESET = [
   'UPDATE login_history SET session_id = NULL, user_id = NULL',
   'DELETE FROM login_history',
   'DELETE FROM app_settings',
+  'DELETE FROM upload_sessions',
   'DELETE FROM comment_mentions',
   'UPDATE comments SET parent_comment_id = NULL',
   'DELETE FROM comments',
@@ -752,6 +769,159 @@ describe('comments — d1', () => {
     await comment();
     expect(await d1CommentRepository.purgeForFiles([])).toBe(0);
     expect(await d1CommentRepository.countForFile(FILE)).toBe(1);
+  });
+});
+
+/* ------------------------------------------------------------------ upload sessions */
+
+describe('upload sessions — d1', () => {
+  beforeEach(async () => {
+    await clearD1(d1, D1_RESET);
+    await seedD1();
+    await seedFolder('d1');
+  });
+
+  async function session(overrides: Record<string, unknown> = {}) {
+    return d1UploadSessionRepository.create({
+      organizationId: ORG,
+      userId: ALICE,
+      folderId: FOLDER,
+      declaredFilename: 'a.csv',
+      displayName: 'a.csv',
+      extension: 'csv',
+      declaredSize: 1_000,
+      resolvedMimeType: 'text/csv',
+      expiresAt: new Date(Date.now() + 3_600_000),
+      ...overrides,
+    });
+  }
+
+  it('creates a session in the pending state', async () => {
+    const created = await session();
+
+    expect(created.status).toBe('pending');
+    expect(created.receivedChunks).toEqual([]);
+    expect(created.finalizationKey).toBeNull();
+    expect(created.expiresAt).toBeInstanceOf(Date);
+  });
+
+  /**
+   * The lock. Only the caller that moves the session out of `uploading`/`pending` may build the
+   * file; a retry that timed out must find nothing to claim and read the stored result instead.
+   */
+  it('lets exactly one caller claim a session for finalization', async () => {
+    const created = await session();
+
+    const claims = await Promise.all([
+      d1UploadSessionRepository.claimForFinalization(created.id, 'key-a'),
+      d1UploadSessionRepository.claimForFinalization(created.id, 'key-b'),
+      d1UploadSessionRepository.claimForFinalization(created.id, 'key-c'),
+    ]);
+
+    expect(claims.filter(Boolean)).toHaveLength(1);
+    expect((await d1UploadSessionRepository.findById(created.id))!.status).toBe('processing');
+  });
+
+  it('refuses to claim a session that already finalized', async () => {
+    const created = await session();
+    await d1UploadSessionRepository.claimForFinalization(created.id, 'key-a');
+
+    expect(await d1UploadSessionRepository.claimForFinalization(created.id, 'key-b')).toBeNull();
+  });
+
+  /**
+   * A file rejected for its content is a different thing from an upload that broke, and the
+   * admin review of quarantined uploads has to tell them apart.
+   */
+  it('does not overwrite a terminal status when marking failed', async () => {
+    for (const status of ['ready', 'rejected', 'aborted'] as const) {
+      const created = await session();
+      await d1UploadSessionRepository.update(created.id, { status });
+
+      await d1UploadSessionRepository.markFailed(created.id, 'connection reset');
+
+      expect((await d1UploadSessionRepository.findById(created.id))!.status).toBe(status);
+    }
+  });
+
+  it('marks a live session failed, with the reason', async () => {
+    const created = await session();
+    await d1UploadSessionRepository.markFailed(created.id, 'connection reset');
+
+    const found = await d1UploadSessionRepository.findById(created.id);
+    expect(found!.status).toBe('failed');
+    expect(found!.failureReason).toBe('connection reset');
+  });
+
+  it('records chunks and accumulates their bytes', async () => {
+    const created = await session({ chunkSize: 100, totalChunks: 3 });
+
+    await d1UploadSessionRepository.recordChunk(created.id, 0, 100);
+    await d1UploadSessionRepository.recordChunk(created.id, 1, 100);
+
+    const found = await d1UploadSessionRepository.findById(created.id);
+    expect(found!.receivedChunks.sort()).toEqual([0, 1]);
+    expect(found!.receivedBytes).toBe(200);
+    expect(found!.status).toBe('uploading');
+  });
+
+  /**
+   * `$addToSet` has no SQLite equivalent, so the index and the byte count are governed by one
+   * predicate in one statement. A re-sent chunk must change neither — counting its bytes twice
+   * would make a resumable upload report more received than it holds and finalize early.
+   */
+  it('ignores a re-sent chunk entirely, bytes included', async () => {
+    const created = await session({ chunkSize: 100, totalChunks: 2 });
+
+    await d1UploadSessionRepository.recordChunk(created.id, 0, 100);
+    await d1UploadSessionRepository.recordChunk(created.id, 0, 100);
+    await d1UploadSessionRepository.recordChunk(created.id, 0, 100);
+
+    const found = await d1UploadSessionRepository.findById(created.id);
+    expect(found!.receivedChunks).toEqual([0]);
+    expect(found!.receivedBytes).toBe(100);
+  });
+
+  it('returns the session rather than null for a duplicate chunk', async () => {
+    const created = await session();
+    await d1UploadSessionRepository.recordChunk(created.id, 0, 50);
+
+    expect(await d1UploadSessionRepository.recordChunk(created.id, 0, 50)).not.toBeNull();
+  });
+
+  it('lists expired sessions, excluding finished ones', async () => {
+    const stale = await session();
+    await d1UploadSessionRepository.update(stale.id, { expiresAt: new Date(Date.now() - 1_000) });
+
+    const finished = await session();
+    await d1UploadSessionRepository.update(finished.id, {
+      expiresAt: new Date(Date.now() - 1_000),
+      status: 'ready',
+    });
+
+    await session();
+
+    const expired = await d1UploadSessionRepository.listExpired(new Date());
+    expect(expired.map((row) => row.id)).toEqual([stale.id]);
+  });
+
+  it('counts by status for the admin page', async () => {
+    await session();
+    const failed = await session();
+    await d1UploadSessionRepository.markFailed(failed.id, 'boom');
+
+    const counts = await d1UploadSessionRepository.countByStatus();
+    expect(counts.pending).toBe(1);
+    expect(counts.failed).toBe(1);
+  });
+
+  it('removes sessions by id and reports the count', async () => {
+    const a = await session();
+    const b = await session();
+
+    expect(await d1UploadSessionRepository.remove([a.id, b.id])).toBe(2);
+    expect(await d1UploadSessionRepository.remove([])).toBe(0);
+    expect(await d1UploadSessionRepository.findById(a.id)).toBeNull();
   });
 });
 
