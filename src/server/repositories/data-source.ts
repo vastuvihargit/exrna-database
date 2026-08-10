@@ -28,6 +28,7 @@
  * `dataSourceSummary()` reports the ones still on Mongo rather than silently omitting them.
  */
 export const DATA_SOURCE_MODULES = [
+  'organizations',
   'users',
   'departments',
   'roles',
@@ -41,6 +42,11 @@ export const DATA_SOURCE_MODULES = [
   'auditLogs',
   'inventory',
   'notifications',
+  'sessions',
+  'uploadSessions',
+  'collaboration',
+  'jobs',
+  'appSettings',
 ] as const;
 
 export type DataSourceModule = (typeof DATA_SOURCE_MODULES)[number];
@@ -68,14 +74,29 @@ export function clearDataSourceOverrides(): void {
   overrides.clear();
 }
 
-export function dataSourceFor(module: DataSourceModule): DataSource {
-  const override = overrides.get(module);
-  if (override) return override;
-
+/**
+ * What the *deployment* is configured to do, ignoring test overrides.
+ *
+ * Separate from `dataSourceFor` because the two answer different questions, and conflating them
+ * broke a suite. `dataSourceFor` answers "which repository should this call use right now",
+ * which a test legitimately redirects per module. `configuredDataSourceFor` answers "how is this
+ * environment set up", which is what the startup matrix check validates.
+ *
+ * A suite that deliberately puts folders on D1 and files on Mongo — to prove the hierarchy layer
+ * *refuses* that combination with its own domain error — must not have the environment guard
+ * throw first and pre-empt the assertion it was written to make.
+ */
+export function configuredDataSourceFor(module: DataSourceModule): DataSource {
   const raw = process.env[envVarFor(module)];
   // Anything other than an exact match falls back to Mongo. A typo must not silently move a
   // module onto a database that has not been verified for it.
   return raw === 'd1' ? 'd1' : 'mongo';
+}
+
+export function dataSourceFor(module: DataSourceModule): DataSource {
+  const override = overrides.get(module);
+  if (override) return override;
+  return configuredDataSourceFor(module);
 }
 
 export function isD1(module: DataSourceModule): boolean {
@@ -87,4 +108,144 @@ export function dataSourceSummary(): Record<DataSourceModule, DataSource> {
   return Object.fromEntries(
     DATA_SOURCE_MODULES.map((module) => [module, dataSourceFor(module)]),
   ) as Record<DataSourceModule, DataSource>;
+}
+
+/* ────────────────────────────────────────────────────────────── the flag matrix ───────── */
+
+/**
+ * Which modules cannot be on D1 unless some other module is too.
+ *
+ * These are not preferences. Each entry is a **foreign key that exists in the D1 schema**: a
+ * row in the dependent table cannot be inserted unless the referenced row is in the same
+ * database. Splitting such a pair does not degrade gracefully — the dependent module's every
+ * write fails with a constraint violation, at runtime, on a user's action.
+ *
+ * The list is deliberately about *writes crossing databases*, which is why it is much shorter
+ * than "everything depends on everything". Modules that only exchange ids — a star naming a
+ * file, a saved search naming a folder — are genuinely independent and are absent here; see the
+ * note in `star.repository.ts`.
+ *
+ * `search` is the interesting absence. `stars`, `recent_items` and `saved_searches` all carry
+ * `user_id` and `organization_id` foreign keys, so they do require identity on D1 — but they
+ * are listed under `requires` for exactly that reason, not omitted.
+ */
+export const DATA_SOURCE_DEPENDENCIES: Partial<Record<DataSourceModule, DataSourceModule[]>> = {
+  users: ['organizations'],
+  departments: ['organizations'],
+  roles: ['organizations', 'users'],
+  projects: ['organizations', 'users', 'departments'],
+  experiments: ['organizations', 'users', 'projects'],
+  folders: ['organizations', 'users', 'departments'],
+  files: ['organizations', 'users', 'folders'],
+  fileVersions: ['organizations', 'users', 'files'],
+  search: ['organizations', 'users'],
+  reviews: ['organizations', 'users', 'files', 'fileVersions'],
+  auditLogs: ['organizations', 'users'],
+  inventory: ['organizations', 'users', 'departments'],
+  notifications: ['organizations', 'users'],
+  sessions: ['organizations', 'users'],
+  uploadSessions: ['organizations', 'users', 'folders'],
+  collaboration: ['organizations', 'users', 'files'],
+  jobs: ['organizations', 'users'],
+  appSettings: ['organizations'],
+};
+
+export interface DataSourceViolation {
+  module: DataSourceModule;
+  requires: DataSourceModule;
+  message: string;
+}
+
+/**
+ * Everything a module transitively needs on D1.
+ *
+ * Resolved rather than hand-listed, because the direct edges are the ones that can be checked
+ * against the schema and the transitive ones are the ones that get forgotten. `fileVersions`
+ * names `files`; `files` names `folders`; `folders` names `departments`. An operator who set
+ * only `DATA_SOURCE_FILE_VERSIONS=d1` should be told about all of them at once.
+ *
+ * The `seen` set makes this safe against a cycle in the table, which would otherwise be an
+ * infinite loop at startup — a worse failure than the misconfiguration it is checking for.
+ */
+function transitiveRequirements(start: DataSourceModule): DataSourceModule[] {
+  const seen = new Set<DataSourceModule>();
+  const queue = [...(DATA_SOURCE_DEPENDENCIES[start] ?? [])];
+
+  while (queue.length > 0) {
+    const next = queue.shift()!;
+    if (next === start || seen.has(next)) continue;
+    seen.add(next);
+    queue.push(...(DATA_SOURCE_DEPENDENCIES[next] ?? []));
+  }
+
+  return [...seen];
+}
+
+/**
+ * Every unsafe split in the current configuration.
+ *
+ * Returns them all rather than the first, and resolves transitively, because an operator fixing
+ * one flag per restart cycle is how a cutover window gets spent.
+ */
+export function dataSourceViolations(): DataSourceViolation[] {
+  const violations: DataSourceViolation[] = [];
+  // `configuredDataSourceFor`, not `isD1`: this validates the environment, not the routing a
+  // test has redirected. See the note on that function.
+  const onD1 = (name: DataSourceModule) => configuredDataSourceFor(name) === 'd1';
+
+  // Named `name` rather than `module`: `module` is a reserved binding in a CommonJS scope and
+  // the Next.js lint rule that catches it treats an assignment as an error, not a warning.
+  for (const name of DATA_SOURCE_MODULES) {
+    if (!onD1(name)) continue;
+    for (const requirement of transitiveRequirements(name)) {
+      if (onD1(requirement)) continue;
+      violations.push({
+        module: name,
+        requires: requirement,
+        message:
+          `${envVarFor(name)}=d1 requires ${envVarFor(requirement)}=d1: rows reachable from ` +
+          `the "${name}" tables carry a foreign key into "${requirement}", which is still on ` +
+          `MongoDB. Every write would fail on a constraint violation.`,
+      });
+    }
+  }
+
+  return violations;
+}
+
+export class UnsafeDataSourceMatrixError extends Error {
+  readonly violations: DataSourceViolation[];
+
+  constructor(violations: DataSourceViolation[]) {
+    super(
+      `Unsafe DATA_SOURCE_* combination — refusing to start.\n\n` +
+        violations.map((violation) => `  • ${violation.message}`).join('\n'),
+    );
+    this.name = 'UnsafeDataSourceMatrixError';
+    this.violations = violations;
+  }
+}
+
+/**
+ * Fails closed on an unsafe split, at startup rather than on somebody's upload.
+ *
+ * Called from the environment validation path, which both runtimes run before serving. The
+ * alternative — discovering the split when the first write hits a foreign key — means the
+ * deployment looks healthy, `/api/health/ready` is green, and reads work; only writes fail, and
+ * only for the module whose flag was wrong.
+ */
+export function assertDataSourceMatrix(): void {
+  const violations = dataSourceViolations();
+  if (violations.length > 0) throw new UnsafeDataSourceMatrixError(violations);
+}
+
+/**
+ * The flags a Cloudflare Worker deployment must have on `d1`, which is all of them.
+ *
+ * A Worker cannot open the TCP socket Mongoose needs (`00-phase-0-analysis.md` §4), so any
+ * module left on `mongo` there is not a slower path — it is a module that throws on first use.
+ */
+export function workerReadinessGaps(): DataSourceModule[] {
+  // Configured, not routed — same reason as `dataSourceViolations`.
+  return DATA_SOURCE_MODULES.filter((name) => configuredDataSourceFor(name) !== 'd1');
 }

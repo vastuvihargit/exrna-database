@@ -32,6 +32,12 @@ import { z } from 'zod';
  * lib — which produces hundreds of spurious errors and hides real ones.
  */
 import type { D1Database, Queue } from '@cloudflare/workers-types';
+import {
+  assertDataSourceMatrix,
+  envVarFor,
+  workerReadinessGaps,
+} from '@/server/repositories/data-source';
+import { assertAccessConfigured } from '@/server/auth/cloudflare-access';
 
 const bool = (defaultValue: boolean) =>
   z
@@ -193,6 +199,46 @@ export function loadWorkerEnv(source: Record<string, string | undefined>): Worke
     throw new Error(
       'Invalid Worker environment configuration:\n' +
         '  • SESSION_SECRET: AUTH_SECRET and SESSION_SECRET must differ in production',
+    );
+  }
+
+  // A split that puts a foreign key across two databases. Same check the Node deployment runs,
+  // for the same reason: at startup, not on somebody's upload.
+  assertDataSourceMatrix();
+
+  /**
+   * A production Worker with no Access configuration cannot authenticate anybody.
+   *
+   * `@node-rs/argon2` is a native addon workerd cannot load, so the existing `passwordHash`
+   * values are unverifiable there by any means — `shims/argon2.worker.ts` refuses rather than
+   * substituting a different algorithm, which would reject every correct password. Access is
+   * therefore the only identity source, and booting without it produces a deployment that 401s
+   * every request while looking healthy.
+   */
+  assertAccessConfigured(v, v.NODE_ENV === 'production');
+
+  /**
+   * In a Worker, every module must be on D1 — and in production that is an error, not a warning.
+   *
+   * A Worker cannot open the TCP socket Mongoose needs, so a module left on `mongo` is not a
+   * slower path: it throws the first time anything touches it. Discovering that per module, in
+   * production, from user reports, is the failure this check exists to prevent.
+   *
+   * Left as a warning outside production so `cf:preview` can boot with a partial flag set,
+   * which is how each module was verified in a Worker as it landed.
+   */
+  const gaps = workerReadinessGaps();
+  if (gaps.length > 0) {
+    const detail = gaps.map((module) => `${envVarFor(module)}=d1`).join(', ');
+    if (v.NODE_ENV === 'production') {
+      throw new Error(
+        'Invalid Worker environment configuration:\n' +
+          `  • These modules are still routed to MongoDB, which a Worker cannot reach: ${detail}`,
+      );
+    }
+    console.warn(
+      `[env.worker] ${gaps.length} module(s) still routed to MongoDB and unreachable from a ` +
+        `Worker: ${detail}. Requests touching them will throw.`,
     );
   }
 

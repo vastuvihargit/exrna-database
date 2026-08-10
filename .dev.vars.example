@@ -92,11 +92,54 @@ GOOGLE_CLIENT_SECRET=
 # With both on d1 the move is genuinely atomic: see
 # docs/cloudflare-migration/09-phase-3-module-7-atomic-moves.md.
 # DATA_SOURCE_FILES=d1
+# DATA_SOURCE_FILE_VERSIONS=d1
+# DATA_SOURCE_SEARCH=d1
+# DATA_SOURCE_REVIEWS=d1
+# DATA_SOURCE_AUDIT_LOGS=d1
+# DATA_SOURCE_ORGANIZATIONS=d1
+# DATA_SOURCE_SESSIONS=d1
+# DATA_SOURCE_NOTIFICATIONS=d1
+#
+# ── The matrix is enforced, not advisory ──────────────────────────────────────────────
+#
+# assertDataSourceMatrix() runs inside loadEnv() and loadWorkerEnv() and REFUSES TO BOOT on a
+# combination that would put a foreign key across two databases — for example
+# DATA_SOURCE_SESSIONS=d1 with DATA_SOURCE_USERS unset. Every such pair is listed in
+# DATA_SOURCE_DEPENDENCIES in src/server/repositories/data-source.ts. The error names the exact
+# pair. This is at startup rather than on somebody's upload, because a split degrades only for
+# writes and only in one module, which is a support ticket rather than an outage.
+#
+# ── Flags that are not independently movable ──────────────────────────────────────────
+#
+# DATA_SOURCE_SESSIONS      — flipping it logs everybody out, because the new engine holds none
+#                             of the existing sessions. A cutover step, inside the write freeze.
+# DATA_SOURCE_NOTIFICATIONS — notifications written before the flip live in the other database
+#                             and stop appearing until the migration copies them.
+#
+# ── A Worker needs all of them ────────────────────────────────────────────────────────
+#
+# A Worker cannot open the TCP socket Mongoose needs, so a module left on MongoDB there is not a
+# slower path: it throws the first time anything touches it. loadWorkerEnv() therefore *errors*
+# in production on any module still unset, and warns otherwise so `cf:preview` can boot with a
+# partial set.
 
 # ── Cloudflare Access (Phase 8) ───────────────────────────────────────────────────────
-# Unused until Phase 8. CF_ACCESS_AUD is the Application Audience tag from the Access
-# application; CF_ACCESS_TEAM_DOMAIN is e.g. yourteam.cloudflareaccess.com. The Worker
-# verifies the Access JWT against these — it must never trust the
-# Cf-Access-Authenticated-User-Email header on its own.
+# CF_ACCESS_AUD is the Application Audience tag from the Access application;
+# CF_ACCESS_TEAM_DOMAIN is e.g. yourteam.cloudflareaccess.com.
+#
+# REQUIRED IN PRODUCTION. Not a convenience: passwordHash is Argon2id from @node-rs/argon2, a
+# native addon workerd cannot load, so those hashes are unverifiable in a Worker by any means.
+# next.config.ts swaps in a shim that refuses rather than falling back to a different algorithm
+# — falling back would reject every correct password. Access is therefore the only identity
+# source a Worker has, and loadWorkerEnv() refuses to boot a production Worker without it.
+#
+# Both values are required together. A team domain with no audience is the DANGEROUS
+# half-configuration: signatures would verify and any Access application's token on the same
+# team would be accepted, including one an attacker enrolled themselves in. accessConfigFrom()
+# returns null rather than a partial config for exactly this reason.
+#
+# The Worker verifies the Access JWT's signature, issuer, audience, exp and nbf. It never trusts
+# the Cf-Access-Authenticated-User-Email header — that is plaintext and forgeable by anything
+# that can reach the Worker directly, and a Worker URL is public.
 CF_ACCESS_TEAM_DOMAIN=
 CF_ACCESS_AUD=

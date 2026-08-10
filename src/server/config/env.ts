@@ -9,6 +9,7 @@
  */
 import path from 'path';
 import { z } from 'zod';
+import { assertDataSourceMatrix } from '@/server/repositories/data-source';
 
 const bool = (defaultValue: boolean) =>
   z
@@ -455,6 +456,11 @@ export function loadEnv(source: NodeJS.ProcessEnv = process.env): AppEnv {
   };
 
   assertRootsArePrivate(storageRoots);
+
+  // Fails closed on a DATA_SOURCE_* split that would put a foreign key across two databases.
+  // Here rather than at the first write, so the mistake surfaces at startup with the exact
+  // pair named — see `dataSourceViolations()`.
+  assertDataSourceMatrix();
 
   return {
     ...v,

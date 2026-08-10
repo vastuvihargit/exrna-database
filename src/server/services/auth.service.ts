@@ -19,6 +19,7 @@ import * as userRepository from '@/server/repositories/user.repository';
 import * as organizationRepository from '@/server/repositories/organization.repository';
 import * as loginHistory from '@/server/repositories/login-history.repository';
 import * as sessionRepository from '@/server/repositories/session.repository';
+import { verifyAccessJwt, type AccessConfig } from '@/server/auth/cloudflare-access';
 import { PasswordResetTokenModel } from '@/server/db/models';
 import { connectToDatabase } from '@/server/db/connection';
 import { auditService } from '@/server/audit/audit.service';
@@ -321,6 +322,47 @@ export async function completeOAuthLogin(
   });
 
   return session;
+}
+
+/**
+ * Turns a verified Cloudflare Access assertion into an application session.
+ *
+ * ── Why this delegates rather than reimplements ─────────────────────────────────────────
+ *
+ * Everything after "who is this person" is identical to the OAuth path: the company-domain
+ * check, the auto-provisioning policy, the active-user enforcement, the login-history row, the
+ * audit record and the session issue. Writing that again here would create a second copy of the
+ * account-status policy, and the failure mode of two copies is that one of them keeps letting a
+ * deactivated employee in after the other stopped.
+ *
+ * So this function owns exactly one thing — establishing the email address from a signature —
+ * and hands the rest to `completeOAuthLogin`.
+ *
+ * ── Access proves identity, not authorization ───────────────────────────────────────────
+ *
+ * A valid assertion says Cloudflare authenticated this person against the configured IdP. It
+ * says nothing about whether they have an account here, whether it is active, or what they may
+ * do. All three remain the application's decision, which is why a token for an unknown or
+ * suspended address still fails below.
+ */
+export async function completeAccessLogin(
+  input: { token: string; config: AccessConfig },
+  meta: RequestMeta,
+): Promise<IssuedSession> {
+  const identity = await verifyAccessJwt(input.token, input.config);
+
+  return completeOAuthLogin(
+    {
+      email: identity.email,
+      // Access's `sub` is stable per user per application, which is what the provider-account
+      // link wants. Recorded as `google` because that is the IdP behind Access here; the
+      // provider enum has no `access` member and adding one would change the meaning of every
+      // historic row.
+      providerAccountId: identity.subject,
+      provider: 'google',
+    },
+    meta,
+  );
 }
 
 export async function logout(sessionId: string, userId: string, meta: RequestMeta): Promise<void> {
