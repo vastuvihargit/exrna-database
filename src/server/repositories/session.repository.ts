@@ -1,189 +1,89 @@
 /**
- * Session repository.
+ * Session repository — a façade over the MongoDB and D1 implementations.
  *
- * Lookup is by SHA-256 of the cookie value — the raw token is never stored, so a
- * database dump yields nothing replayable.
+ * Lookup is by SHA-256 of the cookie value — the raw token is never stored, so a database dump
+ * yields nothing replayable. That is true of both engines and is the reason `tokenHash` is the
+ * only lookup key on the surface.
+ *
+ * Routed by `DATA_SOURCE_SESSIONS`.
+ *
+ * ── This flag is not independently movable, and that is worth stating ───────────────────
+ *
+ * Most modules in this migration can be flipped on their own: a star in D1 pointing at a file
+ * in MongoDB still resolves, because the star repository only returns ids. Sessions are
+ * different in both directions.
+ *
+ * `sessions.user_id` and `sessions.organization_id` are real foreign keys in D1, so a session
+ * cannot be written there unless the user and the organization are there too — this flag
+ * requires `DATA_SOURCE_USERS=d1` and `DATA_SOURCE_ORGANIZATIONS=d1`, and
+ * `assertDataSourceMatrix()` in `data-source.ts` refuses the combination that gets it wrong.
+ *
+ * The other direction is operational rather than structural: moving this flag invalidates every
+ * session that exists, because the new engine has none of them. Every user is logged out at the
+ * moment of the flip. That is a cutover step, not a defect, and it is why the runbook puts this
+ * flag inside the write freeze.
  */
-import { Types, type ClientSession } from 'mongoose';
-import { connectToDatabase } from '@/server/db/connection';
-import { SessionModel, type SessionDocument, type SessionRevokeReason } from '@/server/db/models';
+import { isD1 } from './data-source';
+import { mongoSessionRepository } from './session.repository.mongo';
+import { d1SessionRepository } from './session.repository.d1';
+import type {
+  CreateSessionInput,
+  LiveSessionRecord,
+  SessionRecord,
+  SessionRepository,
+  SessionRevokeReason,
+} from './session.repository.contract';
 
-export interface SessionRecord {
-  id: string;
-  userId: string;
-  organizationId: string;
-  expiresAt: Date;
-  absoluteExpiresAt: Date;
-  lastUsedAt: Date;
-  createdAt: Date;
-  ip: string;
-  userAgent: string;
-  deviceLabel: string;
-  provider: string;
-  revokedAt: Date | null;
-  rotatedAt: Date | null;
+export type {
+  CreateSessionInput,
+  LiveSessionRecord,
+  SessionRecord,
+  SessionRepository,
+  SessionRevokeReason,
+};
+
+export { mongoSessionRepository, d1SessionRepository };
+
+function active(): SessionRepository {
+  return isD1('sessions') ? d1SessionRepository : mongoSessionRepository;
 }
 
-type LeanSession = SessionDocument & { _id: Types.ObjectId; createdAt: Date; updatedAt: Date };
-
-function toRecord(doc: LeanSession): SessionRecord {
-  return {
-    id: String(doc._id),
-    userId: String(doc.userId),
-    organizationId: String(doc.organizationId),
-    expiresAt: doc.expiresAt,
-    absoluteExpiresAt: doc.absoluteExpiresAt,
-    lastUsedAt: doc.lastUsedAt,
-    createdAt: doc.createdAt,
-    ip: doc.ip,
-    userAgent: doc.userAgent,
-    deviceLabel: doc.deviceLabel,
-    provider: doc.provider,
-    revokedAt: doc.revokedAt ?? null,
-    rotatedAt: doc.rotatedAt ?? null,
-  };
+export function create(input: CreateSessionInput): Promise<SessionRecord> {
+  return active().create(input);
 }
 
-export interface CreateSessionInput {
-  userId: string;
-  organizationId: string;
-  tokenHash: string;
-  csrfTokenHash: string;
-  expiresAt: Date;
-  absoluteExpiresAt: Date;
-  ip: string;
-  userAgent: string;
-  deviceLabel: string;
-  provider: string;
-  rotatedFromId?: string | null;
+export function findLiveByTokenHash(tokenHash: string): Promise<LiveSessionRecord | null> {
+  return active().findLiveByTokenHash(tokenHash);
 }
 
-export async function create(input: CreateSessionInput, session?: ClientSession): Promise<SessionRecord> {
-  await connectToDatabase();
-  const [doc] = await SessionModel.create(
-    [
-      {
-        userId: new Types.ObjectId(input.userId),
-        organizationId: new Types.ObjectId(input.organizationId),
-        tokenHash: input.tokenHash,
-        csrfTokenHash: input.csrfTokenHash,
-        expiresAt: input.expiresAt,
-        absoluteExpiresAt: input.absoluteExpiresAt,
-        lastUsedAt: new Date(),
-        ip: input.ip,
-        userAgent: input.userAgent,
-        deviceLabel: input.deviceLabel,
-        provider: input.provider,
-        rotatedFromId: input.rotatedFromId ? new Types.ObjectId(input.rotatedFromId) : null,
-      },
-    ],
-    session ? { session } : undefined,
-  );
-  return toRecord(doc!.toObject() as LeanSession);
+export function touch(id: string, idleExpiresAt: Date): Promise<void> {
+  return active().touch(id, idleExpiresAt);
 }
 
-/**
- * Returns the session only if it is live: not revoked, and inside both the idle and
- * the absolute expiry. Expiry is part of the query, so an expired row can never be
- * treated as valid by a caller that forgets to check.
- */
-export async function findLiveByTokenHash(
-  tokenHash: string,
-): Promise<(SessionRecord & { csrfTokenHash: string }) | null> {
-  await connectToDatabase();
-  const now = new Date();
-
-  const doc = await SessionModel.findOne({
-    tokenHash,
-    revokedAt: null,
-    expiresAt: { $gt: now },
-    absoluteExpiresAt: { $gt: now },
-  })
-    .select('+csrfTokenHash')
-    .lean<LeanSession & { csrfTokenHash: string }>()
-    .exec();
-
-  return doc ? { ...toRecord(doc), csrfTokenHash: doc.csrfTokenHash } : null;
+export function revoke(id: string, reason: SessionRevokeReason): Promise<void> {
+  return active().revoke(id, reason);
 }
 
-/** Slides the idle window, capped by the absolute expiry. Throttled by the caller. */
-export async function touch(id: string, idleExpiresAt: Date): Promise<void> {
-  await connectToDatabase();
-  await SessionModel.updateOne(
-    { _id: new Types.ObjectId(id) },
-    [
-      {
-        $set: {
-          lastUsedAt: new Date(),
-          expiresAt: { $min: [idleExpiresAt, '$absoluteExpiresAt'] },
-        },
-      },
-    ],
-  ).exec();
-}
-
-export async function revoke(id: string, reason: SessionRevokeReason): Promise<void> {
-  await connectToDatabase();
-  await SessionModel.updateOne(
-    { _id: new Types.ObjectId(id), revokedAt: null },
-    { $set: { revokedAt: new Date(), revokedReason: reason } },
-  ).exec();
-}
-
-/**
- * Revokes every live session for a user. This is what makes deactivation, password
- * change and role change take effect immediately.
- */
-export async function revokeAllForUser(
+export function revokeAllForUser(
   userId: string,
   reason: SessionRevokeReason,
-  options: { exceptSessionId?: string; session?: ClientSession } = {},
+  options: { exceptSessionId?: string } = {},
 ): Promise<number> {
-  await connectToDatabase();
-
-  const filter: Record<string, unknown> = {
-    userId: new Types.ObjectId(userId),
-    revokedAt: null,
-  };
-  if (options.exceptSessionId && Types.ObjectId.isValid(options.exceptSessionId)) {
-    filter._id = { $ne: new Types.ObjectId(options.exceptSessionId) };
-  }
-
-  const result = await SessionModel.updateMany(
-    filter,
-    { $set: { revokedAt: new Date(), revokedReason: reason } },
-    options.session ? { session: options.session } : undefined,
-  ).exec();
-
-  return result.modifiedCount;
+  return active().revokeAllForUser(userId, reason, options);
 }
 
-export async function listForUser(userId: string): Promise<SessionRecord[]> {
-  await connectToDatabase();
-  const now = new Date();
-  const docs = await SessionModel.find({
-    userId: new Types.ObjectId(userId),
-    revokedAt: null,
-    absoluteExpiresAt: { $gt: now },
-  })
-    .sort({ lastUsedAt: -1 })
-    .limit(50)
-    .lean<LeanSession[]>()
-    .exec();
-  return docs.map(toRecord);
+export function listForUser(userId: string): Promise<SessionRecord[]> {
+  return active().listForUser(userId);
 }
 
-export async function findById(id: string): Promise<SessionRecord | null> {
-  if (!Types.ObjectId.isValid(id)) return null;
-  await connectToDatabase();
-  const doc = await SessionModel.findOne({ _id: new Types.ObjectId(id) }).lean<LeanSession>().exec();
-  return doc ? toRecord(doc) : null;
+export function findById(id: string): Promise<SessionRecord | null> {
+  return active().findById(id);
 }
 
-export async function markRotated(id: string): Promise<void> {
-  await connectToDatabase();
-  await SessionModel.updateOne(
-    { _id: new Types.ObjectId(id) },
-    { $set: { rotatedAt: new Date(), revokedAt: new Date(), revokedReason: 'rotated' } },
-  ).exec();
+export function markRotated(id: string): Promise<void> {
+  return active().markRotated(id);
+}
+
+export function deleteExpiredBefore(cutoff: Date): Promise<number> {
+  return active().deleteExpiredBefore(cutoff);
 }
