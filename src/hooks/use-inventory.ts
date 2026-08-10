@@ -164,3 +164,121 @@ export function useDeactivateInventoryItem() {
     apiRequest<void>(`/api/inventory/items/${itemId}`, { method: 'DELETE' }),
   );
 }
+
+/* ------------------------------------------------------------------ stock movement */
+
+export type StockAction = 'added' | 'issued' | 'returned' | 'adjusted' | 'expired';
+export type StockIssueTarget = 'employee' | 'department' | 'project' | 'experiment';
+
+/** Mirrors `toStockTransactionDto`. */
+export interface StockTransactionDto {
+  id: string;
+  itemId: string;
+  itemCode: string;
+  itemName: string;
+  action: StockAction;
+  quantity: number;
+  quantityDelta: number;
+  previousQuantity: number;
+  newQuantity: number;
+  unit: string;
+  batchNumber: string;
+  expiryDate: string | null;
+  supplier: string;
+  storageLocation: string;
+  issuedToType: StockIssueTarget | null;
+  issuedToLabel: string;
+  projectId: string | null;
+  experimentId: string | null;
+  purpose: string;
+  notes: string;
+  performedByName: string;
+  performedAt: string;
+}
+
+export const stockKeys = {
+  history: (itemId: string) => ['inventory-stock-history', itemId] as const,
+  dashboard: () => ['inventory-dashboard'] as const,
+};
+
+export function useStockHistory(itemId: string | null) {
+  return useQuery({
+    queryKey: stockKeys.history(itemId ?? ''),
+    queryFn: () =>
+      apiRequest<StockTransactionDto[]>(
+        `/api/inventory/items/${itemId}/stock?pageSize=50`,
+      ),
+    enabled: Boolean(itemId),
+  });
+}
+
+export interface InventoryDashboardDto {
+  totalItems: number;
+  byStockState: Record<StockState, number>;
+  nearExpiry: number;
+  expired: number;
+}
+
+export function useInventoryDashboard() {
+  return useQuery({
+    queryKey: stockKeys.dashboard(),
+    queryFn: () => apiRequest<InventoryDashboardDto>('/api/inventory/dashboard'),
+  });
+}
+
+export interface ReceiveStockInput {
+  quantity: number;
+  batchNumber: string;
+  expiryDate?: string | null;
+  supplier?: string;
+  storageLocation?: string;
+  notes?: string;
+}
+
+export interface IssueStockInput {
+  quantity: number;
+  issuedToType: StockIssueTarget;
+  issuedToUserId?: string;
+  issuedToDepartmentId?: string;
+  projectId?: string;
+  experimentId?: string;
+  purpose?: string;
+  notes?: string;
+}
+
+export interface AdjustStockInput {
+  batchNumber: string;
+  delta: number;
+  reason: string;
+  notes?: string;
+}
+
+export type StockMovement =
+  | { action: 'add'; payload: ReceiveStockInput }
+  | { action: 'issue'; payload: IssueStockInput }
+  | { action: 'adjust'; payload: AdjustStockInput };
+
+/**
+ * Moves stock, and invalidates the history alongside the item.
+ *
+ * The history is a separate query key, so without the extra invalidation the quantity on the
+ * page would update while the table below it still showed the movement that produced it
+ * missing — the two halves of the same screen disagreeing about what just happened.
+ */
+export function useMoveStock(itemId: string) {
+  const queryClient = useQueryClient();
+
+  return useMutation({
+    mutationFn: (movement: StockMovement) =>
+      apiRequest<{ transaction: StockTransactionDto; item: InventoryItemDto }>(
+        `/api/inventory/items/${itemId}/stock`,
+        { method: 'POST', body: movement },
+      ),
+    onSuccess: () => {
+      void queryClient.invalidateQueries({ queryKey: ['inventory-items'] });
+      void queryClient.invalidateQueries({ queryKey: ['inventory-item'] });
+      void queryClient.invalidateQueries({ queryKey: stockKeys.history(itemId) });
+      void queryClient.invalidateQueries({ queryKey: stockKeys.dashboard() });
+    },
+  });
+}
