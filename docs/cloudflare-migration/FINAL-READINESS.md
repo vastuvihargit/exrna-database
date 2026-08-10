@@ -12,10 +12,11 @@ than speculative:
    `originals` directory, and only *then* mirrors to Google Drive. Google Drive is a mirror
    after a local write. `docs/cloudflare-migration/16-phase-7-storage-audit.md` is the full
    classification.
-2. **Ten repositories have no D1 implementation**, and a Worker cannot reach MongoDB at all.
-   None is on the authentication path any more — that gap closed in module 13 — but
-   `upload-session` blocks uploading and `inventory-item`, `comment` and `activity` block
-   whole pages.
+2. **Two repositories still have no D1 implementation** and are reachable from a Worker:
+   `inventory-item` (which blocks the inventory pages, and whose stock-movement feature is not
+   implemented at all — §6.3) and `drive-sync` (the Drive change feed, background rather than
+   request-path). `migration` and `storage-migration` also lack one and always will: they read
+   the local filesystem by definition and must keep running on Node.
 3. **No Mongo → D1 metadata migration tooling exists.** There is no loader, so no cutover can
    be rehearsed, let alone performed.
 
