@@ -99,6 +99,9 @@ GOOGLE_CLIENT_SECRET=
 # DATA_SOURCE_ORGANIZATIONS=d1
 # DATA_SOURCE_SESSIONS=d1
 # DATA_SOURCE_NOTIFICATIONS=d1
+# DATA_SOURCE_LOGIN_HISTORY=d1
+# DATA_SOURCE_STORAGE_USAGE=d1
+# DATA_SOURCE_ACTIVITIES=d1
 #
 # ── The matrix is enforced, not advisory ──────────────────────────────────────────────
 #

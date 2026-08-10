@@ -43,6 +43,10 @@ export const DATA_SOURCE_MODULES = [
   'inventory',
   'notifications',
   'sessions',
+  'loginHistory',
+  'storageUsage',
+  'activities',
+  'comments',
   'uploadSessions',
   'collaboration',
   'jobs',
@@ -144,6 +148,18 @@ export const DATA_SOURCE_DEPENDENCIES: Partial<Record<DataSourceModule, DataSour
   inventory: ['organizations', 'users', 'departments'],
   notifications: ['organizations', 'users'],
   sessions: ['organizations', 'users'],
+  /** `login_history.user_id` and `.session_id` are both real foreign keys. */
+  loginHistory: ['users', 'sessions'],
+  /**
+   * Writes counters on `users`, `departments` and `projects`, and derives them from
+   * `file_versions.file_size`. An engine holding the counters but not the versions cannot
+   * reconcile them — `recomputeAll` would zero every quota.
+   */
+  storageUsage: ['users', 'departments', 'projects', 'files', 'fileVersions'],
+  /** `activity_folders.folder_id` is a real foreign key, as are the actor and project columns. */
+  activities: ['organizations', 'users', 'folders', 'projects'],
+  /** `comments.version_id` is a foreign key, so a comment cannot outrun its version. */
+  comments: ['organizations', 'users', 'files', 'fileVersions'],
   uploadSessions: ['organizations', 'users', 'folders'],
   collaboration: ['organizations', 'users', 'files'],
   jobs: ['organizations', 'users'],
