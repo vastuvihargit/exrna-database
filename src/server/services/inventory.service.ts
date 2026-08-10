@@ -3,10 +3,12 @@
  *
  * The line this service holds is the important one: **nothing here changes a quantity**.
  * `availableQuantity`, `batches`, `batchNumber` and `expiryDate` are not writable through
- * any input type in this file. Stock moves only through the receipt, issue and adjustment
- * paths (Phase 2), each of which writes a history row in the same transaction. That is a
- * structural guarantee rather than a convention: there is no code path here that could
- * forget to record where stock came from or went.
+ * any input type in this file. Stock moves only through `stock.service.ts`, whose every path
+ * writes a ledger row in the same transaction as the movement.
+ *
+ * That is now a structural guarantee rather than a convention. The repository used to take a
+ * `Record<string, unknown>` update, so "no route reaches `availableQuantity`" was a fact about
+ * the callers; `UpdateInventoryItemFields` is a closed set, so it is a fact about the type.
  *
  * Reading is organization-wide and needs only `inventory.view` (see
  * `inventoryVisibilityFilter` for why). Editing is scoped to the item's custodian
@@ -23,10 +25,13 @@ import {
   type InventoryUnit,
 } from '@/server/domain/inventory';
 import type { Actor } from '@/server/permissions/actor';
-import { inventoryVisibilityFilter } from '@/server/permissions/visibility';
 import { auditService } from '@/server/audit/audit.service';
 import * as inventoryItemRepository from '@/server/repositories/inventory-item.repository';
-import type { InventoryItemRecord } from '@/server/repositories/inventory-item.repository';
+import type {
+  InventoryDashboard,
+  InventoryItemRecord,
+  UpdateInventoryItemFields,
+} from '@/server/repositories/inventory-item.repository';
 import * as departmentRepository from '@/server/repositories/department.repository';
 import type { RequestMeta } from '@/server/http/request-meta';
 import {
@@ -70,7 +75,10 @@ export async function list(
   const now = new Date();
 
   const { items, total } = await inventoryItemRepository.list({
-    visibility: inventoryVisibilityFilter(actor),
+    // Inventory has no per-item ACL — `inventory-access.ts` explains why — so the organization
+    // *is* the visibility rule, and the contract makes it a required parameter rather than an
+    // optional filter that a caller could omit into a cross-tenant listing.
+    organizationId: actor.organizationId,
     ...(input.q ? { q: input.q } : {}),
     ...(input.category ? { category: input.category } : {}),
     ...(input.status ? { status: input.status } : {}),
@@ -97,6 +105,17 @@ export async function getById(actor: Actor, itemId: string): Promise<InventoryIt
 
   const departmentNames = await resolveDepartmentNames([item]);
   return toView(actor, item, departmentNames, new Date());
+}
+
+/**
+ * The counts behind the four dashboard tiles.
+ *
+ * One repository call rather than five: the tiles are read together on every page load, and
+ * counting them separately lets a receipt land between two of them so the totals do not add up.
+ */
+export async function dashboard(actor: Actor): Promise<InventoryDashboard> {
+  assertCanReadInventory(actor);
+  return inventoryItemRepository.dashboard(actor.organizationId, new Date());
 }
 
 /**
@@ -233,7 +252,7 @@ export async function update(
     'You cannot change this inventory item',
   );
 
-  const update: Record<string, unknown> = { updatedBy: actor.userId };
+  const update: UpdateInventoryItemFields = { updatedBy: actor.userId };
 
   if (input.name !== undefined) {
     const name = sanitizeDisplayName(input.name);
@@ -284,7 +303,7 @@ export async function update(
     update.departmentId = departmentId;
   }
 
-  const updated = await inventoryItemRepository.updateById(itemId, { $set: update });
+  const updated = await inventoryItemRepository.update(itemId, update);
   if (!updated) throw new NotFoundError();
 
   await auditService.recordForActor(actor, meta, {
@@ -392,6 +411,7 @@ function toView(
 export const inventoryService = {
   list,
   getById,
+  dashboard,
   create,
   update,
   deactivate,

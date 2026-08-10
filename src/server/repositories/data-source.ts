@@ -146,7 +146,14 @@ export const DATA_SOURCE_DEPENDENCIES: Partial<Record<DataSourceModule, DataSour
   search: ['organizations', 'users'],
   reviews: ['organizations', 'users', 'files', 'fileVersions'],
   auditLogs: ['organizations', 'users'],
-  inventory: ['organizations', 'users', 'departments'],
+  /**
+   * The item's own foreign keys, plus the ledger's.
+   *
+   * `stock_transactions` references `projects` and `experiments` because an issue records what
+   * the material was consumed for — that linkage is the point of the feature, not an optional
+   * label — and `files` because a delivery note is attached rather than copied.
+   */
+  inventory: ['organizations', 'users', 'departments', 'projects', 'experiments', 'files'],
   notifications: ['organizations', 'users'],
   sessions: ['organizations', 'users'],
   /** `login_history.user_id` and `.session_id` are both real foreign keys. */
