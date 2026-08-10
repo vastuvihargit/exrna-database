@@ -128,7 +128,8 @@ export async function syncDriveChanges(input: SyncInput): Promise<DriveSyncSumma
   });
 
   await driveSyncRepository.updateState(state.id, {
-    $set: { state: 'polling', lastPollAt: new Date() },
+    state: 'polling',
+    lastPollAt: new Date(),
   });
 
   try {
@@ -143,13 +144,13 @@ export async function syncDriveChanges(input: SyncInput): Promise<DriveSyncSumma
     if (!state.startPageToken) {
       const token = await client.getStartPageToken();
       await driveSyncRepository.updateState(state.id, {
-        $set: {
-          startPageToken: token,
-          state: 'idle',
-          lastSuccessfulPollAt: new Date(),
-          consecutiveFailures: 0,
-          lastError: null,
-        },
+        // The one unconditional `startPageToken` write outside a reconcile: there is no cursor
+        // yet, so there is nothing for `advanceCursor` to be conditional on.
+        startPageToken: token,
+        state: 'idle',
+        lastSuccessfulPollAt: new Date(),
+        consecutiveFailures: 0,
+        lastError: null,
       });
       summary.initialized = true;
       return summary;
@@ -158,12 +159,10 @@ export async function syncDriveChanges(input: SyncInput): Promise<DriveSyncSumma
     await pollPages({ client, state, input, summary });
 
     await driveSyncRepository.updateState(state.id, {
-      $set: {
-        state: 'idle',
-        lastSuccessfulPollAt: new Date(),
-        consecutiveFailures: 0,
-        lastError: null,
-      },
+      state: 'idle',
+      lastSuccessfulPollAt: new Date(),
+      consecutiveFailures: 0,
+      lastError: null,
     });
 
     await auditService.recordSystem({
@@ -182,8 +181,12 @@ export async function syncDriveChanges(input: SyncInput): Promise<DriveSyncSumma
     summary.error = message;
 
     await driveSyncRepository.updateState(state.id, {
-      $set: { state: 'failed', lastError: message.slice(0, 1000) },
-      $inc: { consecutiveFailures: 1 },
+      state: 'failed',
+      lastError: message.slice(0, 1000),
+      // An increment rather than a write: two workers failing on the same drive must not each
+      // read the old count and set it to 1, because that counter is what an operator watches to
+      // decide whether Drive sync is actually broken.
+      incrementFailures: 1,
     });
 
     getLogger().error({ err: error }, 'Google Drive synchronization failed');
@@ -290,7 +293,8 @@ async function handleExpiredToken(context: {
   );
 
   await driveSyncRepository.updateState(state.id, {
-    $set: { state: 'reconciling', tokenExpiredAt: new Date() },
+    state: 'reconciling',
+    tokenExpiredAt: new Date(),
   });
 
   await auditService.recordSystem({
@@ -311,15 +315,15 @@ async function handleExpiredToken(context: {
   await reconcileEverything({ client, input, summary });
 
   await driveSyncRepository.updateState(state.id, {
-    $set: {
-      startPageToken: token,
-      state: 'idle',
-      tokenExpiredAt: null,
-      lastFullReconcileAt: new Date(),
-      lastSuccessfulPollAt: new Date(),
-      consecutiveFailures: 0,
-      lastError: null,
-    },
+    // Unconditional, deliberately. The old cursor expired, so there is no `from` value to be
+    // conditional on — that is what a reconcile means.
+    startPageToken: token,
+    state: 'idle',
+    tokenExpiredAt: null,
+    lastFullReconcileAt: new Date(),
+    lastSuccessfulPollAt: new Date(),
+    consecutiveFailures: 0,
+    lastError: null,
   });
 }
 
