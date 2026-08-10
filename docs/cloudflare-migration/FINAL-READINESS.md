@@ -76,8 +76,8 @@ Exactly as run, from the repository root, at the tip of `cloudflare-migration`.
 | Full D1 suite | `npm run test:d1` | **17 files, 584 tests passed** (1844 s) |
 | Typecheck | `npm run typecheck` | clean |
 | Lint | `npm run lint` | clean |
-| Worker production build | `npm run cf:build` | see §3.2 |
-| Worker preview | `npm run cf:preview` | **not run in this session** |
+| Worker production build | `npm run cf:build` | **passed** — bundle written to `.open-next/worker.js` |
+| Worker preview | `npm run cf:preview` | **not run in this session** — see §3.2 |
 
 The D1 suite is slow by design: `fileParallelism: false`, a real Miniflare/workerd SQLite per
 file, and a real `mongod` per file for the parity blocks. It fails rather than skips when either
@@ -99,10 +99,15 @@ as one that checked everything.
 
 ### 3.2 Honest note on the Worker gates
 
-`cf:build` and `cf:preview` were verified in earlier sessions and are recorded in
-`01-phase-1-worker.md`. **They were not re-run after the module 13 changes.** Those changes touch
-`env.worker.ts` (two new startup assertions), so the preview result in particular should be
-re-established before anyone relies on it. Do not treat the earlier result as current.
+`cf:build` **was** re-run after the module 13 changes and passed. That matters more than it
+sounds: `env.worker.ts` gained two startup assertions and now imports `data-source.ts` and
+`cloudflare-access.ts`, so the build is what proves neither pulled anything Node-only into the
+Worker module graph.
+
+`cf:preview` was **not** re-run. The earlier result is recorded in `01-phase-1-worker.md` and
+should not be treated as current, because the new assertions run at boot: a preview started
+without `CF_ACCESS_*` will now warn, and one started with `NODE_ENV=production` will refuse.
+Re-establish it before relying on it.
 
 ## 4. What has *not* been verified
 
