@@ -7,7 +7,8 @@
  * The one thing worth reading twice is in `list()`: soft-deleted departments are **included**
  * by default, because that is what MongoDB does here. See the note in the contract.
  */
-import { and, count, eq, inArray, sql } from 'drizzle-orm';
+import { and, count, eq, sql } from 'drizzle-orm';
+import { inList } from '@/server/db/d1-bindings';
 import { getD1 } from '@/server/db/d1-context';
 import { departments, users } from '@/server/db/schema/identity';
 import type {
@@ -70,7 +71,7 @@ export async function findByIds(ids: string[]): Promise<DepartmentRecord[]> {
   const unique = [...new Set(ids.filter(Boolean))];
   if (unique.length === 0) return [];
   const db = await getD1();
-  const rows = await db.select().from(departments).where(inArray(departments.id, unique));
+  const rows = await db.select().from(departments).where(inList(departments.id, unique));
   return rows.map(toRecord);
 }
 

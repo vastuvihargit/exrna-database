@@ -25,7 +25,8 @@
  * reproduced rather than tidied; `softDelete` also sets `status = 'archived'`, and that is
  * what actually keeps a deleted project out of the places that matter.
  */
-import { and, asc, eq, inArray, or, sql, type SQL } from 'drizzle-orm';
+import { and, asc, eq, or, sql, type SQL } from 'drizzle-orm';
+import { inList } from '@/server/db/d1-bindings';
 import type { BatchItem } from 'drizzle-orm/batch';
 import { withBatch, type Database } from '@/server/db/d1';
 import { getD1 } from '@/server/db/d1-context';
@@ -72,13 +73,13 @@ async function hydrate(db: Database, rows: ProjectRow[]): Promise<ProjectRecord[
     db
       .select({ projectId: projectMembers.projectId, userId: projectMembers.userId })
       .from(projectMembers)
-      .where(inArray(projectMembers.projectId, ids))
+      .where(inList(projectMembers.projectId, ids))
       .orderBy(asc(projectMembers.userId)),
     db
       .select({ resourceId: resourceTags.resourceId, tag: resourceTags.tag })
       .from(resourceTags)
       .where(
-        and(eq(resourceTags.resourceType, 'project'), inArray(resourceTags.resourceId, ids)),
+        and(eq(resourceTags.resourceType, 'project'), inList(resourceTags.resourceId, ids)),
       )
       .orderBy(asc(resourceTags.tag)),
   ]);
@@ -134,7 +135,7 @@ export async function findByIds(ids: string[]): Promise<ProjectRecord[]> {
   const unique = [...new Set(ids.filter(Boolean))];
   if (unique.length === 0) return [];
   const db = await getD1();
-  const rows = await db.select().from(projects).where(inArray(projects.id, unique));
+  const rows = await db.select().from(projects).where(inList(projects.id, unique));
   return hydrate(db, rows);
 }
 
@@ -182,11 +183,11 @@ export async function listVisible(input: VisibleProjectsInput): Promise<ProjectR
 
   const departmentScopeIds = input.departmentScopeIds.filter(Boolean);
   if (departmentScopeIds.length) {
-    branches.push(inArray(projects.departmentId, departmentScopeIds));
+    branches.push(inList(projects.departmentId, departmentScopeIds));
   }
 
   const projectScopeIds = input.projectScopeIds.filter(Boolean);
-  if (projectScopeIds.length) branches.push(inArray(projects.id, projectScopeIds));
+  if (projectScopeIds.length) branches.push(inList(projects.id, projectScopeIds));
 
   // No branches means no way in — return nothing rather than an unfiltered organization list.
   if (branches.length === 0) return [];

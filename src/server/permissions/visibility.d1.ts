@@ -21,7 +21,8 @@
  * literal table name of the ACL sub-select, which is a constant in this file and never
  * caller-supplied.
  */
-import { and, eq, inArray, isNotNull, isNull, or, sql, type SQL } from 'drizzle-orm';
+import { and, eq, isNotNull, isNull, or, sql, type SQL } from 'drizzle-orm';
+import { inList } from '@/server/db/d1-bindings';
 import type { SQLiteColumn } from 'drizzle-orm/sqlite-core';
 import { resourcePermissions } from '@/server/db/schema/access';
 import { folders, files } from '@/server/db/schema/drive';
@@ -36,14 +37,21 @@ import { getLogger } from '@/server/logging/logger';
  * How many principals one actor may carry into a visibility query.
  *
  * A principal is the actor, their department, each project they belong to, and **each role
- * they hold** — so the list grows with role grants and has no natural ceiling. It is bound
- * into an `IN (...)` list inside two correlated sub-queries per listing; SQLite's default
- * `SQLITE_MAX_VARIABLE_NUMBER` is 999 and D1 rejects statements with too many bindings, so an
- * unbounded list turns a permission check into a query failure at an unpredictable size.
+ * they hold** — so the list grows with role grants and has no natural ceiling.
  *
- * 200 is far above anything legitimate — the seeded role set is single digits, and an employee
- * on 200 projects is a data problem rather than a person — while staying well inside the
- * binding budget once the other predicates are counted.
+ * ── This is no longer a binding limit, and the correction matters ───────────────────────
+ *
+ * The comment this replaces said "SQLite's default `SQLITE_MAX_VARIABLE_NUMBER` is 999 and D1
+ * rejects statements with too many bindings", and chose 200 to stay inside that. **D1's actual
+ * ceiling is 100**, measured and pinned by `tests/d1/bound-parameter-limit.test.ts` — so 200
+ * was never inside the budget. An actor with ninety-odd principals broke *every* listing at
+ * once, because this list is bound inside the visibility predicate of every permission-aware
+ * read rather than in one query.
+ *
+ * The principal list now goes through `inList`, which binds it as a single JSON parameter, so
+ * its length no longer interacts with the parameter budget at all. 200 remains as what it
+ * should always have been: a sanity ceiling on absurd data — the seeded role set is single
+ * digits, and an employee on 200 projects is a data problem rather than a person.
  */
 export const MAX_ACTOR_PRINCIPALS = 200;
 
@@ -170,7 +178,7 @@ function aclExists(
   return sql`EXISTS (SELECT 1 FROM ${resourcePermissions}
     WHERE ${resourcePermissions.resourceType} = ${kind}
       AND ${resourcePermissions.resourceId} = ${resourceId}
-      AND ${inArray(resourcePermissions.principalId, principalIds)}
+      AND ${inList(resourcePermissions.principalId, principalIds)}
       AND ${liveEntry(nowIso)}
       AND ${extra})`;
 }
@@ -269,7 +277,7 @@ function boundedAncestorExists(
       JOIN ${resourcePermissions} ON ${resourcePermissions.resourceType} = 'folder'
                                  AND ${resourcePermissions.resourceId} = anc.ancestor_id
      WHERE anc.${child} = ${columns.id}
-       AND ${inArray(resourcePermissions.principalId, principalIds)}
+       AND ${inList(resourcePermissions.principalId, principalIds)}
        AND ${liveEntry(nowIso)}
        AND ${resourcePermissions.deny} = ${deny}
        AND anc.depth >= ${boundaryDepth(kind)})`;
@@ -313,10 +321,10 @@ function roleScopeBranches(kind: ResourceKind, actor: Actor): SQL[] {
   const branches: SQL[] = [];
 
   const departmentScopes = scopeIds(actor, 'department');
-  if (departmentScopes.length) branches.push(inArray(columns.departmentId, departmentScopes));
+  if (departmentScopes.length) branches.push(inList(columns.departmentId, departmentScopes));
 
   const projectScopes = scopeIds(actor, 'project');
-  if (projectScopes.length) branches.push(inArray(columns.projectId, projectScopes));
+  if (projectScopes.length) branches.push(inList(columns.projectId, projectScopes));
 
   // A folder-scoped grant covers the folder itself and everything beneath it, which is what
   // `roleScopeGrants` expresses as "scopeId is the resource or one of its ancestors".
@@ -325,9 +333,9 @@ function roleScopeBranches(kind: ResourceKind, actor: Actor): SQL[] {
     const { table, child } = ancestorScope(kind);
     const underScope = sql`EXISTS (SELECT 1 FROM ${table} scope
                                     WHERE scope.${child} = ${columns.id}
-                                      AND ${inArray(sql`scope.ancestor_id`, folderScopes)})`;
+                                      AND ${inList(sql`scope.ancestor_id`, folderScopes)})`;
     branches.push(
-      kind === 'folder' ? or(inArray(columns.id, folderScopes), underScope)! : underScope,
+      kind === 'folder' ? or(inList(columns.id, folderScopes), underScope)! : underScope,
     );
   }
 
@@ -396,7 +404,7 @@ export function lookupVisibility(
       branches.push(and(eq(columns.departmentId, actor.departmentId), clearance)!);
     }
     if (actor.projectIds.length > 0) {
-      branches.push(and(inArray(columns.projectId, actor.projectIds), clearance)!);
+      branches.push(and(inList(columns.projectId, actor.projectIds), clearance)!);
     }
   }
 
@@ -411,7 +419,7 @@ export function lookupVisibility(
 
 export function clearancePredicate(kind: ResourceKind, actor: Actor): SQL {
   const allowed = [...CLEARANCE_BY_MAX_LEVEL[actorClearance(actor)]] as ConfidentialityLevel[];
-  return inArray(columnsFor(kind).confidentiality, allowed);
+  return inList(columnsFor(kind).confidentiality, allowed);
 }
 
 /** Soft delete. Both `folder.model.ts` and `file.model.ts` apply the Mongoose hook. */
@@ -468,7 +476,7 @@ export function resourceVisibility(
     branches.push(and(eq(columns.departmentId, actor.departmentId), clearance)!);
   }
   if (actor.projectIds.length > 0) {
-    branches.push(and(inArray(columns.projectId, actor.projectIds), clearance)!);
+    branches.push(and(inList(columns.projectId, actor.projectIds), clearance)!);
   }
 
   // Explicit, so the query can never degenerate into "match all".
@@ -509,8 +517,8 @@ export function childVisibility(
   const projectScopes = scopeIds(actor, 'project');
 
   const scopeBranches: SQL[] = [eq(columns.inheritPermissions, true)];
-  if (departmentScopes.length) scopeBranches.push(inArray(columns.departmentId, departmentScopes));
-  if (projectScopes.length) scopeBranches.push(inArray(columns.projectId, projectScopes));
+  if (departmentScopes.length) scopeBranches.push(inList(columns.departmentId, departmentScopes));
+  if (projectScopes.length) scopeBranches.push(inList(columns.projectId, projectScopes));
 
   const branches: SQL[] = [];
   // Owner and direct grantee bypass the clearance gate — they were given the resource.

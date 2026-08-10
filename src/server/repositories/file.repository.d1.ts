@@ -92,6 +92,7 @@ import {
   sum,
   type SQL,
 } from 'drizzle-orm';
+import { inList } from '@/server/db/d1-bindings';
 import type { BatchItem } from 'drizzle-orm/batch';
 import { withBatch, type Database } from '@/server/db/d1';
 import { getD1 } from '@/server/db/d1-context';
@@ -117,6 +118,7 @@ import {
 import type { ConfidentialityLevel } from '@/server/domain/permissions';
 import type { FileCategory } from '@/server/domain/file-types';
 import { AmbiguousDriveFileError } from './file.repository.contract';
+import { toFtsQuery } from './fts-query';
 import type {
   AclEntryWrite,
   CreateFileInput,
@@ -193,7 +195,7 @@ async function hydrate(db: Database, rows: FileRow[]): Promise<FileRecord[]> {
         depth: fileFolderAncestors.depth,
       })
       .from(fileFolderAncestors)
-      .where(inArray(fileFolderAncestors.fileId, ids))
+      .where(inList(fileFolderAncestors.fileId, ids))
       .orderBy(asc(fileFolderAncestors.fileId), asc(fileFolderAncestors.depth)),
     db
       .select()
@@ -201,20 +203,20 @@ async function hydrate(db: Database, rows: FileRow[]): Promise<FileRecord[]> {
       .where(
         and(
           eq(resourcePermissions.resourceType, 'file'),
-          inArray(resourcePermissions.resourceId, ids),
+          inList(resourcePermissions.resourceId, ids),
         ),
       )
       .orderBy(asc(resourcePermissions.grantedAt), asc(resourcePermissions.id)),
     db
       .select()
       .from(fileMetadata)
-      .where(inArray(fileMetadata.fileId, ids))
+      .where(inList(fileMetadata.fileId, ids))
       .orderBy(asc(fileMetadata.fileId), asc(fileMetadata.key)),
     db
       .select()
       .from(resourceTags)
       .where(
-        and(eq(resourceTags.resourceType, 'file'), inArray(resourceTags.resourceId, ids)),
+        and(eq(resourceTags.resourceType, 'file'), inList(resourceTags.resourceId, ids)),
       )
       .orderBy(asc(resourceTags.resourceId), asc(resourceTags.tag)),
   ]);
@@ -399,27 +401,6 @@ function refreshFileFts(
 }
 
 /**
- * User text → an FTS5 MATCH expression that cannot be a syntax error.
- *
- * Every token is wrapped in double quotes, which makes it a literal string to FTS5 rather than
- * an operator: a user searching for `NEAR` or `sample-1 OR *` gets those characters looked up
- * instead of a parse failure or an accidental operator. Embedded quotes are doubled, which is
- * FTS5's own escape.
- *
- * Tokens are joined with `OR` to match MongoDB `$text`, which treats a bare multi-word search
- * as any-term and ranks by score. Switching to `AND` would silently narrow every existing
- * search.
- */
-function ftsQuery(text: string): string | null {
-  const tokens = text
-    .split(/\s+/)
-    .map((token) => token.replace(/"/g, '""').trim())
-    .filter((token) => token.length > 0);
-  if (tokens.length === 0) return null;
-  return tokens.map((token) => `"${token}"`).join(' OR ');
-}
-
-/**
  * The bm25 weighting, with the leading placeholder for the UNINDEXED `file_id` column.
  *
  * The placeholder is not optional: `bm25()` takes one weight per column *including* the
@@ -528,7 +509,7 @@ export async function findByIds(actor: Actor, ids: string[]): Promise<FileRecord
   const rows = await db
     .select()
     .from(files)
-    .where(and(inArray(files.id, unique), lookupVisibility('file', actor), live()));
+    .where(and(inList(files.id, unique), lookupVisibility('file', actor), live()));
   return hydrate(db, rows);
 }
 
@@ -586,7 +567,14 @@ export async function search(input: SearchFilesInput): Promise<FilePage> {
     resourceVisibility('file', input.actor),
   ];
 
-  const match = input.text ? ftsQuery(input.text) : null;
+  const match = input.text ? toFtsQuery(input.text) : null;
+  if (input.text && !match) {
+    // The text held nothing searchable — `***`, `--`, an emoji on its own. "No results" is the
+    // honest answer; dropping the term would answer a question the user did not ask with every
+    // file they can see, which on a search page reads as a disclosure. Same rule as
+    // `experiment.repository.d1.ts`.
+    return { items: [], total: 0 };
+  }
   if (match) {
     conditions.push(
       sql`${files.id} IN (SELECT file_id FROM files_fts WHERE files_fts MATCH ${match})`,
@@ -671,7 +659,7 @@ export async function listSharedWith(input: ListSharedWithInput): Promise<FilePa
     sql`EXISTS (SELECT 1 FROM ${resourcePermissions} rp
                  WHERE rp.resource_type = 'file'
                    AND rp.resource_id = ${files.id}
-                   AND ${inArray(sql`rp.principal_id`, principals)}
+                   AND ${inList(sql`rp.principal_id`, principals)}
                    AND rp.deny = 0
                    AND (rp.expires_at IS NULL OR rp.expires_at > ${now}))`,
   )!;
@@ -927,7 +915,7 @@ export async function findByIdsInternal(ids: string[]): Promise<FileRecord[]> {
   const rows = await db
     .select()
     .from(files)
-    .where(and(inArray(files.id, unique), live()));
+    .where(and(inList(files.id, unique), live()));
   return hydrate(db, rows);
 }
 
@@ -1754,7 +1742,7 @@ export async function planFileReparent(
       depth: folderAncestors.depth,
     })
     .from(folderAncestors)
-    .where(inArray(folderAncestors.folderId, folderIds))
+    .where(inList(folderAncestors.folderId, folderIds))
     .orderBy(asc(folderAncestors.folderId), asc(folderAncestors.depth));
 
   const existing = new Map<string, string[]>();
@@ -1811,7 +1799,7 @@ export function buildFileReparentStatements(
   if (folderChains.length === 0) return [];
 
   const folderIds = folderChains.map((entry) => entry.folderId);
-  const inSubtree = inArray(files.folderId, folderIds);
+  const inSubtree = inList(files.folderId, folderIds);
   const scope = guard ? and(inSubtree, live(), guard)! : and(inSubtree, live())!;
 
   const statements: BatchItem<'sqlite'>[] = [
@@ -1829,7 +1817,7 @@ export function buildFileReparentStatements(
       .delete(fileFolderAncestors)
       .where(
         sql`${fileFolderAncestors.fileId} IN (SELECT f.id FROM ${files} f
-              WHERE ${inArray(sql`f.folder_id`, folderIds)} AND f.deleted_at IS NULL)
+              WHERE ${inList(sql`f.folder_id`, folderIds)} AND f.deleted_at IS NULL)
             ${guard ? sql` AND ${guard}` : sql``}`,
       ),
   ];
@@ -1894,7 +1882,7 @@ export async function unlinkExperiment(experimentId: string): Promise<number> {
   await db
     .update(files)
     .set({ experimentId: null, updatedAt: nowIso() })
-    .where(inArray(files.id, ids));
+    .where(inList(files.id, ids));
   return ids.length;
 }
 
@@ -1911,10 +1899,10 @@ export async function purge(fileIds: string[]): Promise<number> {
 
   // The ids that actually exist: `changes` would count the cascaded side-table rows as well,
   // and the retention job reports this number as "files purged".
-  const present = await matchingIds(db, inArray(files.id, unique));
+  const present = await matchingIds(db, inList(files.id, unique));
   if (present.length === 0) return 0;
 
-  await db.delete(files).where(inArray(files.id, present));
+  await db.delete(files).where(inList(files.id, present));
   return present.length;
 }
 
@@ -1953,10 +1941,13 @@ export async function checkFileHierarchyIntegrity(
         depth: fileFolderAncestors.depth,
       })
       .from(fileFolderAncestors)
-      // A sub-select, not the ids just read: binding them is one parameter per file, and past
-      // 999 SQLite refuses the statement outright — so the checker used to die on exactly the
-      // large organizations where an integrity problem matters most. Found by the test that
-      // sweeps 1200 files and then asks whether the result is intact.
+      // A sub-select, not the ids just read: binding them is one parameter per file, and D1
+      // refuses a statement past 100 of them — so the checker used to die on exactly the large
+      // organizations where an integrity problem matters most. Found by the test that sweeps
+      // 1200 files and then asks whether the result is intact.
+      //
+      // `inArray` and not `inList` here: this is the one form that takes a *query* rather than
+      // a value list, and it already binds nothing per row.
       .where(
         inArray(
           fileFolderAncestors.fileId,

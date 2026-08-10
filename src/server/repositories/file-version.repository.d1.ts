@@ -32,12 +32,12 @@ import {
   desc,
   eq,
   gt,
-  inArray,
   isNotNull,
   isNull,
   sql,
   type SQL,
 } from 'drizzle-orm';
+import { inList } from '@/server/db/d1-bindings';
 import type { BatchItem } from 'drizzle-orm/batch';
 import { withBatch, type Database } from '@/server/db/d1';
 import { getD1 } from '@/server/db/d1-context';
@@ -73,12 +73,17 @@ function toIso(value: Date | null | undefined): string | null {
 }
 
 /**
- * How many ids one `IN (...)` may carry.
+ * How many file ids one purge or lookup pass handles.
  *
- * SQLite's default `SQLITE_MAX_VARIABLE_NUMBER` is 999 and D1 rejects statements above it. The
- * purge path hands this module a page of file ids, and a page large enough to trip that would
- * fail as an opaque `D1_ERROR` rather than as anything a caller could act on — so the reads
- * chunk instead. Same reasoning as `MAX_MOVE_FOLDERS` in the unit-of-work.
+ * This is **no longer a bound-parameter limit**. The comment it replaces said "SQLite's default
+ * `SQLITE_MAX_VARIABLE_NUMBER` is 999"; D1's actual ceiling is 100, measured and pinned by
+ * `tests/d1/bound-parameter-limit.test.ts`, so 500 was never a safe chunk — it was a broken
+ * one that happened not to be reached. The id lists here now go through `inList`, which binds
+ * the whole list as a single JSON parameter, and length no longer interacts with the budget.
+ *
+ * The loop stays because it still bounds *work per statement* — a purge of a hundred thousand
+ * versions is better as many statements than one — which is the same reasoning as
+ * `MAX_MOVE_FOLDERS` in the unit-of-work.
  */
 const MAX_BOUND_IDS = 500;
 
@@ -264,7 +269,7 @@ export async function getStorageLocationsForFiles(fileIds: string[]): Promise<St
         googleDriveFileId: fileVersions.googleDriveFileId,
       })
       .from(fileVersions)
-      .where(inArray(fileVersions.fileId, page));
+      .where(inList(fileVersions.fileId, page));
 
     for (const row of rows) {
       out.push({
@@ -645,16 +650,39 @@ export function versionPatchColumns(patch: VersionPatch): Partial<typeof fileVer
   return columns;
 }
 
-export async function updateFlags(versionId: string, patch: VersionPatch): Promise<void> {
-  if (!versionId) return;
+/**
+ * The same update as `updateFlags`, as a statement rather than an execution.
+ *
+ * A review decision writes this version's approval flags *and* the review, the decision row and
+ * the file, and those four have to commit together or not at all — see
+ * `d1-review-unit-of-work.ts`. So the mutation is exposed as a builder and the self-executing
+ * `updateFlags` below is written in terms of it, which is what keeps the two from drifting: a
+ * column added to `versionPatchColumns` reaches both paths or neither.
+ *
+ * Returns `null` for an empty patch. A caller composing a batch should skip it rather than push
+ * a no-op `UPDATE … SET updated_at = ?`, which would touch the row and move its timestamp for
+ * no reason.
+ */
+export function buildVersionFlagsStatement(
+  db: Database,
+  versionId: string,
+  patch: VersionPatch,
+): BatchItem<'sqlite'> | null {
+  if (!versionId) return null;
   const columns = versionPatchColumns(patch);
-  if (Object.keys(columns).length === 0) return;
+  if (Object.keys(columns).length === 0) return null;
 
-  const db = await getD1();
-  await db
+  return db
     .update(fileVersions)
     .set({ ...columns, updatedAt: nowIso() })
     .where(eq(fileVersions.id, versionId));
+}
+
+export async function updateFlags(versionId: string, patch: VersionPatch): Promise<void> {
+  const db = await getD1();
+  const statement = buildVersionFlagsStatement(db, versionId, patch);
+  if (!statement) return;
+  await statement;
 }
 
 /**
@@ -698,10 +726,10 @@ export async function purgeForFiles(fileIds: string[]): Promise<number> {
     const present = await db
       .select({ id: fileVersions.id })
       .from(fileVersions)
-      .where(inArray(fileVersions.fileId, page));
+      .where(inList(fileVersions.fileId, page));
     if (present.length === 0) continue;
 
-    await db.delete(fileVersions).where(inArray(fileVersions.fileId, page));
+    await db.delete(fileVersions).where(inList(fileVersions.fileId, page));
     removed += present.length;
   }
   return removed;

@@ -25,7 +25,8 @@
  * path, and the cost of keeping an unreachable safety check is nothing next to the cost of
  * discovering the constraint was dropped in a later migration.
  */
-import { and, asc, desc, eq, inArray, isNull, or, sql, type SQL } from 'drizzle-orm';
+import { and, asc, desc, eq, isNull, or, sql, type SQL } from 'drizzle-orm';
+import { inList } from '@/server/db/d1-bindings';
 import type { Database } from '@/server/db/d1';
 import { getD1 } from '@/server/db/d1-context';
 import { roles, rolePermissions, roleScopeTypes, userRoles } from '@/server/db/schema/access';
@@ -60,12 +61,12 @@ async function hydrateRoles(db: Database, rows: RoleRow[]): Promise<RoleRecord[]
     db
       .select({ roleId: rolePermissions.roleId, key: rolePermissions.permissionKey })
       .from(rolePermissions)
-      .where(inArray(rolePermissions.roleId, ids))
+      .where(inList(rolePermissions.roleId, ids))
       .orderBy(asc(rolePermissions.permissionKey)),
     db
       .select({ roleId: roleScopeTypes.roleId, scopeType: roleScopeTypes.scopeType })
       .from(roleScopeTypes)
-      .where(inArray(roleScopeTypes.roleId, ids))
+      .where(inList(roleScopeTypes.roleId, ids))
       .orderBy(asc(roleScopeTypes.scopeType)),
   ]);
 
@@ -126,7 +127,7 @@ export async function findRolesByIds(ids: string[]): Promise<RoleRecord[]> {
   const unique = [...new Set(ids.filter(Boolean))];
   if (unique.length === 0) return [];
   const db = await getD1();
-  const rows = await db.select().from(roles).where(inArray(roles.id, unique));
+  const rows = await db.select().from(roles).where(inList(roles.id, unique));
   return hydrateRoles(db, rows);
 }
 
@@ -173,7 +174,7 @@ export async function getActorGrants(userId: string): Promise<RoleGrant[]> {
   if (grants.length === 0) return [];
 
   const roleIds = [...new Set(grants.map((grant) => grant.roleId))];
-  const roleRows = await db.select().from(roles).where(inArray(roles.id, roleIds));
+  const roleRows = await db.select().from(roles).where(inList(roles.id, roleIds));
   const records = await hydrateRoles(db, roleRows);
   const roleById = new Map(records.map((role) => [role.id, role]));
 
@@ -258,7 +259,7 @@ export async function listGrantsForUser(userId: string): Promise<GrantSummary[]>
   if (grants.length === 0) return [];
 
   const roleIds = [...new Set(grants.map((grant) => grant.roleId))];
-  const roleRows = await db.select().from(roles).where(inArray(roles.id, roleIds));
+  const roleRows = await db.select().from(roles).where(inList(roles.id, roleIds));
   const records = await hydrateRoles(db, roleRows);
   const roleById = new Map(records.map((role) => [role.id, role]));
 

@@ -346,11 +346,31 @@ export async function listSharedWith(input: ListSharedWithInput): Promise<FilePa
   return { items: docs.map(toRecord), total };
 }
 
+/**
+ * `applySoftDeleteFilter` hooks `find`, `findOne`, `findOneAndUpdate`, `countDocuments`,
+ * `updateMany` and `updateOne` — but **not** `aggregate`, which Mongoose does not route
+ * through query middleware at all.
+ *
+ * So every `$match` written by hand in this file has to carry the predicate itself. It did not,
+ * and the result was a dashboard inconsistent with itself: the facet chips and four of the five
+ * project figures counted trashed files, while `linkedToExperiment` — a `countDocuments`, and
+ * therefore hooked — did not. Two numbers on one screen, computed over different populations.
+ *
+ * Named rather than inlined so a future aggregate cannot omit it by simply not thinking about
+ * it. See `file.repository.d1.ts` §3: the D1 implementation has always excluded them, and this
+ * is the Mongo half of bringing the two into agreement rather than carrying the bug across.
+ */
+const NOT_TRASHED = { deletedAt: null };
+
 /** Distinct values for the facet chips shown beside search results. */
 export async function searchFacets(actor: Actor): Promise<SearchFacets> {
   await connectToDatabase();
   const match = {
-    $and: [resourceVisibilityFilter(actor), { organizationId: oid(actor.organizationId) }],
+    $and: [
+      resourceVisibilityFilter(actor),
+      { organizationId: oid(actor.organizationId) },
+      NOT_TRASHED,
+    ],
   };
 
   const [categories, tags] = await Promise.all([
@@ -432,7 +452,10 @@ export async function projectContentBreakdown(
   await connectToDatabase();
 
   const visibility = resourceVisibilityFilter(actor);
-  const match = { $and: [visibility, { projectId: oid(projectId) }] };
+  // `NOT_TRASHED` because `aggregate` is not hooked — see the note above `searchFacets`. The
+  // `linkedToExperiment` count below is a `countDocuments` and is filtered by the hook, so
+  // without this the five figures would not describe the same set of files.
+  const match = { $and: [visibility, { projectId: oid(projectId) }, NOT_TRASHED] };
 
   const [totals, categories, documentTypes, reviewStatuses, linked] = await Promise.all([
     FileModel.aggregate<{ count: number; bytes: number }>([

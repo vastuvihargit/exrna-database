@@ -25,7 +25,8 @@
  * not call `applySoftDeleteFilter`, so MongoDB returns soft-deleted users from these queries
  * today. Filtering them here would be a silent behaviour change disguised as a tidy-up.
  */
-import { and, count, eq, inArray, or, sql, type SQL } from 'drizzle-orm';
+import { and, count, eq, or, sql, type SQL } from 'drizzle-orm';
+import { inList } from '@/server/db/d1-bindings';
 import type { BatchItem } from 'drizzle-orm/batch';
 import { withBatch, type Database } from '@/server/db/d1';
 import { getD1 } from '@/server/db/d1-context';
@@ -120,11 +121,11 @@ async function hydrate(db: Database, rows: UserRow[]): Promise<UserRecord[]> {
     db
       .select({ userId: projectMembers.userId, projectId: projectMembers.projectId })
       .from(projectMembers)
-      .where(inArray(projectMembers.userId, ids)),
+      .where(inList(projectMembers.userId, ids)),
     db
       .select({ userId: userAuthProviders.userId, provider: userAuthProviders.provider })
       .from(userAuthProviders)
-      .where(inArray(userAuthProviders.userId, ids)),
+      .where(inList(userAuthProviders.userId, ids)),
   ]);
 
   const projectsByUser = new Map<string, string[]>();
@@ -174,7 +175,7 @@ export async function findByIds(ids: string[]): Promise<UserRecord[]> {
   const unique = [...new Set(ids.filter(Boolean))];
   if (unique.length === 0) return [];
   const db = await getD1();
-  const rows = await db.select().from(users).where(inArray(users.id, unique));
+  const rows = await db.select().from(users).where(inList(users.id, unique));
   return hydrate(db, rows);
 }
 
@@ -217,7 +218,7 @@ export async function findForMentions(input: FindForMentionsInput): Promise<User
   const branches: SQL[] = [];
 
   if (input.emails.length > 0) {
-    branches.push(inArray(users.email, input.emails.map((email) => email.toLowerCase())));
+    branches.push(inList(users.email, input.emails.map((email) => email.toLowerCase())));
   }
   for (const name of input.names.slice(0, 10)) {
     branches.push(sql`${users.name} LIKE ${`${escapeLike(name)}%`} ESCAPE '\\'`);

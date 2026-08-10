@@ -35,7 +35,6 @@ import {
   count,
   desc,
   eq,
-  inArray,
   isNotNull,
   isNull,
   lt,
@@ -44,6 +43,7 @@ import {
   sql,
   type SQL,
 } from 'drizzle-orm';
+import { inList } from '@/server/db/d1-bindings';
 import type { BatchItem } from 'drizzle-orm/batch';
 import { withBatch, type Database } from '@/server/db/d1';
 import { getD1 } from '@/server/db/d1-context';
@@ -111,7 +111,7 @@ async function hydrate(db: Database, rows: FolderRow[]): Promise<FolderRecord[]>
         depth: folderAncestors.depth,
       })
       .from(folderAncestors)
-      .where(inArray(folderAncestors.folderId, ids))
+      .where(inList(folderAncestors.folderId, ids))
       .orderBy(asc(folderAncestors.folderId), asc(folderAncestors.depth)),
     db
       .select()
@@ -119,7 +119,7 @@ async function hydrate(db: Database, rows: FolderRow[]): Promise<FolderRecord[]>
       .where(
         and(
           eq(resourcePermissions.resourceType, 'folder'),
-          inArray(resourcePermissions.resourceId, ids),
+          inList(resourcePermissions.resourceId, ids),
         ),
       )
       .orderBy(asc(resourcePermissions.grantedAt), asc(resourcePermissions.id)),
@@ -258,7 +258,7 @@ export async function findByIds(
   const unique = [...new Set(ids.filter(Boolean))];
   if (unique.length === 0) return [];
   const db = await getD1();
-  const conditions = [inArray(folders.id, unique), lookupVisibility('folder', actor)];
+  const conditions = [inList(folders.id, unique), lookupVisibility('folder', actor)];
   if (!options.includeDeleted) conditions.push(live());
 
   const rows = await db.select().from(folders).where(and(...conditions));
@@ -390,7 +390,7 @@ export async function listSharedWith(input: ListSharedWithInput): Promise<Folder
     sql`EXISTS (SELECT 1 FROM ${resourcePermissions}
                  WHERE ${resourcePermissions.resourceType} = 'folder'
                    AND ${resourcePermissions.resourceId} = ${folders.id}
-                   AND ${inArray(resourcePermissions.principalId, principals)}
+                   AND ${inList(resourcePermissions.principalId, principals)}
                    AND ${resourcePermissions.deny} = 0
                    AND (${resourcePermissions.expiresAt} IS NULL
                         OR ${resourcePermissions.expiresAt} > ${now}))`,
@@ -477,7 +477,7 @@ export async function findByIdsInternal(ids: string[]): Promise<FolderRecord[]> 
   const db = await getD1();
   // Trashed rows included, matching Mongo's `withDeleted`: an ancestor in the trash still
   // carries the ACL entries a permission decision has to see.
-  const rows = await db.select().from(folders).where(inArray(folders.id, unique));
+  const rows = await db.select().from(folders).where(inList(folders.id, unique));
   return hydrate(db, rows);
 }
 
@@ -512,7 +512,7 @@ export async function findByRootKeysInternal(rootKeys: string[]): Promise<Folder
   const rows = await db
     .select()
     .from(folders)
-    .where(and(inArray(folders.rootKey, unique), live()));
+    .where(and(inList(folders.rootKey, unique), live()));
   return hydrate(db, rows);
 }
 
@@ -1263,15 +1263,15 @@ export async function purge(folderIds: string[]): Promise<number> {
       .delete(folderAncestors)
       .where(
         or(
-          inArray(folderAncestors.folderId, unique),
-          inArray(folderAncestors.ancestorId, unique),
+          inList(folderAncestors.folderId, unique),
+          inList(folderAncestors.ancestorId, unique),
         ),
       ),
     db
       .update(folders)
       .set({ trashedWithFolderId: null })
-      .where(inArray(folders.trashedWithFolderId, unique)),
-    db.delete(folders).where(inArray(folders.id, unique)).returning({ id: folders.id }),
+      .where(inList(folders.trashedWithFolderId, unique)),
+    db.delete(folders).where(inList(folders.id, unique)).returning({ id: folders.id }),
   ]);
 
   return (deleted as { id: string }[]).length;

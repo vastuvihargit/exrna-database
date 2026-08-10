@@ -16,7 +16,8 @@
  * Mongo used a weighted `$text` index sorted by `$meta: 'textScore'`. The equivalent is FTS5
  * with `bm25()`. See `SEARCH_WEIGHTS` for the one thing that is easy to get wrong.
  */
-import { and, asc, eq, inArray, isNull, sql, type SQL } from 'drizzle-orm';
+import { and, asc, eq, isNull, sql, type SQL } from 'drizzle-orm';
+import { inList } from '@/server/db/d1-bindings';
 import type { BatchItem } from 'drizzle-orm/batch';
 import { withBatch, type Database } from '@/server/db/d1';
 import { getD1 } from '@/server/db/d1-context';
@@ -28,6 +29,7 @@ import {
 import { resourceTags } from '@/server/db/schema/drive';
 import type { ConfidentialityLevel } from '@/server/domain/permissions';
 import type { ExperimentOutcome, ExperimentStatus } from '@/server/db/models';
+import { toFtsQuery } from './fts-query';
 import type {
   CreateExperimentInput,
   ExperimentPatch,
@@ -47,33 +49,6 @@ type ExperimentRow = typeof experiments.$inferSelect;
  * one position, which does not fail, it just ranks by the wrong field.
  */
 const SEARCH_WEIGHTS = '0.0, 10.0, 8.0, 6.0, 1.0';
-
-/**
- * Turns a user's search box into a safe FTS5 query.
- *
- * **A raw user string cannot be passed to `MATCH`.** FTS5 has a query language: `-` means NOT,
- * `*` is a prefix wildcard, `:` is a column filter, `OR`/`NEAR` are operators, and an unbalanced
- * quote is a syntax error. Searching for a sample id like `S-4471` therefore does not return
- * nothing — it *throws*, turning a search into a 500. MongoDB's `$text` has no such problem, so
- * this is a hazard the migration introduces and has to answer for.
- *
- * Each token is extracted and re-quoted as a literal phrase, which makes every metacharacter
- * inert. Tokens are joined with `OR` because that is what MongoDB's `$text` does with
- * space-separated terms — FTS5 would otherwise default to AND and quietly return far fewer
- * results than the Mongo path for the same query.
- *
- * Returns `null` when nothing usable survives, which the caller turns into "no results" rather
- * than "no filter".
- */
-function toFtsQuery(text: string): string | null {
-  const tokens = text.match(/[\p{L}\p{N}_]+/gu);
-  if (!tokens || tokens.length === 0) return null;
-  // Bounded: a 200-token query is not a search, it is a denial-of-service.
-  return tokens
-    .slice(0, 32)
-    .map((token) => `"${token}"`)
-    .join(' OR ');
-}
 
 function nowIso(): string {
   return new Date().toISOString();
@@ -99,7 +74,7 @@ async function hydrate(db: Database, rows: ExperimentRow[]): Promise<ExperimentR
         userId: experimentCollaborators.userId,
       })
       .from(experimentCollaborators)
-      .where(inArray(experimentCollaborators.experimentId, ids))
+      .where(inList(experimentCollaborators.experimentId, ids))
       .orderBy(asc(experimentCollaborators.userId)),
     db
       .select({
@@ -107,13 +82,13 @@ async function hydrate(db: Database, rows: ExperimentRow[]): Promise<ExperimentR
         sampleId: experimentSamples.sampleId,
       })
       .from(experimentSamples)
-      .where(inArray(experimentSamples.experimentId, ids))
+      .where(inList(experimentSamples.experimentId, ids))
       .orderBy(asc(experimentSamples.sampleId)),
     db
       .select({ resourceId: resourceTags.resourceId, tag: resourceTags.tag })
       .from(resourceTags)
       .where(
-        and(eq(resourceTags.resourceType, 'experiment'), inArray(resourceTags.resourceId, ids)),
+        and(eq(resourceTags.resourceType, 'experiment'), inList(resourceTags.resourceId, ids)),
       )
       .orderBy(asc(resourceTags.tag)),
   ]);
@@ -198,7 +173,7 @@ export async function findByIds(ids: string[]): Promise<ExperimentRecord[]> {
   const rows = await db
     .select()
     .from(experiments)
-    .where(and(inArray(experiments.id, unique), live()));
+    .where(and(inList(experiments.id, unique), live()));
   return hydrate(db, rows);
 }
 
@@ -237,7 +212,7 @@ export async function list(
 
   const predicates: SQL[] = [
     eq(experiments.organizationId, input.organizationId),
-    inArray(experiments.projectId, projectIds),
+    inList(experiments.projectId, projectIds),
     live(),
   ];
   if (input.status) predicates.push(eq(experiments.status, input.status));

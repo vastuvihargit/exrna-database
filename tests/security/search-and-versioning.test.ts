@@ -747,3 +747,72 @@ describe('a version id is not a capability', () => {
     ).rejects.toMatchObject({ status: 404 });
   });
 });
+
+/**
+ * Facet counts describe the same population the results do.
+ *
+ * `searchFacets` is built from MongoDB aggregates, and Mongoose does not route `aggregate`
+ * through the query middleware that applies the soft-delete filter — so the chips counted
+ * trashed files while the result list beside them did not. A user reading "qpcr (2)" and
+ * seeing one row is being told, accurately, that a second file exists.
+ *
+ * That is a disclosure as well as an inconsistency: the trashed file may have been trashed
+ * *because* it should not have been there. The D1 implementation excluded them from the start;
+ * this pins the corrected Mongo behaviour so the two engines cannot drift apart again.
+ */
+describe('facet counts agree with the results beside them', () => {
+  it('stops counting a file once it is in the trash', async () => {
+    if (skipUnlessDb()) return;
+    const { searchService, fileService } = await services();
+    const alice = await actorFor(fixture.users.scientistA);
+
+    const folderId = await personalFolder(alice, 'Facet trash');
+    const keep = await upload(alice, folderId, 'facet-keep.pdf', pdfOfSize('facet-keep'));
+    const drop = await upload(alice, folderId, 'facet-drop.pdf', pdfOfSize('facet-drop'));
+
+    const TAG = 'facet-consistency-probe';
+    for (const file of [keep, drop]) {
+      await fileService.updateFile(alice, file.fileId, { tags: [TAG] }, TEST_META);
+    }
+
+    const countFor = async (tag: string) =>
+      (await searchService.facets(alice)).tags.find((entry) => entry.value === tag)?.count ?? 0;
+
+    expect(await countFor(TAG)).toBe(2);
+
+    await fileService.trashFile(alice, drop.fileId, TEST_META);
+
+    // The chip and the result list now describe the same one file.
+    expect(await countFor(TAG)).toBe(1);
+    const results = await searchService.search(alice, query({ tags: [TAG] }));
+    expect(results.files).toHaveLength(1);
+    expect(results.totals.files).toBe(1);
+  });
+
+  /**
+   * The category facet is a second aggregate with the same defect, and it is the one a user
+   * sees without searching for anything — so it is worth its own assertion rather than
+   * trusting that one fix covered both.
+   */
+  it('stops counting a trashed file in the category chips too', async () => {
+    if (skipUnlessDb()) return;
+    const { searchService, fileService } = await services();
+    const bob = await actorFor(fixture.users.scientistB);
+
+    const folderId = await personalFolder(bob, 'Facet category');
+    const before = await searchService.facets(bob);
+    const baseline =
+      before.categories.find((entry) => entry.value === 'document')?.count ?? 0;
+
+    const uploaded = await upload(bob, folderId, 'category-probe.pdf', pdfOfSize('category'));
+    const withFile = await searchService.facets(bob);
+    expect(withFile.categories.find((entry) => entry.value === 'document')?.count ?? 0).toBe(
+      baseline + 1,
+    );
+
+    await fileService.trashFile(bob, uploaded.fileId, TEST_META);
+
+    const after = await searchService.facets(bob);
+    expect(after.categories.find((entry) => entry.value === 'document')?.count ?? 0).toBe(baseline);
+  });
+});
