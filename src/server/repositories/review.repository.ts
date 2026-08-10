@@ -1,297 +1,105 @@
-import { Types, type ClientSession, type FilterQuery } from 'mongoose';
-import { connectToDatabase } from '@/server/db/connection';
-import {
-  ReviewModel,
-  type ReviewDecision,
-  type ReviewDocument,
-  type ReviewRequestStatus,
-} from '@/server/db/models';
+/**
+ * Review repository — a façade over the MongoDB and D1 implementations.
+ *
+ * Routed by `DATA_SOURCE_REVIEWS`.
+ *
+ * ── This flag does not move alone ───────────────────────────────────────────────────────
+ *
+ * Approving a review writes three tables in two other modules: `file_versions.is_approved` and
+ * the approval binding, and `files.approval_status` / `approved_version_id`. No transaction
+ * spans two databases, so reviews on D1 with files or versions on MongoDB is a write that can
+ * commit half-way — a file reporting "approved" pointing at a version that does not, or a
+ * version marked approved under a review that never closed.
+ *
+ * `reviewMutationEngine()` in `d1-unit-of-work.ts` refuses that combination rather than
+ * attempting it. See §12 of the flag matrix.
+ */
+import { isD1 } from './data-source';
+import { mongoReviewRepository } from './review.repository.mongo';
+import { d1ReviewRepository } from './review.repository.d1';
+import type {
+  CreateReviewInput,
+  ListReviewsInput,
+  ReviewDecision,
+  ReviewDecisionRecord,
+  ReviewRecord,
+  ReviewRepository,
+  ReviewRequestStatus,
+  ReviewTx,
+} from './review.repository.contract';
 
-function oid(value: string): Types.ObjectId {
-  return new Types.ObjectId(value);
+export type {
+  CreateReviewInput,
+  ListReviewsInput,
+  ReviewDecision,
+  ReviewDecisionRecord,
+  ReviewRecord,
+  ReviewRepository,
+  ReviewRequestStatus,
+  ReviewTx,
+};
+
+export { mongoReviewRepository, d1ReviewRepository };
+
+function active(): ReviewRepository {
+  return isD1('reviews') ? d1ReviewRepository : mongoReviewRepository;
 }
 
-export function isValidId(value: string): boolean {
-  return Types.ObjectId.isValid(value) && /^[a-f0-9]{24}$/i.test(value);
+export function findById(id: string): Promise<ReviewRecord | null> {
+  return active().findById(id);
 }
 
-export interface ReviewDecisionRecord {
-  reviewerUserId: string;
-  reviewerName: string;
-  reviewerEmail: string;
-  decision: ReviewDecision;
-  comment: string;
-  decidedAt: Date;
-  ip: string;
-  userAgent: string;
-  requestId: string | null;
+export function findOpenForVersion(versionId: string): Promise<ReviewRecord | null> {
+  return active().findOpenForVersion(versionId);
 }
 
-export interface ReviewRecord {
-  id: string;
-  fileId: string;
-  versionId: string;
-  versionNumber: number;
-  fileName: string;
-  versionChecksum: string;
-  /** The remote content state when the request was raised. Null for local versions. */
-  versionRevisionId: string | null;
-  versionContentModifiedAt: Date | null;
-  requestedBy: string;
-  requestedByName: string;
-  requestNote: string;
-  reviewerUserIds: string[];
-  requiredApprovals: number;
-  status: ReviewRequestStatus;
-  decisions: ReviewDecisionRecord[];
-  dueAt: Date | null;
-  closedAt: Date | null;
-  departmentId: string | null;
-  projectId: string | null;
-  createdAt: Date;
-  updatedAt: Date;
+export function listForFile(fileId: string): Promise<ReviewRecord[]> {
+  return active().listForFile(fileId);
 }
 
-type LeanReview = ReviewDocument & { _id: Types.ObjectId; createdAt: Date; updatedAt: Date };
-
-function toRecord(doc: LeanReview): ReviewRecord {
-  return {
-    id: String(doc._id),
-    fileId: String(doc.fileId),
-    versionId: String(doc.versionId),
-    versionNumber: doc.versionNumber,
-    fileName: doc.fileName,
-    versionChecksum: doc.versionChecksum,
-    versionRevisionId: doc.versionRevisionId ?? null,
-    versionContentModifiedAt: doc.versionContentModifiedAt ?? null,
-    requestedBy: String(doc.requestedBy),
-    requestedByName: doc.requestedByName,
-    requestNote: doc.requestNote ?? '',
-    reviewerUserIds: (doc.reviewerUserIds ?? []).map(String),
-    requiredApprovals: doc.requiredApprovals ?? 1,
-    status: doc.status as ReviewRequestStatus,
-    decisions: (doc.decisions ?? []).map((decision) => ({
-      reviewerUserId: String(decision.reviewerUserId),
-      reviewerName: decision.reviewerName,
-      reviewerEmail: decision.reviewerEmail,
-      decision: decision.decision as ReviewDecision,
-      comment: decision.comment ?? '',
-      decidedAt: decision.decidedAt ?? doc.createdAt,
-      ip: decision.ip ?? 'unknown',
-      userAgent: decision.userAgent ?? 'unknown',
-      requestId: decision.requestId ?? null,
-    })),
-    dueAt: doc.dueAt ?? null,
-    closedAt: doc.closedAt ?? null,
-    departmentId: doc.departmentId ? String(doc.departmentId) : null,
-    projectId: doc.projectId ? String(doc.projectId) : null,
-    createdAt: doc.createdAt,
-    updatedAt: doc.updatedAt,
-  };
-}
-
-export async function findById(id: string): Promise<ReviewRecord | null> {
-  if (!isValidId(id)) return null;
-  await connectToDatabase();
-  const doc = await ReviewModel.findOne({ _id: oid(id) }).lean<LeanReview>().exec();
-  return doc ? toRecord(doc) : null;
-}
-
-export async function findOpenForVersion(versionId: string): Promise<ReviewRecord | null> {
-  if (!isValidId(versionId)) return null;
-  await connectToDatabase();
-  const doc = await ReviewModel.findOne({ versionId: oid(versionId), status: 'pending' })
-    .lean<LeanReview>()
-    .exec();
-  return doc ? toRecord(doc) : null;
-}
-
-/** Every review ever raised against a file, newest first — the approval history. */
-export async function listForFile(fileId: string): Promise<ReviewRecord[]> {
-  if (!isValidId(fileId)) return [];
-  await connectToDatabase();
-  const docs = await ReviewModel.find({ fileId: oid(fileId) })
-    .sort({ createdAt: -1 })
-    .lean<LeanReview[]>()
-    .exec();
-  return docs.map(toRecord);
-}
-
-export interface ListReviewsInput {
-  organizationId: string;
-  /** Requests naming this user as a reviewer. */
-  reviewerUserId?: string;
-  requestedBy?: string;
-  status?: ReviewRequestStatus;
-  page: number;
-  pageSize: number;
-}
-
-export async function list(
+export function list(
   input: ListReviewsInput,
 ): Promise<{ items: ReviewRecord[]; total: number }> {
-  await connectToDatabase();
-
-  const filter: FilterQuery<ReviewDocument> = {
-    organizationId: oid(input.organizationId),
-  };
-  if (input.reviewerUserId && isValidId(input.reviewerUserId)) {
-    filter.reviewerUserIds = oid(input.reviewerUserId);
-  }
-  if (input.requestedBy && isValidId(input.requestedBy)) {
-    filter.requestedBy = oid(input.requestedBy);
-  }
-  if (input.status) filter.status = input.status;
-
-  const [docs, total] = await Promise.all([
-    ReviewModel.find(filter)
-      .sort({ createdAt: -1 })
-      .skip((input.page - 1) * input.pageSize)
-      .limit(input.pageSize)
-      .lean<LeanReview[]>()
-      .exec(),
-    ReviewModel.countDocuments(filter).exec(),
-  ]);
-
-  return { items: docs.map(toRecord), total };
+  return active().list(input);
 }
 
-export interface CreateReviewInput {
-  organizationId: string;
-  fileId: string;
-  versionId: string;
-  versionNumber: number;
-  fileName: string;
-  versionChecksum: string;
-  versionRevisionId?: string | null;
-  versionContentModifiedAt?: Date | null;
-  requestedBy: string;
-  requestedByName: string;
-  requestNote?: string;
-  reviewerUserIds: string[];
-  requiredApprovals?: number;
-  dueAt?: Date | null;
-  departmentId?: string | null;
-  projectId?: string | null;
+export function create(input: CreateReviewInput, tx?: ReviewTx): Promise<ReviewRecord> {
+  return active().create(input, tx);
 }
 
-export async function create(
-  input: CreateReviewInput,
-  session?: ClientSession,
-): Promise<ReviewRecord> {
-  await connectToDatabase();
-  const [doc] = await ReviewModel.create(
-    [
-      {
-        organizationId: oid(input.organizationId),
-        fileId: oid(input.fileId),
-        versionId: oid(input.versionId),
-        versionNumber: input.versionNumber,
-        fileName: input.fileName,
-        versionChecksum: input.versionChecksum,
-        versionRevisionId: input.versionRevisionId ?? null,
-        versionContentModifiedAt: input.versionContentModifiedAt ?? null,
-        requestedBy: oid(input.requestedBy),
-        requestedByName: input.requestedByName,
-        requestNote: input.requestNote ?? '',
-        reviewerUserIds: input.reviewerUserIds.map(oid),
-        requiredApprovals: input.requiredApprovals ?? 1,
-        dueAt: input.dueAt ?? null,
-        departmentId: input.departmentId ? oid(input.departmentId) : null,
-        projectId: input.projectId ? oid(input.projectId) : null,
-      },
-    ],
-    session ? { session } : undefined,
-  );
-  return toRecord(doc!.toObject() as LeanReview);
-}
-
-/**
- * Appends a decision and, when the request closes, sets its final status in the same
- * update.
- *
- * `status: 'pending'` in the filter is the concurrency guard: two reviewers deciding at
- * the same moment cannot both close the request, and the second one's update matches
- * nothing rather than overwriting the first outcome.
- */
-export async function appendDecision(
+export function appendDecision(
   reviewId: string,
   decision: ReviewDecisionRecord,
   close: { status: ReviewRequestStatus } | null,
-  session?: ClientSession,
+  tx?: ReviewTx,
 ): Promise<ReviewRecord | null> {
-  if (!isValidId(reviewId)) return null;
-  await connectToDatabase();
-
-  const query = ReviewModel.findOneAndUpdate(
-    { _id: oid(reviewId), status: 'pending' },
-    {
-      $push: {
-        decisions: {
-          ...decision,
-          reviewerUserId: oid(decision.reviewerUserId),
-        },
-      },
-      ...(close ? { $set: { status: close.status, closedAt: new Date() } } : {}),
-    },
-    { new: true },
-  );
-  if (session) query.session(session);
-
-  const doc = await query.lean<LeanReview>().exec();
-  return doc ? toRecord(doc) : null;
+  return active().appendDecision(reviewId, decision, close, tx);
 }
 
-export async function cancel(reviewId: string, session?: ClientSession): Promise<boolean> {
-  if (!isValidId(reviewId)) return false;
-  await connectToDatabase();
-  const query = ReviewModel.updateOne(
-    { _id: oid(reviewId), status: 'pending' },
-    { $set: { status: 'cancelled', closedAt: new Date() } },
-  );
-  if (session) query.session(session);
-  const result = await query.exec();
-  return result.modifiedCount > 0;
+export function cancel(reviewId: string, tx?: ReviewTx): Promise<boolean> {
+  return active().cancel(reviewId, tx);
+}
+
+export function cancelOpenForFile(
+  fileId: string,
+  exceptVersionId?: string,
+  tx?: ReviewTx,
+): Promise<number> {
+  return active().cancelOpenForFile(fileId, exceptVersionId, tx);
+}
+
+export function countPendingFor(userId: string): Promise<number> {
+  return active().countPendingFor(userId);
+}
+
+export function purgeForFiles(fileIds: string[]): Promise<number> {
+  return active().purgeForFiles(fileIds);
 }
 
 /**
- * Cancels any request still open against a file.
- *
- * Called when a new version lands: a pending review of superseded bytes would let a
- * reviewer approve content that is no longer current, which is exactly the confusion the
- * version-pinned design exists to prevent.
+ * Retained because `review.service.ts` and two routes validate a caller-supplied id before
+ * using it. The check is Mongo's ObjectId shape, which stays correct after the migration: ids
+ * are preserved as D1 TEXT, so a string that is not a valid ObjectId is not one of ours on
+ * either engine.
  */
-export async function cancelOpenForFile(
-  fileId: string,
-  exceptVersionId?: string,
-  session?: ClientSession,
-): Promise<number> {
-  if (!isValidId(fileId)) return 0;
-  await connectToDatabase();
-
-  const filter: FilterQuery<ReviewDocument> = { fileId: oid(fileId), status: 'pending' };
-  if (exceptVersionId && isValidId(exceptVersionId)) {
-    filter.versionId = { $ne: oid(exceptVersionId) };
-  }
-
-  const query = ReviewModel.updateMany(filter, {
-    $set: { status: 'cancelled', closedAt: new Date() },
-  });
-  if (session) query.session(session);
-  const result = await query.exec();
-  return result.modifiedCount;
-}
-
-export async function countPendingFor(userId: string): Promise<number> {
-  if (!isValidId(userId)) return 0;
-  await connectToDatabase();
-  return ReviewModel.countDocuments({ reviewerUserIds: oid(userId), status: 'pending' }).exec();
-}
-
-export async function purgeForFiles(fileIds: string[]): Promise<number> {
-  const valid = fileIds.filter(isValidId).map(oid);
-  if (valid.length === 0) return 0;
-  await connectToDatabase();
-  const result = await ReviewModel.deleteMany({ fileId: { $in: valid } }).exec();
-  return result.deletedCount ?? 0;
-}
+export { isValidId } from './review.repository.mongo';

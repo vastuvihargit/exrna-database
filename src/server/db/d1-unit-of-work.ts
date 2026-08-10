@@ -82,6 +82,7 @@ import {
   newId as newVersionId,
   nextVersionNumber,
 } from '@/server/repositories/file-version.repository.d1';
+import { buildCancelOpenForFileStatement } from '@/server/repositories/review.repository.d1';
 import type { CreateVersionInput } from '@/server/repositories/file-version.repository.contract';
 import type { FilePatch } from '@/server/repositories/file.repository.contract';
 import type { MoveSubtreeInput } from '@/server/repositories/folder.repository.contract';
@@ -100,13 +101,14 @@ function nowIso(): string {
  *
  * ── Where the numbers come from ─────────────────────────────────────────────────────────
  *
- * The binding ceiling is the one hard constraint the project already reasons about:
- * `visibility.d1.ts` records that SQLite's default `SQLITE_MAX_VARIABLE_NUMBER` is 999 and that
- * D1 rejects statements carrying more, and it picked `MAX_ACTOR_PRINCIPALS = 200` to stay well
- * inside that. The same reasoning applies here, because the file statements bind one parameter
- * per folder in the subtree.
+ * `MAX_MOVE_FOLDERS` is 200, matching the `MAX_ACTOR_PRINCIPALS` precedent in `visibility.d1.ts`
+ * rather than inventing a new number.
  *
- * `MAX_MOVE_FOLDERS` is therefore 200, matching that precedent rather than inventing a new one.
+ * **It is no longer a binding ceiling.** Both numbers were originally chosen against SQLite's
+ * compile-time `SQLITE_MAX_VARIABLE_NUMBER` default of 999; D1's real limit is 100, and the
+ * folder id lists now go through `inList`, which binds any list as one JSON parameter. See
+ * `d1-bindings.ts`. What 200 still bounds is the **statement count** of one batch, which is
+ * `folders × depth` and is a real constraint on `MAX_BATCH_STATEMENTS`.
  * `MAX_COPY_FOLDERS` in `folder.service.ts` (2000) is the precedent for the *shape* of the
  * refusal — a controlled `ValidationError` naming the limit — but not for the size, because a
  * copy is not bound to a single batch the way this is.
@@ -651,6 +653,22 @@ export async function createVersionWithFile(
       ...buildSetCurrentStatements(db, fileId, versionId),
       ...fileStatements,
     ];
+
+    /**
+     * A new version cancels every review still open against the file, in the same batch.
+     *
+     * Not a generic hook — a named domain rule. A review pinned to the previously current
+     * bytes is a review of content that is no longer current, and leaving one open lets a
+     * reviewer approve it afterwards, which would set `files.approved_version_id` to a
+     * superseded version *after* the file had already moved on.
+     *
+     * Conditional on the reviews flag because the statement only makes sense against D1
+     * reviews. When they are still on MongoDB the version service cancels them through the
+     * Mongo session, exactly as it always has.
+     */
+    if (isD1('reviews')) {
+      statements.push(buildCancelOpenForFileStatement(db, fileId));
+    }
 
     try {
       await withBatch(db, statements);
