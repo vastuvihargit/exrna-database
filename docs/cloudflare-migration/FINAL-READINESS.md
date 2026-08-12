@@ -4,24 +4,24 @@
 
 Not because anything migrated so far is wrong — every migrated module is implemented, tested
 against a real D1 engine and a real MongoDB, and green — but because a Cloudflare Worker
-deployment still has requirements this repository does not meet, and each is demonstrable rather
-than speculative:
+deployment still has requirements this repository does not meet. Two remain, both demonstrable
+rather than speculative:
 
 1. **Uploads cannot work in a Worker.** The pipeline streams to a local quarantine directory,
    reads the head back off disk to check the file signature, scans it, moves it to a local
    `originals` directory, and only *then* mirrors to Google Drive. Google Drive is a mirror
-   after a local write. `docs/cloudflare-migration/16-phase-7-storage-audit.md` is the full
-   classification.
-2. **Two repositories still have no D1 implementation** and are reachable from a Worker:
-   `inventory-item` (which blocks the inventory pages, and whose stock-movement feature is not
-   implemented at all — §6.3) and `drive-sync` (the Drive change feed, background rather than
-   request-path). `migration` and `storage-migration` also lack one and always will: they read
-   the local filesystem by definition and must keep running on Node.
-3. **No Mongo → D1 metadata migration tooling exists.** There is no loader, so no cutover can
+   after a local write. `16-phase-7-storage-audit.md` is the full classification and
+   §6.1 records what the replacement has to be, including the one schema change it needs.
+2. **No Mongo → D1 metadata migration tooling exists.** There is no loader, so no cutover can
    be rehearsed, let alone performed.
 
-None of these is an external blocker. All three are repository work. §6 states what remains with
-enough detail to plan it, and §7 lists the two things that genuinely need a human.
+Neither is an external blocker. Both are repository work. §6 states what remains with enough
+detail to plan it, and §7 lists the two things that genuinely need a human.
+
+**The repository migration list is now closed** (was item 3 in the previous revision of this
+document). Every repository a Worker can reach has a D1 implementation. The two that do not —
+`migration` and `storage-migration` — read the local filesystem by definition and are supposed to
+keep running on Node.
 
 This document is written to be actionable rather than reassuring. §2 records what is done and
 proven; §5 records defects found and fixed; §6 records what is left.
@@ -66,6 +66,9 @@ MongoDB, and its verification.
 | Audit trail | `_AUDIT_LOGS` | `14-…-module-12` |
 | Sessions, organizations, notifications, flag matrix, Cloudflare Access | `_SESSIONS`, `_ORGANIZATIONS`, `_NOTIFICATIONS` | `15-…-module-13` |
 | Storage audit (classification only) | — | `16-phase-7-storage-audit.md` |
+| Login history, settings, storage accounting, activity, comments, upload sessions | `_LOGIN_HISTORY`, `_APP_SETTINGS`, `_STORAGE_USAGE`, `_ACTIVITIES`, `_COMMENTS`, `_UPLOAD_SESSIONS` | `17-…-module-14` |
+| Inventory, batches, stock ledger **and stock movement** | `_INVENTORY` | `18-…-module-15` |
+| Drive change-feed cursor | `_DRIVE_SYNC` | `19-…-module-16` |
 
 ## 3. Test results
 
@@ -125,7 +128,54 @@ Stated plainly, because the absence of a result is not a pass.
 
 ## 5. Defects found and fixed
 
-Six, each reachable in code that had already shipped or been written.
+Nine, each reachable in code that had already shipped or been written.
+
+### 5.0 `objectIdSchema` rejected every id D1 mints — a cutover blocker
+
+The most consequential one found so far, and it was in a four-line validator.
+
+`objectIdSchema` accepted only 24 hex characters. Every D1 repository mints
+`crypto.randomUUID()`. So the moment any module was switched to D1, **every resource created
+after the switch had an id its own API rejected** — 238 call sites returning 422 "Invalid
+identifier" from routes that never reached the database. A user would create a folder and be
+unable to open it.
+
+There is no cutover ordering that avoids it, because migrated rows keep their ObjectId (Phase 9
+preserves them as TEXT) and new rows get UUIDs, so both shapes are live in the same column at the
+same time. `schema/_shared.ts` says so explicitly — *"Both shapes coexist in the same column
+deliberately"* — and the validator had simply never been told.
+
+Widened to accept either. The anchored, fixed-length, character-restricted check was kept
+because it is load-bearing twice over: `Types.ObjectId.isValid()` returns true for any
+12-character string, and the Mongo repositories branch on it to return `null`, so a value that is
+neither shape reaching that branch turns a malformed request into a 404 instead of a 422.
+
+### 5.7 A stock overdraw check that reported success
+
+The first MongoDB `issue()` used `updateOne` with `arrayFilters` pinning
+`quantity: { $gte: take }`, and treated `modifiedCount === 0` as "somebody got there first".
+
+The driver reports the *parent document* as matched, so the overdraw case did not throw — it
+changed nothing and returned success. The failure mode is the bad one: the caller is told the
+stock was issued, the material is still on the shelf, and the two only disagree at the next
+stock take.
+
+Found by the concurrency test rather than by review, which is the argument for writing that test.
+Replaced by a comparison against the value read inside the transaction; the write conflict makes
+`withTransaction` retry, so the loser re-reads the decremented quantity.
+
+### 5.8 SQLite validates CHECK before resolving an upsert conflict
+
+A negative D1 stock adjustment was written as an upsert carrying `quantity = -3`, relying on
+`ON CONFLICT DO UPDATE` to turn it into `quantity + (-3)`.
+
+SQLite validates CHECK constraints on the candidate row **first**, so
+`ck_inventory_batches_quantity` aborts the statement even though the DO UPDATE branch would have
+produced a legal positive value. Worth recording because the resulting error is indistinguishable
+from a real overdraw, and would have been "fixed" by weakening the constraint.
+
+Negative adjustments now use a plain UPDATE, which is sound because the batch is required to
+exist.
 
 ### 5.1 D1 binds at most 100 parameters per statement — not 999
 
@@ -215,38 +265,46 @@ copy) → record.
 `GOOGLE_DRIVE_STORAGE_ENABLED=true` is **not** sufficient today and setting it would be
 misleading: it changes where bytes are mirrored to, not where they are first written.
 
-### 6.2 Ten repositories have no D1 implementation
+#### 6.1.1 It needs a schema change, and that is the reason it is not done here
 
-| Repository | Needed for | Blocking a Worker? |
-|---|---|---|
-| `upload-session` | uploading | yes |
-| `inventory-item` | the inventory pages | yes |
-| `comment` | file discussion | yes |
-| `activity` | the "what happened here" timeline | yes |
-| `storage-usage` | quota enforcement | yes |
-| `login-history` | admin security view, and the login path writes it | yes |
-| `app-setting` | runtime settings | yes |
-| `drive-sync` | Drive change feed | background only |
-| `migration` | the inbound Drive importer | Node-only tooling |
-| `storage-migration` | byte-migration jobs | Node-only tooling |
+`upload_sessions` has nowhere to put the two handles the Drive path needs between requests: the
+**resumable session URI** and the **staged Drive file id**. `receiveStream` and `finalize` are
+separate HTTP requests, so both have to be persisted.
 
-The D1 schema already covers all of them. What is missing is the contract/Mongo/D1/façade split,
-the tests and the flag wiring — the same shape as the thirteen modules already done. The last two
-are *supposed* to run on Node and need no D1 implementation for cutover.
+Overloading the existing nullable `quarantineKey` to hold a `drive:<id>` handle would make
+single-shot uploads work with no migration, and it was rejected: it makes one column mean two
+different things depending on a flag, and the chunked path needs a *second* handle anyway, which
+would push it to encoding JSON in a string column. That is a decision the next person would have
+to undo.
 
-### 6.3 Inventory stock movement is not implemented at all
+The right shape is migration `0005` adding `external_upload_uri` and `external_staged_id`, the
+matching Mongoose fields, and the contract change — then the staging abstraction with a local and
+a Drive implementation, so `upload.service.ts` picks one instead of calling
+`getStorageProvider()` eight times.
 
-Worth separating from §6.2, because it is a feature gap rather than a migration gap. The brief's
-Phase 5 asks for add-stock, issue-stock, employee/department/project/experiment linkage,
-no-over-issue and immutable history. Today `inventory.service.ts` handles item *definitions* only
-and says so: *"nothing here changes a quantity … stock moves only through the receipt, issue and
-adjustment paths (Phase 2)"*, and those paths do not exist. There are two API routes, both item
-CRUD.
+The resumable machinery itself already exists and is tested: `GoogleDriveHttpClient` does
+chunked resumable uploads with offset re-query before every retry
+(`tests/unit/drive-resumable-upload.test.ts`). What is missing is the session plumbing above it,
+not the transfer.
 
-The D1 schema anticipates the whole feature — `inventory_batches`, `stock_transactions`, the
-`CHECK (quantity >= 0)` constraints and the append-only triggers are already there, and
-`schema/inventory.ts` documents the conditional-UPDATE approach that replaces MongoDB's atomic
-`findOneAndUpdate`. So the design decision is made; the implementation is not.
+### 6.2 The repository list is closed — RESOLVED
+
+Modules 14, 15 and 16 finished it. Every repository a Worker can reach now has a
+contract/Mongo/D1/façade split, tests on both engines and a flag.
+
+`migration` and `storage-migration` still have no D1 implementation and never will: they read the
+local filesystem by definition and must keep running on Node.
+
+### 6.3 Inventory stock movement — RESOLVED
+
+Implemented in module 15, on both engines. Receipts, issues, adjustments and the expiry sweep
+each move stock and append a ledger row atomically or do neither; negative stock is prevented by
+`CHECK` inside a D1 `batch()` and by the retried transaction on MongoDB; the ledger's before/after
+figures are computed by the database rather than predicted. `18-…-module-15.md` has the design and
+the reasoning, including two deliberate divergences between the engines.
+
+The UI is done too: receive/issue/adjust from the item page, a stock-history table showing the
+running total per row, and an overview page with the four counts a store manager checks first.
 
 ### 6.4 No Mongo → D1 metadata migration tooling
 
