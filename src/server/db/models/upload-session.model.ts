@@ -49,9 +49,18 @@ const uploadSessionSchema = new Schema(
     totalChunks: { type: Number, default: 0, min: 0 },
     receivedChunks: { type: [Number], default: [] },
 
-    /** Where the bytes sit while they are still untrusted. */
+    /** Where the bytes sit while they are still untrusted, when that is a local disk. */
     quarantineKey: { type: String, default: null, maxlength: 500 },
     checksumSha256: { type: String, default: null, maxlength: 64 },
+
+    /**
+     * The same, when staging happens in an external provider instead — the Drive resumable
+     * session URI, and the id of the staged object once Drive has acknowledged the last
+     * chunk. Both null for a locally-staged upload. See migration 0005 for why these are two
+     * named columns rather than an overloaded `quarantineKey`.
+     */
+    externalUploadUri: { type: String, default: null, maxlength: 2000 },
+    externalStagedId: { type: String, default: null, maxlength: 200 },
 
     resultFileId: { type: Schema.Types.ObjectId, ref: 'File', default: null },
     resultVersionId: { type: Schema.Types.ObjectId, ref: 'FileVersion', default: null },

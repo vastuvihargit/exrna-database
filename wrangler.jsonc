@@ -28,7 +28,12 @@
   "vars": {
     "NODE_ENV": "production",
     "APP_NAME": "Biotech Research Drive",
-    "LOG_LEVEL": "info"
+    "LOG_LEVEL": "info",
+    // Storage. A Worker has no persistent filesystem, so these are the only values it can
+    // run with — env.worker.ts refuses anything else at boot rather than per upload.
+    "GOOGLE_DRIVE_STORAGE_ENABLED": "true",
+    "DEFAULT_STORAGE_PROVIDER": "google_drive",
+    "UPLOAD_STAGING": "google_drive"
   },
 
   // ── Bindings ────────────────────────────────────────────────────────────────────────
@@ -80,7 +85,12 @@
       "vars": {
         "NODE_ENV": "development",
         "APP_NAME": "Biotech Research Drive",
-        "LOG_LEVEL": "debug"
+        "LOG_LEVEL": "debug",
+        // Storage. A Worker has no persistent filesystem, so these are the only values it can
+        // run with — env.worker.ts refuses anything else at boot rather than per upload.
+        "GOOGLE_DRIVE_STORAGE_ENABLED": "true",
+        "DEFAULT_STORAGE_PROVIDER": "google_drive",
+        "UPLOAD_STAGING": "google_drive"
       },
       "observability": { "enabled": true, "head_sampling_rate": 1 },
       "d1_databases": [
@@ -103,7 +113,12 @@
       "vars": {
         "NODE_ENV": "staging",
         "APP_NAME": "Biotech Research Drive (Staging)",
-        "LOG_LEVEL": "debug"
+        "LOG_LEVEL": "debug",
+        // Storage. A Worker has no persistent filesystem, so these are the only values it can
+        // run with — env.worker.ts refuses anything else at boot rather than per upload.
+        "GOOGLE_DRIVE_STORAGE_ENABLED": "true",
+        "DEFAULT_STORAGE_PROVIDER": "google_drive",
+        "UPLOAD_STAGING": "google_drive"
       },
       "observability": { "enabled": true, "head_sampling_rate": 1 },
       "d1_databases": [
@@ -126,7 +141,12 @@
       "vars": {
         "NODE_ENV": "production",
         "APP_NAME": "Biotech Research Drive",
-        "LOG_LEVEL": "info"
+        "LOG_LEVEL": "info",
+        // Storage. A Worker has no persistent filesystem, so these are the only values it can
+        // run with — env.worker.ts refuses anything else at boot rather than per upload.
+        "GOOGLE_DRIVE_STORAGE_ENABLED": "true",
+        "DEFAULT_STORAGE_PROVIDER": "google_drive",
+        "UPLOAD_STAGING": "google_drive"
       },
       // Sampled rather than 1.0: production traffic is higher and the interesting events
       // (errors, denials) are logged explicitly by the application, not inferred from traces.

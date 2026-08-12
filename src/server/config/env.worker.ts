@@ -85,6 +85,33 @@ const workerEnvSchema = z.object({
     .min(1, 'GOOGLE_SERVICE_ACCOUNT_PRIVATE_KEY is required'),
   GOOGLE_WORKSPACE_DOMAIN: z.string().min(1, 'GOOGLE_WORKSPACE_DOMAIN is required'),
 
+  /**
+   * Where uploads are staged. In a Worker there is exactly one possible answer.
+   *
+   * A literal rather than an enum with a default: `local` staging streams to a filesystem that
+   * does not exist here, so accepting the value and failing later would turn a configuration
+   * mistake into a run of failed uploads. It is stated in `wrangler.jsonc` under `vars` so the
+   * deployed configuration says so out loud rather than relying on a default.
+   *
+   * The shared `env.ts` schema — which the storage layer actually reads, because both runtimes
+   * read `process.env` — defaults this to `local`. That default is right for the Node
+   * deployment and wrong here, which is exactly why this is checked at boot.
+   */
+  UPLOAD_STAGING: z.literal('google_drive', {
+    errorMap: () => ({
+      message:
+        'must be "google_drive" in a Worker: workerd has no persistent filesystem, so uploads ' +
+        'cannot be staged on local disk. Set it in wrangler.jsonc under "vars".',
+    }),
+  }),
+  DEFAULT_STORAGE_PROVIDER: z.literal('google_drive', {
+    errorMap: () => ({
+      message:
+        'must be "google_drive" in a Worker: there is no local object store to record new ' +
+        'content against.',
+    }),
+  }),
+
   GOOGLE_CLIENT_ID: z.string().optional(),
   GOOGLE_CLIENT_SECRET: z.string().optional(),
 

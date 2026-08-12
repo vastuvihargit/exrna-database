@@ -87,7 +87,7 @@ async function upload(
     { folderId, filename, size: content.byteLength, ...extra },
     TEST_META,
   );
-  await uploadService.receiveStream(actor, ticket.sessionId, Readable.from(content));
+  await uploadService.receiveStream(actor, ticket.sessionId, Readable.from(content), TEST_META);
   return uploadService.finalize(actor, ticket.sessionId, TEST_META);
 }
 

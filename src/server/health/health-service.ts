@@ -11,6 +11,7 @@ import { getEnv } from '@/server/config/env';
 import { checkDatabaseHealth, type DatabaseHealth } from '@/server/db/connection';
 import { checkDriveConnection, driveIsLoadBearing, getStorageProvider, isDriveStorageEnabled } from '@/server/storage';
 import { LocalStorageProvider } from '@/server/storage/local-provider';
+import { stagingProviderName } from '@/server/storage/staging';
 
 export interface StorageHealth {
   status: 'ok' | 'degraded' | 'error';
@@ -73,8 +74,33 @@ async function checkDriveHealth(): Promise<DriveHealth> {
   };
 }
 
+/**
+ * The writable-volume probe.
+ *
+ * **Only meaningful when uploads are staged locally.** The probe writes a file, reads it back
+ * and deletes it, which is exactly the right check for a mount that has silently become
+ * read-only after a container restart. It is the wrong check — and an impossible one — when
+ * staging is Google Drive and there is no volume: `getStorageProvider()` would construct a
+ * local provider against directories nothing has ever created, and report `provider: "local"`
+ * on a deployment that writes nothing to a disk.
+ *
+ * That string is the first thing an operator reads after a deploy, so being wrong about it is
+ * not cosmetic. When staging is external the report says so and defers to the Drive check,
+ * which is the dependency that actually gates uploads.
+ */
 async function checkStorageHealth(): Promise<StorageHealth> {
   const env = getEnv();
+
+  if (stagingProviderName() !== 'local') {
+    return {
+      status: 'ok',
+      provider: stagingProviderName(),
+      // Not "assumed true": the Drive connection check below is the real writability probe for
+      // this configuration, and it fails the whole report if the service account cannot write.
+      writable: true,
+    };
+  }
+
   const provider = getStorageProvider();
 
   try {

@@ -79,7 +79,7 @@ async function upload(
     { folderId, filename, size: content.byteLength, ...extra },
     TEST_META,
   );
-  await uploadService.receiveStream(actor, ticket.sessionId, Readable.from(content));
+  await uploadService.receiveStream(actor, ticket.sessionId, Readable.from(content), TEST_META);
   const result = await uploadService.finalize(actor, ticket.sessionId, TEST_META);
   return { ticket, result };
 }
@@ -212,17 +212,50 @@ describe('what reaches storage', () => {
       { folderId, filename: 'protocol.pdf', size: disguised.byteLength },
       TEST_META,
     );
-    await uploadService.receiveStream(alice, ticket.sessionId, Readable.from(disguised));
-
+    /**
+     * Refused during `receiveStream`, not at finalization.
+     *
+     * Phase 7 moved the signature check in front of staging: the first 4 KB are buffered and
+     * checked before the body is written anywhere, so a mislabelled file never reaches storage
+     * at all. The check at finalization still exists and is still the authoritative one — it
+     * inspects what was actually stored — but for a single-shot upload this one fires first.
+     */
     await expect(
-      uploadService.finalize(alice, ticket.sessionId, TEST_META),
+      uploadService.receiveStream(alice, ticket.sessionId, Readable.from(disguised), TEST_META),
     ).rejects.toMatchObject({ status: 415 });
 
     const session = await sessionRepository.findById(ticket.sessionId);
     expect(session?.status).toBe('rejected');
+
+    // And finalization refuses a session that was rejected for its content.
+    await expect(uploadService.finalize(alice, ticket.sessionId, TEST_META)).rejects.toThrow();
+
     // The whole point: nothing usable was created.
     const names = await fileRepository.takenNamesInFolder(folderId);
     expect(names.has('protocol.pdf')).toBe(false);
+  });
+
+  it('rejects a chunked upload whose first chunk does not match its extension', async () => {
+    if (skipUnlessDb()) return;
+    const { uploadService, sessionRepository, fileRepository } = await services();
+    const alice = await actorFor(fixture.users.scientistA);
+    const folderId = await personalFolder(alice, 'Chunked signature');
+    const disguised = Buffer.concat([Buffer.from([0x4d, 0x5a]), Buffer.alloc(64, 0x90)]);
+
+    const ticket = await uploadService.authorizeUpload(
+      alice,
+      { folderId, filename: 'chunked.pdf', size: disguised.byteLength, chunked: true },
+      TEST_META,
+    );
+
+    // The head arrives in chunk zero, so the same refusal is available on this path — and it
+    // matters more here, because a chunked upload is a large one.
+    await expect(
+      uploadService.receiveChunk(alice, ticket.sessionId, 0, disguised, TEST_META),
+    ).rejects.toMatchObject({ status: 415 });
+
+    expect((await sessionRepository.findById(ticket.sessionId))?.status).toBe('rejected');
+    expect((await fileRepository.takenNamesInFolder(folderId)).has('chunked.pdf')).toBe(false);
   });
 
   it('does not create a file record when the upload never delivered its bytes', async () => {
@@ -254,7 +287,7 @@ describe('what reaches storage', () => {
     );
 
     await expect(
-      uploadService.receiveStream(alice, ticket.sessionId, Readable.from(Buffer.alloc(4096, 0x41))),
+      uploadService.receiveStream(alice, ticket.sessionId, Readable.from(Buffer.alloc(4096, 0x41)), TEST_META),
     ).rejects.toThrow();
 
     const session = await sessionRepository.findById(ticket.sessionId);
@@ -276,7 +309,7 @@ describe('what reaches storage', () => {
     // Caught at the point the stream ends, not at finalization: the provider compares
     // what it wrote against what was declared before it reports success.
     await expect(
-      uploadService.receiveStream(alice, ticket.sessionId, Readable.from(Buffer.from('short'))),
+      uploadService.receiveStream(alice, ticket.sessionId, Readable.from(Buffer.from('short')), TEST_META),
     ).rejects.toThrow();
 
     await expect(uploadService.finalize(alice, ticket.sessionId, TEST_META)).rejects.toThrow();
@@ -314,7 +347,7 @@ describe('finalization is idempotent', () => {
       { folderId, filename: 'retried.csv', size: content.byteLength },
       TEST_META,
     );
-    await uploadService.receiveStream(alice, ticket.sessionId, Readable.from(content));
+    await uploadService.receiveStream(alice, ticket.sessionId, Readable.from(content), TEST_META);
 
     const first = await uploadService.finalize(alice, ticket.sessionId, TEST_META);
     const second = await uploadService.finalize(alice, ticket.sessionId, TEST_META);
@@ -338,7 +371,7 @@ describe('finalization is idempotent', () => {
     );
 
     await expect(
-      uploadService.receiveStream(bob, ticket.sessionId, Readable.from(Buffer.alloc(16))),
+      uploadService.receiveStream(bob, ticket.sessionId, Readable.from(Buffer.alloc(16)), TEST_META),
     ).rejects.toMatchObject({ code: 'NOT_FOUND' });
     await expect(uploadService.finalize(bob, ticket.sessionId, TEST_META)).rejects.toMatchObject({
       code: 'NOT_FOUND',
@@ -371,7 +404,7 @@ describe('chunked and resumable uploads', () => {
       chunks.push(whole.subarray(offset, Math.min(offset + ticket.chunkSize, whole.byteLength)));
     }
     for (const [index, chunk] of chunks.entries()) {
-      await uploadService.receiveChunk(alice, ticket.sessionId, index, chunk);
+      await uploadService.receiveChunk(alice, ticket.sessionId, index, chunk, TEST_META);
     }
 
     const result = await uploadService.finalize(alice, ticket.sessionId, TEST_META);
@@ -394,8 +427,8 @@ describe('chunked and resumable uploads', () => {
       TEST_META,
     );
 
-    await uploadService.receiveChunk(alice, ticket.sessionId, 0, content);
-    const again = await uploadService.receiveChunk(alice, ticket.sessionId, 0, content);
+    await uploadService.receiveChunk(alice, ticket.sessionId, 0, content, TEST_META);
+    const again = await uploadService.receiveChunk(alice, ticket.sessionId, 0, content, TEST_META);
 
     expect(again.receivedChunks).toEqual([0]);
     const result = await uploadService.finalize(alice, ticket.sessionId, TEST_META);
@@ -415,7 +448,7 @@ describe('chunked and resumable uploads', () => {
     );
 
     await expect(
-      uploadService.receiveChunk(alice, ticket.sessionId, 99, Buffer.alloc(8)),
+      uploadService.receiveChunk(alice, ticket.sessionId, 99, Buffer.alloc(8), TEST_META),
     ).rejects.toMatchObject({ code: 'VALIDATION_FAILED' });
   });
 
@@ -522,7 +555,7 @@ describe('abandoned uploads', () => {
       { folderId, filename: 'orphan.txt', size: content.byteLength },
       TEST_META,
     );
-    await uploadService.receiveStream(alice, ticket.sessionId, Readable.from(content));
+    await uploadService.receiveStream(alice, ticket.sessionId, Readable.from(content), TEST_META);
 
     const quarantine = buildQuarantineKey({ uploadSessionId: ticket.sessionId });
     expect(await storage.fileExists(quarantine.key, quarantine.area)).toBe(true);
@@ -553,7 +586,7 @@ describe('abandoned uploads', () => {
     });
 
     await expect(
-      uploadService.receiveStream(alice, ticket.sessionId, Readable.from(Buffer.from('data'))),
+      uploadService.receiveStream(alice, ticket.sessionId, Readable.from(Buffer.from('data')), TEST_META),
     ).rejects.toMatchObject({ code: 'UPLOAD_SESSION_EXPIRED' });
   });
 
@@ -569,7 +602,7 @@ describe('abandoned uploads', () => {
       { folderId, filename: 'cancelled.txt', size: 5 },
       TEST_META,
     );
-    await uploadService.receiveStream(alice, ticket.sessionId, Readable.from(Buffer.from('bytes')));
+    await uploadService.receiveStream(alice, ticket.sessionId, Readable.from(Buffer.from('bytes')), TEST_META);
 
     await uploadService.abort(alice, ticket.sessionId);
 

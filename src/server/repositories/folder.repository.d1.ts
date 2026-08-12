@@ -50,6 +50,7 @@ import { getD1 } from '@/server/db/d1-context';
 import { folders, folderAncestors } from '@/server/db/schema/drive';
 import { resourcePermissions } from '@/server/db/schema/access';
 import { ConflictError } from '@/server/errors/app-error';
+import { getLogger } from '@/server/logging/logger';
 import type { AclEntry, Actor } from '@/server/permissions/actor';
 import {
   childVisibility,
@@ -61,6 +62,7 @@ import type {
   AclEntryWrite,
   CreateFolderInput,
   EnsureRootInput,
+  FolderDriveMapping,
   FolderPage,
   FolderPatch,
   FolderRecord,
@@ -492,6 +494,95 @@ export async function findByDriveFolderIdInternal(
     .where(eq(folders.googleDriveFolderId, googleDriveFolderId))
     .limit(1);
   return hydrateOne(db, row);
+}
+
+export async function findDriveMappingsInternal(ids: string[]): Promise<FolderDriveMapping[]> {
+  const unique = [...new Set(ids.filter(Boolean))];
+  if (unique.length === 0) return [];
+  const db = await getD1();
+
+  const [rows, ancestorRows] = await Promise.all([
+    db
+      .select({
+        id: folders.id,
+        name: folders.name,
+        depth: folders.depth,
+        googleDriveFolderId: folders.googleDriveFolderId,
+      })
+      .from(folders)
+      .where(inList(folders.id, unique)),
+    db
+      .select({ folderId: folderAncestors.folderId, ancestorId: folderAncestors.ancestorId })
+      .from(folderAncestors)
+      .where(inList(folderAncestors.folderId, unique))
+      .orderBy(asc(folderAncestors.folderId), asc(folderAncestors.depth)),
+  ]);
+
+  const chains = new Map<string, string[]>();
+  for (const row of ancestorRows) {
+    const chain = chains.get(row.folderId);
+    if (chain) chain.push(row.ancestorId);
+    else chains.set(row.folderId, [row.ancestorId]);
+  }
+
+  return rows.map((row) => ({
+    id: row.id,
+    name: row.name,
+    depth: row.depth,
+    pathAncestors: chains.get(row.id) ?? [],
+    googleDriveFolderId: row.googleDriveFolderId ?? null,
+  }));
+}
+
+/**
+ * Writes the mapping, and loses the race gracefully.
+ *
+ * `ux_folders_google_drive_folder_id` is what decides the winner when two workers each created
+ * a Drive folder for the same application folder. The loser's UPDATE violates the index, and it
+ * then re-reads: returning its own id would scatter one folder's contents across two Drive
+ * folders, which is the outcome the whole adoption design exists to prevent.
+ */
+export async function recordDriveMappingInternal(input: {
+  folderId: string;
+  googleDriveFolderId: string;
+  googleDriveParentFolderId: string | null;
+}): Promise<string> {
+  const db = await getD1();
+  const now = new Date().toISOString();
+
+  try {
+    await db
+      .update(folders)
+      .set({
+        googleDriveFolderId: input.googleDriveFolderId,
+        googleDriveParentFolderId: input.googleDriveParentFolderId,
+        driveMappingStatus: 'mapped',
+        driveMappedAt: now,
+        updatedAt: now,
+      })
+      .where(eq(folders.id, input.folderId));
+    return input.googleDriveFolderId;
+  } catch (error) {
+    const [existing] = await db
+      .select({ googleDriveFolderId: folders.googleDriveFolderId })
+      .from(folders)
+      .where(eq(folders.id, input.folderId))
+      .limit(1);
+
+    if (existing?.googleDriveFolderId) {
+      getLogger().warn(
+        {
+          module: 'folders',
+          folderId: input.folderId,
+          discarded: input.googleDriveFolderId,
+          adopted: existing.googleDriveFolderId,
+        },
+        'Lost a folder-mirroring race; using the mapping that was recorded first',
+      );
+      return existing.googleDriveFolderId;
+    }
+    throw error;
+  }
 }
 
 export async function findByRootKeyInternal(rootKey: string): Promise<FolderRecord | null> {
@@ -1394,6 +1485,8 @@ export const d1FolderRepository: FolderRepository = {
   findByIdInternal,
   findByIdsInternal,
   findByDriveFolderIdInternal,
+  findDriveMappingsInternal,
+  recordDriveMappingInternal,
   findByRootKeyInternal,
   findByRootKeysInternal,
   listDescendantsInternal,

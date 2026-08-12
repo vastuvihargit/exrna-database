@@ -20,12 +20,12 @@ export const maxDuration = 300;
  * chunk after a dropped connection is expected and does not double-count.
  */
 export const PUT = withAuthenticatedRoute<{ sessionId: string; chunkIndex: string }>(
-  async (request: NextRequest, { actor, params }) => {
+  async (request: NextRequest, { actor, params, meta }) => {
     const sessionId = objectIdSchema.parse(params.sessionId);
     const { chunkIndex } = chunkParamsSchema.parse({ chunkIndex: params.chunkIndex });
 
     const chunk = await readBoundedBody(request, getEnv().uploadChunkBytes);
-    const result = await uploadService.receiveChunk(actor, sessionId, chunkIndex, chunk);
+    const result = await uploadService.receiveChunk(actor, sessionId, chunkIndex, chunk, meta);
 
     return ok(result);
   },

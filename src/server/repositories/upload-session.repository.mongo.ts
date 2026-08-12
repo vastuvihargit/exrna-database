@@ -52,6 +52,8 @@ function toRecord(doc: LeanSession): UploadSessionRecord {
     totalChunks: doc.totalChunks ?? 0,
     receivedChunks: doc.receivedChunks ?? [],
     quarantineKey: doc.quarantineKey ?? null,
+    externalUploadUri: doc.externalUploadUri ?? null,
+    externalStagedId: doc.externalStagedId ?? null,
     checksumSha256: doc.checksumSha256 ?? null,
     resultFileId: doc.resultFileId ? String(doc.resultFileId) : null,
     resultVersionId: doc.resultVersionId ? String(doc.resultVersionId) : null,

@@ -24,6 +24,7 @@ import type {
   AclEntryWrite,
   CreateFolderInput,
   EnsureRootInput,
+  FolderDriveMapping,
   FolderPage,
   FolderPatch,
   FolderRecord,
@@ -43,6 +44,7 @@ export type {
   AclEntryWrite,
   CreateFolderInput,
   EnsureRootInput,
+  FolderDriveMapping,
   FolderPage,
   FolderPatch,
   FolderRecord,
@@ -164,6 +166,26 @@ export function findByDriveFolderIdInternal(
   googleDriveFolderId: string,
 ): Promise<FolderRecord | null> {
   return active().findByDriveFolderIdInternal(googleDriveFolderId);
+}
+
+/**
+ * ⚠️ Authorization bypass: folder mirroring runs as the transfer worker, not as a user.
+ *
+ * Routed like every other read, which is what makes the Drive upload path work on either
+ * engine. Reading `FolderModel` directly here — as `folder-mirror.ts` used to — pinned the
+ * whole Drive storage backend to MongoDB, and Mongoose cannot run in a Worker.
+ */
+export function findDriveMappingsInternal(ids: string[]): Promise<FolderDriveMapping[]> {
+  return active().findDriveMappingsInternal(ids);
+}
+
+/** ⚠️ Authorization bypass: as above. Returns the mapping that is stored afterwards. */
+export function recordDriveMappingInternal(input: {
+  folderId: string;
+  googleDriveFolderId: string;
+  googleDriveParentFolderId: string | null;
+}): Promise<string> {
+  return active().recordDriveMappingInternal(input);
 }
 
 /** ⚠️ Authorization bypass: the caller has already authorized the drive itself. */

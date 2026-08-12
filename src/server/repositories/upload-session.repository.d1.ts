@@ -64,6 +64,8 @@ interface SessionRow {
   totalChunks: number;
   receivedChunks: string;
   quarantineKey: string | null;
+  externalUploadUri: string | null;
+  externalStagedId: string | null;
   checksumSha256: string | null;
   resultFileId: string | null;
   resultVersionId: string | null;
@@ -92,6 +94,8 @@ const recordColumns = {
   totalChunks: uploadSessions.totalChunks,
   receivedChunks: uploadSessions.receivedChunks,
   quarantineKey: uploadSessions.quarantineKey,
+  externalUploadUri: uploadSessions.externalUploadUri,
+  externalStagedId: uploadSessions.externalStagedId,
   checksumSha256: uploadSessions.checksumSha256,
   resultFileId: uploadSessions.resultFileId,
   resultVersionId: uploadSessions.resultVersionId,
@@ -133,6 +137,8 @@ function toRecord(row: SessionRow): UploadSessionRecord {
     totalChunks: row.totalChunks ?? 0,
     receivedChunks: parseChunks(row.receivedChunks),
     quarantineKey: row.quarantineKey,
+    externalUploadUri: row.externalUploadUri,
+    externalStagedId: row.externalStagedId,
     checksumSha256: row.checksumSha256,
     resultFileId: row.resultFileId,
     resultVersionId: row.resultVersionId,

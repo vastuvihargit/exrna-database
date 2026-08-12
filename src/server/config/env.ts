@@ -159,6 +159,30 @@ const envSchema = z
     /** Where *new* content is written. Existing records always read from their own field. */
     DEFAULT_STORAGE_PROVIDER: z.enum(['local', 'google_drive']).default('local'),
 
+    /**
+     * Where bytes are held while they are still untrusted — and, by consequence, whether a
+     * newly uploaded file has a local copy at all.
+     *
+     * This is **not** a duplicate of `DEFAULT_STORAGE_PROVIDER`, and conflating the two was
+     * tempting enough to be worth stating why it is wrong:
+     *
+     *   • `local` (the default) — bytes are streamed to local quarantine, scanned, moved into
+     *     `originals`, recorded, and *then* handed to Drive if `DEFAULT_STORAGE_PROVIDER` says
+     *     so. The local copy is retained for `LOCAL_COPY_RETENTION_DAYS`, and **that retained
+     *     copy is the entire rollback plan for the byte migration.** A Drive outage during this
+     *     window costs latency, not availability.
+     *
+     *   • `google_drive` — bytes are streamed straight into a Drive resumable upload in a
+     *     staging folder and promoted by re-parenting. Nothing is ever written to a disk, so
+     *     there is **no local copy and no local-copy fallback** for anything uploaded this way.
+     *
+     * A Cloudflare Worker has no persistent filesystem, so `google_drive` is the only value it
+     * can run with — `loadWorkerEnv` defaults to it and refuses `local`. On Node, `local`
+     * remains the default precisely because giving up the rollback copy should be a decision
+     * somebody made rather than one a deployment inherited.
+     */
+    UPLOAD_STAGING: z.enum(['local', 'google_drive']).default('local'),
+
     GOOGLE_WORKSPACE_DOMAIN: z.string().optional(),
     GOOGLE_SHARED_DRIVE_ID: z.string().optional(),
     /** A folder *inside* the Shared Drive. Blank means the drive's own root. */
@@ -260,6 +284,31 @@ const envSchema = z
         path: ['DEFAULT_STORAGE_PROVIDER'],
         message:
           'cannot be "google_drive" while GOOGLE_DRIVE_STORAGE_ENABLED is false — every new upload would fail',
+      });
+    }
+
+    if (v.UPLOAD_STAGING === 'google_drive' && !v.GOOGLE_DRIVE_STORAGE_ENABLED) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ['UPLOAD_STAGING'],
+        message:
+          'cannot be "google_drive" while GOOGLE_DRIVE_STORAGE_ENABLED is false — every upload would ' +
+          'have nowhere to be staged',
+      });
+    }
+
+    /**
+     * Staging in Drive while new content is recorded as local would produce versions whose
+     * `storageProvider` says `local` and whose bytes are in the Shared Drive. Every read would
+     * then look for a file on a disk that was never written.
+     */
+    if (v.UPLOAD_STAGING === 'google_drive' && v.DEFAULT_STORAGE_PROVIDER !== 'google_drive') {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ['UPLOAD_STAGING'],
+        message:
+          'is "google_drive" but DEFAULT_STORAGE_PROVIDER is "local" — content staged in Drive is ' +
+          'already in Drive and cannot be recorded as local. Set both, or neither.',
       });
     }
 

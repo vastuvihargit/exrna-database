@@ -27,7 +27,7 @@ import { Types } from 'mongoose';
 import { connectToDatabase } from '@/server/db/connection';
 import { FolderModel } from '@/server/db/models/folder.model';
 import { StorageError } from '@/server/errors/app-error';
-import { getLogger } from '@/server/logging/logger';
+import * as folderRepository from '@/server/repositories/folder.repository';
 import type { HierarchicalStorageProvider } from '@/server/storage/types';
 
 /**
@@ -37,44 +37,20 @@ import type { HierarchicalStorageProvider } from '@/server/storage/types';
  */
 export const DRIVE_MAX_FOLDER_DEPTH = 20;
 
-interface MappedFolder {
-  id: string;
-  name: string;
-  parentFolderId: string | null;
-  pathAncestors: string[];
-  depth: number;
-  googleDriveFolderId: string | null;
-}
+type MappedFolder = folderRepository.FolderDriveMapping;
 
+/**
+ * Reads through the folder repository rather than `FolderModel`.
+ *
+ * That is not a tidying change. This module sits underneath the Drive **upload** path as of
+ * Phase 7, and a Worker cannot load Mongoose at all — a direct model read here would have
+ * pinned the whole Google Drive storage backend to the MongoDB deployment while claiming to be
+ * the Worker's storage layer. Routing through the repository means the mirror follows
+ * `DATA_SOURCE_FOLDERS` like every other folder read.
+ */
 async function loadFolders(ids: string[]): Promise<Map<string, MappedFolder>> {
-  await connectToDatabase();
-  const docs = await FolderModel.find({ _id: { $in: ids.map((id) => new Types.ObjectId(id)) } })
-    .select({ name: 1, parentFolderId: 1, pathAncestors: 1, depth: 1, googleDriveFolderId: 1 })
-    .setOptions({ withDeleted: true })
-    .lean<
-      Array<{
-        _id: Types.ObjectId;
-        name: string;
-        parentFolderId: Types.ObjectId | null;
-        pathAncestors: Types.ObjectId[];
-        depth: number;
-        googleDriveFolderId?: string | null;
-      }>
-    >()
-    .exec();
-
-  const map = new Map<string, MappedFolder>();
-  for (const doc of docs) {
-    map.set(String(doc._id), {
-      id: String(doc._id),
-      name: doc.name,
-      parentFolderId: doc.parentFolderId ? String(doc.parentFolderId) : null,
-      pathAncestors: (doc.pathAncestors ?? []).map(String),
-      depth: doc.depth,
-      googleDriveFolderId: doc.googleDriveFolderId ?? null,
-    });
-  }
-  return map;
+  const rows = await folderRepository.findDriveMappingsInternal(ids);
+  return new Map(rows.map((row) => [row.id, row]));
 }
 
 export interface FolderMirror {
@@ -97,7 +73,6 @@ export async function ensureDriveFolderPath(input: {
 }): Promise<FolderMirror> {
   const { folderId, hierarchy } = input;
 
-  await connectToDatabase();
   const seed = await loadFolders([folderId]);
   const leaf = seed.get(folderId);
   if (!leaf) throw new StorageError('STORAGE_ERROR', 'The folder to mirror no longer exists');
@@ -156,41 +131,21 @@ export async function ensureDriveFolderPath(input: {
  *
  * Two workers mirroring the same folder both call `ensureFolder`; adoption by stamped id
  * means they usually get the *same* Drive folder back, but if both created one the unique
- * index rejects the second write. The loser re-reads the winner's id and uses that — the
- * folder it created is left orphaned in Drive, which a reconciliation sweep can adopt or
- * remove later. Returning a wrong id here would scatter one folder's contents across two.
+ * index rejects the second write. The repository re-reads the winner's id and returns that —
+ * the folder this worker created is left orphaned in Drive, which a reconciliation sweep can
+ * adopt or remove later. Returning a wrong id here would scatter one folder's contents across
+ * two, so the return value is always used rather than the id that was passed in.
  */
 async function recordMapping(input: {
   folderId: string;
   externalId: string;
   parentExternalId: string | null;
 }): Promise<string> {
-  try {
-    await FolderModel.updateOne(
-      { _id: new Types.ObjectId(input.folderId) },
-      {
-        $set: {
-          googleDriveFolderId: input.externalId,
-          googleDriveParentFolderId: input.parentExternalId,
-          driveMappingStatus: 'mapped',
-          driveMappedAt: new Date(),
-        },
-      },
-      { withDeleted: true } as never,
-    ).exec();
-    return input.externalId;
-  } catch (error) {
-    const winner = await loadFolders([input.folderId]);
-    const existing = winner.get(input.folderId)?.googleDriveFolderId;
-    if (existing) {
-      getLogger().warn(
-        { folderId: input.folderId, discarded: input.externalId, adopted: existing },
-        'Lost a folder-mirroring race; using the mapping that was recorded first',
-      );
-      return existing;
-    }
-    throw error;
-  }
+  return folderRepository.recordDriveMappingInternal({
+    folderId: input.folderId,
+    googleDriveFolderId: input.externalId,
+    googleDriveParentFolderId: input.parentExternalId,
+  });
 }
 
 export function assertMirrorableDepth(depth: number, name: string): void {

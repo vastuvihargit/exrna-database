@@ -416,6 +416,100 @@ export class FakeDriveClient implements DriveClient {
     );
   }
 
+  /* ------------------------------------------------- resumable sessions (chunked) */
+
+  /**
+   * Modelled as real state rather than as a no-op.
+   *
+   * The properties worth testing in the chunked upload path are *session* properties: a
+   * chunk replayed at an offset the session already holds must not corrupt the object, a
+   * chunk that arrives at the wrong offset must be refused, and a session must not produce a
+   * file until it has all the declared bytes. A fake that concatenated whatever it was
+   * handed would pass an implementation with none of that.
+   */
+  private readonly sessions = new Map<
+    string,
+    { name: string; parentId: string; mimeType: string; appProperties: Record<string, string>; declared?: number; buffer: Buffer[]; received: number; fileId: string | null }
+  >();
+
+  async beginResumableUpload(input: Omit<DriveUploadInput, 'body'>): Promise<string> {
+    this.record('beginResumableUpload');
+    globalSequence += 1;
+    const uri = `https://upload.example/session/${globalSequence}`;
+    this.sessions.set(uri, {
+      name: input.name,
+      parentId: input.parentId,
+      mimeType: input.mimeType,
+      appProperties: input.appProperties ?? {},
+      declared: input.size,
+      buffer: [],
+      received: 0,
+      fileId: null,
+    });
+    return uri;
+  }
+
+  async putResumableChunk(input: {
+    sessionUri: string;
+    chunk: Buffer;
+    offset: number;
+    totalBytes?: number;
+  }): Promise<DriveFileResource | null> {
+    this.record('putResumableChunk');
+    const session = this.sessions.get(input.sessionUri);
+    if (!session) {
+      throw new DriveApiError({ status: 404, reason: 'notFound', message: 'Upload session not found' });
+    }
+
+    // Already complete: the response to the final chunk was lost. Return the resource rather
+    // than appending the bytes a second time.
+    if (session.fileId) return this.toResource(this.require(session.fileId));
+
+    if (input.offset !== session.received) {
+      // A replay of bytes the session already holds is not an error in the real API either —
+      // it answers 308 with its own range and the client re-syncs. Anything *ahead* of the
+      // cursor would leave a hole, and that is a 400.
+      if (input.offset < session.received) return null;
+      throw new DriveApiError({
+        status: 400,
+        message: `Session holds ${session.received} bytes; chunk starts at ${input.offset}`,
+      });
+    }
+
+    session.buffer.push(Buffer.from(input.chunk));
+    session.received += input.chunk.length;
+
+    const total = input.totalBytes ?? session.declared;
+    if (total === undefined || session.received < total) return null;
+    if (session.received > total) {
+      throw new DriveApiError({ status: 400, message: `Session received ${session.received} of ${total} bytes` });
+    }
+
+    const item = this.insert({
+      name: session.name,
+      mimeType: session.mimeType,
+      parents: [session.parentId],
+      content: Buffer.concat(session.buffer, session.received),
+      appProperties: session.appProperties,
+    });
+    session.fileId = item.id;
+    session.buffer = [];
+    return this.toResource(item);
+  }
+
+  async queryResumableUpload(sessionUri: string, totalBytes?: number): Promise<{ file: DriveFileResource | null; receivedBytes: number }> {
+    this.record('queryResumableUpload');
+    const session = this.sessions.get(sessionUri);
+    if (!session) {
+      throw new DriveApiError({ status: 404, reason: 'notFound', message: 'Upload session not found' });
+    }
+    void totalBytes;
+    return {
+      file: session.fileId ? this.toResource(this.require(session.fileId)) : null,
+      receivedBytes: session.received,
+    };
+  }
+
   async downloadFile(fileId: string, range?: { start: number; end?: number }): Promise<NodeJS.ReadableStream> {
     this.record('downloadFile');
     const item = this.require(fileId);

@@ -66,7 +66,7 @@ async function uploadInto(
     { folderId, filename, size: content.byteLength },
     TEST_META,
   );
-  await uploadService.receiveStream(actor, ticket.sessionId, Readable.from(content));
+  await uploadService.receiveStream(actor, ticket.sessionId, Readable.from(content), TEST_META);
   const result = await uploadService.finalize(actor, ticket.sessionId, TEST_META);
   return { fileId: result.fileId, versionId: result.versionId };
 }
@@ -189,7 +189,7 @@ describe('download', () => {
       },
       TEST_META,
     );
-    await uploadService.receiveStream(alice, ticket.sessionId, Readable.from(secondBytes));
+    await uploadService.receiveStream(alice, ticket.sessionId, Readable.from(secondBytes), TEST_META);
     await uploadService.finalize(alice, ticket.sessionId, TEST_META);
 
     const old = await downloadService.download(

@@ -6,8 +6,11 @@
 # Remote environments do NOT read this file. Set each value with:
 #   npx wrangler secret put <NAME> --env development|staging|production
 #
-# Plain, non-secret values (NODE_ENV, APP_NAME, LOG_LEVEL) live in wrangler.jsonc
-# under "vars" and are not repeated here.
+# Plain, non-secret values (NODE_ENV, APP_NAME, LOG_LEVEL, and the three storage settings
+# GOOGLE_DRIVE_STORAGE_ENABLED / DEFAULT_STORAGE_PROVIDER / UPLOAD_STAGING) live in
+# wrangler.jsonc under "vars" and are not repeated here. All three are pinned to
+# google_drive there: a Worker has no filesystem, and env.worker.ts refuses any other value
+# at boot rather than letting every upload fail individually.
 
 # ── Application secrets ───────────────────────────────────────────────────────────────
 # Both at least 32 characters, and different from each other in production.

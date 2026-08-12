@@ -67,6 +67,19 @@ export const uploadSessions = sqliteTable(
     quarantineKey: text('quarantine_key'),
     checksumSha256: text('checksum_sha256'),
 
+    /**
+     * Staging handles for an upload that is being staged in an external provider rather than
+     * on a local disk — which is every upload in a Worker, because a Worker has no disk.
+     *
+     * `externalUploadUri` is the Drive resumable session URI, minted once and the only way to
+     * continue or query an interrupted transfer. `externalStagedId` is the id of the staged
+     * object, learned when the final chunk is acknowledged; `finalize` moves *that* object
+     * into the destination folder. Both NULL for a locally-staged upload, which is what
+     * `quarantine_key` describes instead. See migration 0005.
+     */
+    externalUploadUri: text('external_upload_uri'),
+    externalStagedId: text('external_staged_id'),
+
     resultFileId: text('result_file_id').references(() => files.id),
     resultVersionId: text('result_version_id').references(() => fileVersions.id),
     failureReason: text('failure_reason'),

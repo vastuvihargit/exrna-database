@@ -125,13 +125,18 @@ export async function startTestD1(): Promise<D1Database> {
 
   const database = (await instance.getD1Database('DB')) as unknown as D1Database;
 
-  for (const name of [
-    '0000_initial_schema.sql',
-    '0001_fts_triggers_and_seed.sql',
-    '0002_fix_user_roles_active_uniqueness.sql',
-    '0003_user_roles_scope_invariant.sql',
-    '0004_notification_dedupe_key.sql',
-  ]) {
+  // Read from the directory rather than a hand-maintained list. The list was a standing
+  // trap: adding a migration and forgetting to name it here produces a suite that runs
+  // against the *previous* schema and reports the same green ticks as one that did not.
+  const names = fs
+    .readdirSync(MIGRATIONS_DIR)
+    .filter((name) => name.endsWith('.sql'))
+    .sort();
+  if (names.length === 0) {
+    throw new Error(`No migrations found in ${MIGRATIONS_DIR}`);
+  }
+
+  for (const name of names) {
     const file = path.join(MIGRATIONS_DIR, name);
     const statements = splitStatements(fs.readFileSync(file, 'utf8'));
 

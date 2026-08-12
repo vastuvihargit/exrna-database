@@ -22,6 +22,7 @@ import { Types, type ClientSession, type FilterQuery } from 'mongoose';
 import type { PipelineStage } from 'mongoose';
 import { connectToDatabase } from '@/server/db/connection';
 import { FolderModel, type FolderDocument } from '@/server/db/models';
+import { getLogger } from '@/server/logging/logger';
 import type { AclEntry, Actor } from '@/server/permissions/actor';
 import {
   childVisibilityFilter,
@@ -32,6 +33,7 @@ import type { ConfidentialityLevel } from '@/server/domain/permissions';
 import type {
   CreateFolderInput,
   EnsureRootInput,
+  FolderDriveMapping,
   FolderPage,
   FolderPatch,
   FolderRecord,
@@ -172,6 +174,73 @@ export async function findByDriveFolderIdInternal(
     .lean<LeanFolder>()
     .exec();
   return doc ? toRecord(doc) : null;
+}
+
+export async function findDriveMappingsInternal(ids: string[]): Promise<FolderDriveMapping[]> {
+  const valid = ids.filter(isValidId).map(oid);
+  if (valid.length === 0) return [];
+  await connectToDatabase();
+
+  const docs = await FolderModel.find({ _id: { $in: valid } })
+    .select({ name: 1, parentFolderId: 1, pathAncestors: 1, depth: 1, googleDriveFolderId: 1 })
+    .setOptions({ withDeleted: true })
+    .lean<
+      Array<{
+        _id: Types.ObjectId;
+        name: string;
+        pathAncestors: Types.ObjectId[];
+        depth: number;
+        googleDriveFolderId?: string | null;
+      }>
+    >()
+    .exec();
+
+  return docs.map((doc) => ({
+    id: String(doc._id),
+    name: doc.name,
+    depth: doc.depth,
+    pathAncestors: (doc.pathAncestors ?? []).map(String),
+    googleDriveFolderId: doc.googleDriveFolderId ?? null,
+  }));
+}
+
+/** See the contract: the return value is what is stored afterwards, not what was passed in. */
+export async function recordDriveMappingInternal(input: {
+  folderId: string;
+  googleDriveFolderId: string;
+  googleDriveParentFolderId: string | null;
+}): Promise<string> {
+  await connectToDatabase();
+  try {
+    await FolderModel.updateOne(
+      { _id: oid(input.folderId) },
+      {
+        $set: {
+          googleDriveFolderId: input.googleDriveFolderId,
+          googleDriveParentFolderId: input.googleDriveParentFolderId,
+          driveMappingStatus: 'mapped',
+          driveMappedAt: new Date(),
+        },
+      },
+      { withDeleted: true } as never,
+    ).exec();
+    return input.googleDriveFolderId;
+  } catch (error) {
+    const [existing] = await findDriveMappingsInternal([input.folderId]);
+    if (existing?.googleDriveFolderId) {
+      getLogger().warn(
+        {
+          module: 'folders',
+          folderId: input.folderId,
+          discarded: input.googleDriveFolderId,
+          adopted: existing.googleDriveFolderId,
+        },
+        'Lost a folder-mirroring race; using the mapping that was recorded first',
+      );
+      return existing.googleDriveFolderId;
+    }
+    throw error;
+  }
 }
 
 export async function findByRootKeyInternal(rootKey: string): Promise<FolderRecord | null> {
@@ -832,6 +901,8 @@ export const mongoFolderRepository: FolderRepository = {
   findByIdInternal,
   findByIdsInternal,
   findByDriveFolderIdInternal,
+  findDriveMappingsInternal,
+  recordDriveMappingInternal,
   findByRootKeyInternal,
   findByRootKeysInternal,
   listDescendantsInternal,

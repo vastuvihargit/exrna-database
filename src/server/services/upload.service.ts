@@ -3,14 +3,31 @@
  *
  * The order matters and is the whole point (docs/phase-0/06-flows.md):
  *
- *   authorize → session → stream to quarantine → measure → verify → move → record
+ *   authorize → session → signature-check the head → stage → measure → scan → promote → record
  *
- * Nothing is accepted before permission, type and quota have been decided, the bytes
- * never touch the served tree, the size and checksum are what the server *measured*
- * rather than what the client claimed, and the metadata is written only once the bytes
- * are safely in place. A failure at any step leaves no half-file and no orphan record.
+ * Nothing is accepted before permission, type and quota have been decided, the bytes never
+ * touch the served tree, the size and checksum are what the server *measured* rather than what
+ * the client claimed, and the metadata is written only once the bytes are safely in place. A
+ * failure at any step leaves no half-file and no orphan record.
+ *
+ * ── What Phase 7 changed, and what it did not ───────────────────────────────────────────
+ *
+ * "Stage" used to be spelled `getStorageProvider()` — the local filesystem — in eight places,
+ * which made this the one request path a Cloudflare Worker could not run. It is now an
+ * `UploadStagingBackend`, chosen by `DEFAULT_STORAGE_PROVIDER`, with a local implementation
+ * that is the pipeline that has been serving production and a Drive implementation that stages
+ * into a resumable upload and promotes by re-parenting.
+ *
+ * Two things genuinely improved rather than merely moved:
+ *
+ *   • **The signature check runs before the body is staged at all.** The first 4 KB are
+ *     buffered in memory and checked against the declared extension, so a mistyped or
+ *     mislabelled file is refused before a byte is written or uploaded — rather than after it
+ *     has been written to disk and read back.
+ *   • **Drive is a destination, not a mirror.** `handOffToDrive` still exists and is unchanged,
+ *     but it now runs only for uploads that were staged locally. Content staged in Drive is
+ *     already there and is recorded as such; there is nothing to hand off.
  */
-import { createHash } from 'crypto';
 import { Readable } from 'stream';
 
 import { getEnv } from '@/server/config/env';
@@ -21,7 +38,6 @@ import {
   NotFoundError,
   PayloadTooLargeError,
   QuotaExceededError,
-  ServiceUnavailableError,
   UnsupportedMediaTypeError,
   ValidationError,
 } from '@/server/errors/app-error';
@@ -43,17 +59,19 @@ import * as folderRepository from '@/server/repositories/folder.repository';
 import * as reviewRepository from '@/server/repositories/review.repository';
 import * as sessionRepository from '@/server/repositories/upload-session.repository';
 import * as usageRepository from '@/server/repositories/storage-usage.repository';
-import { getStorageProvider, storageRegistry } from '@/server/storage';
+import { getObjectStore, storageRegistry } from '@/server/storage';
 import { getGoogleDriveStorage, isDriveStorageEnabled } from '@/server/storage/google';
+import {
+  getUploadStaging,
+  offsetForChunk,
+  peekHead,
+  type PromotedObject,
+  type StagingHandles,
+  type StagingSession,
+} from '@/server/storage/staging';
 import { requireDriveStore, transferVersion } from './storage-migration/transfer';
 import { queueForDrive } from './storage-migration/pending-transfers';
-import {
-  buildOriginalKey,
-  buildQuarantineKey,
-  buildTemporaryChunkKey,
-  newStorageId,
-} from '@/server/storage/keys';
-import type { StorageArea } from '@/server/storage/types';
+import { newStorageId } from '@/server/storage/keys';
 import { extractExtension, sanitizeFilename } from '@/server/storage/path-safety';
 import { getLogger } from '@/server/logging/logger';
 import { getMalwareScanner, verdictBlocksContent } from '@/server/security/malware-scanner';
@@ -61,7 +79,15 @@ import type { RequestMeta } from '@/server/http/request-meta';
 import { requireFolder } from './folder-access';
 import { requireFile } from './file-access';
 
-/** Bytes read back from quarantine to check the file really is what it claims. */
+/**
+ * Bytes inspected to check the file really is what it claims.
+ *
+ * Buffered from the front of the stream *before* staging, and read back from staging again at
+ * finalization. Both, deliberately: the first refusal is cheap and stops a mislabelled file
+ * being transferred at all, and the second is the gate — it inspects what was actually stored
+ * rather than what was presented, which is the only version of the check a chunked upload can
+ * have at all.
+ */
 const SIGNATURE_SAMPLE_BYTES = 4096;
 
 export interface AuthorizeUploadInput {
@@ -153,7 +179,7 @@ export async function authorizeUpload(
 
   // 4. Quota and physical headroom.
   await assertQuota(actor, folder.folder.departmentId, input.size);
-  await assertDiskHeadroom(input.size);
+  await assertStagingHeadroom(input.size);
 
   const displayName = await resolveDisplayName(folder.folder.id, safeFilename, Boolean(input.targetFileId));
   const chunkSize = input.chunked ? env.uploadChunkBytes : 0;
@@ -204,48 +230,60 @@ export async function authorizeUpload(
 /**
  * Single-shot streaming upload.
  *
- * The body is piped straight into quarantine; the provider hashes and counts as it
- * writes and aborts past `expectedSize`, so an oversized or lying client is stopped
- * mid-stream rather than after the disk has filled.
+ * The head is buffered and signature-checked first, so a mislabelled file is refused before a
+ * byte is staged. The rest of the body is then streamed into the staging backend, which hashes
+ * and counts as it goes and aborts past `expectedSize` — so an oversized or lying client is
+ * stopped mid-stream rather than after the disk (or the Shared Drive) has filled.
  */
 export async function receiveStream(
   actor: Actor,
   sessionId: string,
   body: Readable,
+  meta: RequestMeta,
 ): Promise<{ receivedBytes: number; checksumSha256: string }> {
   const session = await requireOwnSession(actor, sessionId, ['pending', 'uploading']);
-  const storage = getStorageProvider();
-  const quarantine = buildQuarantineKey({ uploadSessionId: physicalId(session.id) });
+  const staging = getUploadStaging();
+
+  // Before anything is staged. A .exe renamed to .csv is refused here, having cost one buffer
+  // rather than a full transfer.
+  const peeked = await peekHead(body, SIGNATURE_SAMPLE_BYTES);
+  await assertSignature(actor, session, peeked.head, meta);
 
   try {
-    const stored = await storage.saveFile({
-      key: quarantine.key,
-      area: quarantine.area,
-      body,
-      expectedSize: session.declaredSize,
-      contentType: session.resolvedMimeType,
+    const staged = await staging.receive({
+      session: stagingView(session),
+      body: peeked.body,
+      displayName: session.displayName,
     });
 
     await sessionRepository.update(sessionId, {
       status: 'uploading',
-      receivedBytes: stored.size,
-      checksumSha256: stored.checksumSha256,
-      quarantineKey: quarantine.key,
+      receivedBytes: staged.size,
+      checksumSha256: staged.checksumSha256,
+      ...staged.handles,
     });
 
-    return { receivedBytes: stored.size, checksumSha256: stored.checksumSha256 };
+    return { receivedBytes: staged.size, checksumSha256: staged.checksumSha256 };
   } catch (error) {
     await failSession(sessionId, error instanceof Error ? error.message : 'Upload failed');
     throw error;
   }
 }
 
-/** One chunk of a resumable upload. Re-sending a chunk is safe and does not double-count. */
+/**
+ * One chunk of a resumable upload. Re-sending a chunk is safe and does not double-count.
+ *
+ * The chunk's byte offset is derived from the size agreed at authorization rather than taken
+ * from the client, because on a provider-side resumable session the offset *is* the write
+ * position: accepting a client-chosen one would let a caller write over bytes it had already
+ * sent, or leave a hole the checksum would then be computed across.
+ */
 export async function receiveChunk(
   actor: Actor,
   sessionId: string,
   chunkIndex: number,
   chunk: Buffer,
+  meta: RequestMeta,
 ): Promise<{ receivedChunks: number[]; totalChunks: number }> {
   const session = await requireOwnSession(actor, sessionId, ['pending', 'uploading']);
   if (session.chunkSize <= 0) {
@@ -258,18 +296,24 @@ export async function receiveChunk(
     throw new PayloadTooLargeError('Chunk is larger than the agreed chunk size');
   }
 
-  const storage = getStorageProvider();
-  const key = buildTemporaryChunkKey({ uploadSessionId: physicalId(session.id), chunkIndex });
+  // The first chunk carries the head, so the cheap refusal is available here too.
+  if (chunkIndex === 0) {
+    await assertSignature(actor, session, chunk.subarray(0, SIGNATURE_SAMPLE_BYTES), meta);
+  }
 
-  // A retried chunk overwrites nothing: the previous attempt is removed first, so the
-  // exclusive-create rule in the provider still holds.
-  await storage.deleteFile(key.key, key.area).catch(() => undefined);
-  await storage.saveFile({
-    key: key.key,
-    area: key.area,
-    body: Readable.from(chunk),
-    expectedSize: chunk.byteLength,
+  const staged = await getUploadStaging().receiveChunk({
+    session: stagingView(session),
+    chunkIndex,
+    expectedOffset: offsetForChunk(chunkIndex, session.chunkSize),
+    chunk,
+    displayName: session.displayName,
   });
+
+  // Handles first: a crash between the provider accepting bytes and the session recording
+  // where they went would strand them, with nothing left to find them by.
+  if (hasHandles(staged.handles)) {
+    await sessionRepository.update(sessionId, staged.handles);
+  }
 
   const alreadyReceived = session.receivedChunks.includes(chunkIndex);
   const updated = await sessionRepository.recordChunk(
@@ -340,7 +384,7 @@ async function buildFileFromSession(
   session: sessionRepository.UploadSessionRecord,
   meta: RequestMeta,
 ): Promise<FinalizedUpload> {
-  const storage = getStorageProvider();
+  const staging = getUploadStaging();
   const folderContext = await requireFolder(
     actor,
     session.folderId,
@@ -348,19 +392,25 @@ async function buildFileFromSession(
   );
   const folder = folderContext.folder;
 
-  // Chunked uploads are assembled into the same quarantine object a single-shot
-  // upload would have produced, so everything below has one code path.
-  const quarantine = buildQuarantineKey({ uploadSessionId: physicalId(session.id) });
+  // Chunked uploads are assembled into the same single staged object a single-shot upload
+  // would have produced, so everything below has one code path.
+  let stagingSession = stagingView(session);
   let measuredSize = session.receivedBytes;
   let checksum = session.checksumSha256;
 
   if (session.chunkSize > 0) {
-    const assembled = await assembleChunks(session);
+    const assembled = await staging.assemble(stagingSession);
     measuredSize = assembled.size;
     checksum = assembled.checksumSha256;
+    stagingSession = applyHandles(stagingSession, assembled.handles);
+    await sessionRepository.update(session.id, {
+      receivedBytes: assembled.size,
+      checksumSha256: assembled.checksumSha256,
+      ...assembled.handles,
+    });
   }
 
-  if (!(await storage.fileExists(quarantine.key, quarantine.area))) {
+  if (!(await staging.exists(stagingSession))) {
     throw new ConflictError('No uploaded content was received for this upload');
   }
   if (measuredSize === 0) {
@@ -380,18 +430,21 @@ async function buildFileFromSession(
 
   await assertQuota(actor, folder.departmentId, measuredSize);
 
-  const head = await readHead(quarantine.key, quarantine.area, measuredSize);
+  // Read back from staging — what was actually stored, not what was presented. For a chunked
+  // upload this is the only signature check there can be, because the head arrived in its own
+  // request before any of the rest existed.
+  const head = await staging.readHead(stagingSession, Math.min(SIGNATURE_SAMPLE_BYTES, measuredSize));
   const verdict = verifySignature(session.extension, head);
   if (!verdict.ok) {
     await rejectSession(actor, session, verdict.reason, meta);
     throw new UnsupportedMediaTypeError(verdict.reason);
   }
 
-  // Scanned while still in quarantine, before the move. An infected file therefore never
-  // exists at a key any download endpoint could resolve — there is no window in which it
-  // could be served, however briefly.
+  // Scanned while still staged, before the promotion. An infected file therefore never exists
+  // at an address any download endpoint could resolve — every read path resolves bytes through
+  // a version record, and no version record points into staging.
   const scan = await getMalwareScanner().scan(
-    await storage.getFile(quarantine.key, quarantine.area),
+    await staging.openRead(stagingSession),
     session.displayName,
   );
   const blocking = verdictBlocksContent(scan);
@@ -402,19 +455,19 @@ async function buildFileFromSession(
 
   const fileId = session.targetFileId ?? fileRepository.newId();
   const physicalName = newStorageId();
-  const destination = buildOriginalKey({
+
+  // The moment the file stops being untrusted: a same-volume rename locally, a re-parent in
+  // Drive. Either way no bytes are re-read and nothing is copied.
+  const stored: PromotedObject = await staging.promote(stagingSession, {
     organizationId: folder.organizationId,
     departmentId: folder.departmentId,
+    folderId: folder.id,
     fileId,
     versionId: physicalName,
+    displayName: session.displayName,
+    contentType: session.resolvedMimeType,
+    sizeBytes: measuredSize,
   });
-
-  // The move is a rename inside the same volume: atomic, and it is the moment the file
-  // stops being untrusted.
-  await storage.moveFile(
-    { key: quarantine.key, area: quarantine.area },
-    { key: destination.key, area: destination.area },
-  );
 
   try {
     const result = await withTransaction(async (dbSession) => {
@@ -449,9 +502,9 @@ async function buildFileFromSession(
       const versionFields = {
         organizationId: folder.organizationId,
         fileId,
-        storageKey: destination.key,
-        storageArea: destination.area,
-        relativeStoragePath: `${destination.area}/${destination.key}`,
+        storageKey: stored.key,
+        storageArea: stored.area,
+        relativeStoragePath: `${stored.area}/${stored.key}`,
         storedFilename: physicalName,
         originalFilename: session.declaredFilename,
         fileSize: measuredSize,
@@ -461,6 +514,20 @@ async function buildFileFromSession(
         checksumSha256: checksum,
         uploadedBy: actor.userId,
         ...(session.versionNote ? { versionNote: session.versionNote } : {}),
+        /**
+         * Where the bytes actually are.
+         *
+         * For a locally-staged upload this is `local` and the Drive fields are absent, exactly
+         * as before — `handOffToDrive` below may copy it later. For a Drive-staged upload the
+         * bytes are already in the Shared Drive at a real id, and recording it as `local` would
+         * make every subsequent read look for a file on a disk that does not exist.
+         */
+        storageProvider: stored.provider,
+        ...(stored.externalId ? { googleDriveFileId: stored.externalId } : {}),
+        ...(stored.externalParentId ? { googleDriveParentId: stored.externalParentId } : {}),
+        ...(stored.externalRevisionId ? { googleDriveRevisionId: stored.externalRevisionId } : {}),
+        ...(stored.externalWebViewLink ? { googleDriveWebViewLink: stored.externalWebViewLink } : {}),
+        ...(stored.checksumMd5 ? { googleDriveMd5: stored.checksumMd5 } : {}),
       };
 
       const fileFields = {
@@ -529,7 +596,11 @@ async function buildFileFromSession(
           status: 'ready',
           receivedBytes: measuredSize,
           checksumSha256: checksum,
+          // Cleared together. A staged handle left behind after promotion names an object the
+          // file now points at, and the cleanup sweep would delete it.
           quarantineKey: null,
+          externalUploadUri: null,
+          externalStagedId: null,
           resultFileId: fileId,
           resultVersionId: version.id,
         },
@@ -569,7 +640,7 @@ async function buildFileFromSession(
       })
       .catch(() => undefined);
 
-    await cleanupChunks(session);
+    await cleanupChunks(stagingSession);
 
     /**
      * Hand the file on to Google Drive, if that is where new content belongs.
@@ -584,14 +655,19 @@ async function buildFileFromSession(
      * unscanned file at a real Drive id — visible in the Drive web UI, syncable to
      * desktops, indexable — during the scan window is exactly what decision D1 refuses.
      */
-    await handOffToDrive({
-      versionId: result.version.id,
-      fileId,
-      folderId: folder.id,
-      displayName: session.displayName,
-      organizationId: folder.organizationId,
-      sizeBytes: measuredSize,
-    });
+    // Only for content that was staged locally. A Drive-staged upload is already in the Shared
+    // Drive at the id just recorded; handing it off would look for a local file that was never
+    // written and queue a transfer that can never succeed.
+    if (stored.provider === 'local') {
+      await handOffToDrive({
+        versionId: result.version.id,
+        fileId,
+        folderId: folder.id,
+        displayName: session.displayName,
+        organizationId: folder.organizationId,
+        sizeBytes: measuredSize,
+      });
+    }
 
     return {
       fileId,
@@ -603,11 +679,23 @@ async function buildFileFromSession(
       isNewFile: result.isNewFile,
     };
   } catch (error) {
-    // The bytes are already in place but no record points at them: remove them, or the
-    // volume slowly fills with files nothing can ever reference.
-    await storage.deleteFile(destination.key, destination.area).catch(() => undefined);
+    // The bytes are already in place but no record points at them: remove them, or storage
+    // slowly fills with objects nothing can ever reference. The promoted object is addressed
+    // by what `promote` returned, because it is no longer where staging left it.
+    await removePromoted(stored).catch(() => undefined);
     throw error;
   }
+}
+
+/** Undoes a promotion whose database write failed. Best effort, and never throws. */
+async function removePromoted(stored: PromotedObject): Promise<void> {
+  const locator = {
+    provider: stored.provider,
+    key: stored.key,
+    area: stored.area,
+    ...(stored.externalId ? { externalId: stored.externalId } : {}),
+  };
+  await getObjectStore(stored.provider).remove(locator);
 }
 
 /**
@@ -690,7 +778,12 @@ export async function abort(actor: Actor, sessionId: string): Promise<void> {
   }
 
   await discardBytes(session);
-  await sessionRepository.update(sessionId, { status: 'aborted', quarantineKey: null });
+  await sessionRepository.update(sessionId, {
+    status: 'aborted',
+    quarantineKey: null,
+    externalUploadUri: null,
+    externalStagedId: null,
+  });
 }
 
 export async function getStatus(
@@ -759,19 +852,15 @@ async function assertQuota(
   }
 }
 
-/** Refuses an upload that would take the volume below its configured free-space floor. */
-async function assertDiskHeadroom(bytes: number): Promise<void> {
-  const env = getEnv();
-  const capacity = await getStorageProvider().getCapacity('originals');
-  if (capacity.freeBytes - bytes < env.minFreeDiskBytes) {
-    getLogger().error(
-      { freeBytes: capacity.freeBytes, requiredBytes: bytes },
-      'Refusing upload: server storage is below the free-space floor',
-    );
-    throw new ServiceUnavailableError(
-      'The server is low on storage. An administrator has been alerted; try again later.',
-    );
-  }
+/**
+ * Refuses an upload the staging backend has no room for.
+ *
+ * Delegated rather than inlined because "room" means different things: a free-space floor on a
+ * local volume, and nothing checkable at all in Drive, where Google enforces the quota and
+ * reports it as an upload failure. See `UploadStagingBackend.assertHeadroom`.
+ */
+async function assertStagingHeadroom(bytes: number): Promise<void> {
+  await getUploadStaging().assertHeadroom(bytes);
 }
 
 /**
@@ -789,107 +878,84 @@ async function resolveDisplayName(
   return nextAvailableName(base, taken);
 }
 
-/** Physical ids must be filesystem-safe; storage keys never contain a Mongo id verbatim. */
-function physicalId(sessionId: string): string {
-  return sessionId;
+/**
+ * The narrow view of a session a staging backend is allowed to see.
+ *
+ * Staging has no business reading the actor, the destination folder or any of the fields
+ * `authorizeUpload` decided against a permission check. Passing a projection rather than the
+ * record is what stops it growing a second opinion about any of them.
+ */
+function stagingView(session: sessionRepository.UploadSessionRecord): StagingSession {
+  return {
+    id: session.id,
+    resolvedMimeType: session.resolvedMimeType,
+    declaredSize: session.declaredSize,
+    chunkSize: session.chunkSize,
+    totalChunks: session.totalChunks,
+    receivedChunks: session.receivedChunks,
+    quarantineKey: session.quarantineKey,
+    externalUploadUri: session.externalUploadUri,
+    externalStagedId: session.externalStagedId,
+  };
+}
+
+/** `undefined` means "unchanged"; an explicit `null` clears. See `StagingHandles`. */
+function applyHandles(session: StagingSession, handles: StagingHandles): StagingSession {
+  return {
+    ...session,
+    ...(handles.quarantineKey !== undefined ? { quarantineKey: handles.quarantineKey } : {}),
+    ...(handles.externalUploadUri !== undefined
+      ? { externalUploadUri: handles.externalUploadUri }
+      : {}),
+    ...(handles.externalStagedId !== undefined
+      ? { externalStagedId: handles.externalStagedId }
+      : {}),
+  };
+}
+
+function hasHandles(handles: StagingHandles): boolean {
+  return (
+    handles.quarantineKey !== undefined ||
+    handles.externalUploadUri !== undefined ||
+    handles.externalStagedId !== undefined
+  );
 }
 
 /**
- * Reads the first bytes of a quarantined object for signature checking.
+ * The early signature refusal, shared by both receive paths.
  *
- * The range is clamped to the object's own size: the storage provider treats a range
- * ending past EOF as a programming error rather than clamping it (which is the right
- * default for an internal contract), so asking for 4 KB of a 20-byte CSV would fail the
- * upload rather than inspect it.
+ * Records the same `upload.rejected` audit event the finalization check does, because a refusal
+ * that leaves no trace is indistinguishable from an upload nobody attempted — and the quarantine
+ * review exists precisely to see attempts.
  */
-async function readHead(key: string, area: StorageArea, size: number): Promise<Buffer> {
-  const end = Math.min(SIGNATURE_SAMPLE_BYTES, size) - 1;
-  if (end < 0) return Buffer.alloc(0);
-
-  const stream = await getStorageProvider().getFile(key, area, {
-    range: { start: 0, end },
-  });
-  const chunks: Buffer[] = [];
-  for await (const chunk of stream as unknown as AsyncIterable<Buffer>) {
-    chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
-    if (Buffer.concat(chunks).byteLength >= SIGNATURE_SAMPLE_BYTES) break;
-  }
-  return Buffer.concat(chunks).subarray(0, SIGNATURE_SAMPLE_BYTES);
-}
-
-/**
- * Concatenates the received chunks into one quarantined object.
- *
- * Streamed chunk by chunk rather than buffered: a 2 GB resumable upload must not need
- * 2 GB of server memory to be assembled.
- */
-async function assembleChunks(
+async function assertSignature(
+  actor: Actor,
   session: sessionRepository.UploadSessionRecord,
-): Promise<{ size: number; checksumSha256: string }> {
-  const missing = [];
-  for (let index = 0; index < session.totalChunks; index += 1) {
-    if (!session.receivedChunks.includes(index)) missing.push(index);
-  }
-  if (missing.length > 0) {
-    throw new ConflictError(
-      `The upload is missing ${missing.length} chunk(s). Resume it before finalizing.`,
-    );
-  }
+  head: Buffer,
+  meta: RequestMeta,
+): Promise<void> {
+  // Nothing to inspect yet. A zero-length head is not a pass, it is an absent answer, and the
+  // authoritative check at finalization reads what was actually stored.
+  if (head.byteLength === 0) return;
 
-  const storage = getStorageProvider();
-  const quarantine = buildQuarantineKey({ uploadSessionId: physicalId(session.id) });
-  await storage.deleteFile(quarantine.key, quarantine.area).catch(() => undefined);
+  const verdict = verifySignature(session.extension, head);
+  if (verdict.ok) return;
 
-  const handle = await storage.createWriteStream(quarantine.key, quarantine.area);
-  const hash = createHash('sha256');
-  let size = 0;
-
-  try {
-    for (let index = 0; index < session.totalChunks; index += 1) {
-      const chunkKey = buildTemporaryChunkKey({
-        uploadSessionId: physicalId(session.id),
-        chunkIndex: index,
-      });
-      const stream = await storage.getFile(chunkKey.key, chunkKey.area);
-      for await (const piece of stream as unknown as AsyncIterable<Buffer>) {
-        const buffer = Buffer.isBuffer(piece) ? piece : Buffer.from(piece);
-        hash.update(buffer);
-        size += buffer.byteLength;
-        await handle.write(buffer);
-      }
-    }
-    await handle.commit();
-  } catch (error) {
-    await handle.abort().catch(() => undefined);
-    throw error;
-  }
-
-  const checksumSha256 = hash.digest('hex');
-  await sessionRepository.update(session.id, {
-    receivedBytes: size,
-    checksumSha256,
-    quarantineKey: quarantine.key,
-  });
-  return { size, checksumSha256 };
+  await rejectSession(actor, session, verdict.reason, meta);
+  throw new UnsupportedMediaTypeError(verdict.reason);
 }
 
-async function cleanupChunks(session: sessionRepository.UploadSessionRecord): Promise<void> {
+async function cleanupChunks(session: StagingSession): Promise<void> {
   if (session.chunkSize <= 0) return;
-  const storage = getStorageProvider();
-  for (let index = 0; index < session.totalChunks; index += 1) {
-    const chunkKey = buildTemporaryChunkKey({
-      uploadSessionId: physicalId(session.id),
-      chunkIndex: index,
-    });
-    await storage.deleteFile(chunkKey.key, chunkKey.area).catch(() => undefined);
-  }
+  // `discard` removes chunk objects as well as the assembled one, and the assembled one has
+  // already been promoted away by the time this runs.
+  await getUploadStaging()
+    .discard({ ...session, quarantineKey: null, externalStagedId: null })
+    .catch(() => undefined);
 }
 
 async function discardBytes(session: sessionRepository.UploadSessionRecord): Promise<void> {
-  const storage = getStorageProvider();
-  const quarantine = buildQuarantineKey({ uploadSessionId: physicalId(session.id) });
-  await storage.deleteFile(quarantine.key, quarantine.area).catch(() => undefined);
-  await cleanupChunks(session);
+  await getUploadStaging().discard(stagingView(session)).catch(() => undefined);
 }
 
 async function failSession(sessionId: string, reason: string): Promise<void> {
@@ -910,6 +976,8 @@ async function rejectSession(
     status: 'rejected',
     failureReason: reason.slice(0, 500),
     quarantineKey: null,
+    externalUploadUri: null,
+    externalStagedId: null,
   });
 
   await auditService.recordForActor(actor, meta, {

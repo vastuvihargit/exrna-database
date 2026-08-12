@@ -55,6 +55,17 @@ export interface UploadSessionRecord {
   totalChunks: number;
   receivedChunks: number[];
   quarantineKey: string | null;
+  /**
+   * Where the bytes are being staged when staging is *not* a local disk.
+   *
+   * `externalUploadUri` is the provider's resumable session handle and `externalStagedId` the
+   * id of the staged object once the provider has acknowledged the whole body. They are on the
+   * session because `receiveStream`/`receiveChunk` and `finalize` are separate HTTP requests
+   * and neither handle can be recomputed from the session id. Both null for a locally-staged
+   * upload — see migration 0005.
+   */
+  externalUploadUri: string | null;
+  externalStagedId: string | null;
   checksumSha256: string | null;
   resultFileId: string | null;
   resultVersionId: string | null;
@@ -99,6 +110,8 @@ export interface UploadSessionPatch {
   receivedBytes?: number;
   checksumSha256?: string | null;
   quarantineKey?: string | null;
+  externalUploadUri?: string | null;
+  externalStagedId?: string | null;
   failureReason?: string | null;
   resultFileId?: string | null;
   resultVersionId?: string | null;

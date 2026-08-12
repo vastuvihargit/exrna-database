@@ -66,6 +66,19 @@ export interface FolderRecord {
 }
 
 /**
+ * What folder mirroring needs, and nothing else.
+ *
+ * `pathAncestors` is ordered root → parent, so `[...pathAncestors, id]` is the chain to walk.
+ */
+export interface FolderDriveMapping {
+  id: string;
+  name: string;
+  depth: number;
+  pathAncestors: string[];
+  googleDriveFolderId: string | null;
+}
+
+/**
  * An engine-specific transaction handle, threaded through unchanged.
  *
  * **MongoDB** — a `ClientSession`, exactly as before. `folder.service.ts` still opens a
@@ -291,6 +304,33 @@ export interface FolderRepository {
    * reported.
    */
   findByDriveFolderIdInternal(googleDriveFolderId: string): Promise<FolderRecord | null>;
+
+  /**
+   * The Drive-mirroring view of a set of folders: name, depth and current mapping.
+   *
+   * A separate shape rather than fields on `FolderRecord`, for the reason stated at the top of
+   * the file-version contract: `googleDriveFolderId` identifies *where a mirror is*, and adding
+   * it to the record every listing returns would put storage-side identifiers into API
+   * responses that have no business carrying them.
+   *
+   * Trashed folders are included. A version being transferred may live under a folder that has
+   * since been trashed, and refusing to mirror it would strand the transfer.
+   */
+  findDriveMappingsInternal(ids: string[]): Promise<FolderDriveMapping[]>;
+
+  /**
+   * Records the Drive folder one application folder maps to.
+   *
+   * Returns the id that is **actually stored afterwards**, which is not always the one passed
+   * in: two workers mirroring the same folder can each create one, and the loser must adopt
+   * the winner's rather than scatter one folder's contents across two. Implementations that
+   * cannot detect the race re-read and return what they find.
+   */
+  recordDriveMappingInternal(input: {
+    folderId: string;
+    googleDriveFolderId: string;
+    googleDriveParentFolderId: string | null;
+  }): Promise<string>;
 
   /** Drive roots, by key. The caller has already authorized the drive itself. */
   findByRootKeyInternal(rootKey: string): Promise<FolderRecord | null>;

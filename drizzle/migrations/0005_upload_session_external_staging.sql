@@ -1,0 +1,40 @@
+-- ---------------------------------------------------------------------------------------
+-- Phase 7 — the two handles a Worker upload needs to survive between requests.
+--
+-- ── Why the upload pipeline needs new columns at all ────────────────────────────────────
+--
+-- Until now the pipeline staged bytes on a local disk: `quarantine_key` named a file, and
+-- `receiveStream` and `finalize` — separate HTTP requests — both found it by rebuilding that
+-- key from the session id. A Worker has no disk, so staging moves into a Google Drive
+-- resumable upload, and a resumable upload has *two* pieces of state that neither request can
+-- recompute:
+--
+--   • `external_upload_uri`   the resumable session URI Drive minted. It is opaque, it is the
+--                             only way to continue or to query an interrupted transfer, and it
+--                             is issued once per upload.
+--   • `external_staged_id`    the Drive file id of the staged object, learned when the last
+--                             chunk is acknowledged. `finalize` moves *this* object into the
+--                             destination folder; without it there is nothing to move.
+--
+-- ── Why not overload `quarantine_key` ───────────────────────────────────────────────────
+--
+-- Writing `drive:<id>` into the existing nullable column would have made single-shot uploads
+-- work with no migration, and it was rejected. It makes one column mean two different things
+-- depending on a flag, and the chunked path needs a *second* handle regardless — which would
+-- push it to encoding JSON in a string column. Two named, nullable columns cost one migration
+-- and stay legible; the alternative costs nothing now and has to be undone later.
+--
+-- ── Backfill ────────────────────────────────────────────────────────────────────────────
+--
+-- None, and none is possible. Both columns describe an upload *in flight* against a specific
+-- provider. Every existing row was staged on local disk and is correctly described by
+-- `quarantine_key` with both of these NULL, which is exactly what the local staging backend
+-- still writes today.
+--
+-- No index. Neither column is ever a search key: both are read only through the session row
+-- the request already holds by id.
+-- ---------------------------------------------------------------------------------------
+
+ALTER TABLE upload_sessions ADD COLUMN external_upload_uri TEXT;
+--> statement-breakpoint
+ALTER TABLE upload_sessions ADD COLUMN external_staged_id TEXT;
