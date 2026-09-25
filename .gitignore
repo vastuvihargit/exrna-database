@@ -60,3 +60,6 @@ Thumbs.db
 *.pem
 .tsbuildinfo
 *.tsbuildinfo
+
+# Mongo → D1 migration reports (source ids and failure payloads)
+/migration-reports/
