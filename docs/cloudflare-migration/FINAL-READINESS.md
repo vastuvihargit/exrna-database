@@ -1,30 +1,21 @@
 # Deployment readiness — Biotech Research Drive on Cloudflare
 
-**Status: NOT READY.**
+**Status: NOT READY.** Interim revision after the migration-tooling commit (`03adb14`); a full
+rewrite follows once the remaining code items are done.
 
-Not because anything migrated so far is wrong — every migrated module is implemented, tested
-against a real D1 engine and a real MongoDB, and green — but because a Cloudflare Worker
-deployment still has requirements this repository does not meet. Two remain, both demonstrable
-rather than speculative:
+Both repository blockers named by the previous revision are now closed:
 
-1. **Uploads cannot work in a Worker.** The pipeline streams to a local quarantine directory,
-   reads the head back off disk to check the file signature, scans it, moves it to a local
-   `originals` directory, and only *then* mirrors to Google Drive. Google Drive is a mirror
-   after a local write. `16-phase-7-storage-audit.md` is the full classification and
-   §6.1 records what the replacement has to be, including the one schema change it needs.
-2. **No Mongo → D1 metadata migration tooling exists.** There is no loader, so no cutover can
-   be rehearsed, let alone performed.
+1. ~~Uploads cannot work in a Worker.~~ **Fixed by `e023975`** — uploads stage directly into a
+   Google Drive staging folder behind `UPLOAD_STAGING=google_drive` and are promoted by
+   re-parenting. See `20-phase-7-worker-uploads.md`.
+2. ~~No Mongo → D1 metadata migration tooling exists.~~ **Code complete and tested locally
+   (`03adb14`)** — validate, migrate (dry run by default), resume, delta pass and verify. It has
+   been dry-run against the development MongoDB; it has not been run against a production
+   snapshot. See `21-phase-9-mongo-to-d1-migration.md`.
 
-Neither is an external blocker. Both are repository work. §6 states what remains with enough
-detail to plan it, and §7 lists the two things that genuinely need a human.
-
-**The repository migration list is now closed** (was item 3 in the previous revision of this
-document). Every repository a Worker can reach has a D1 implementation. The two that do not —
-`migration` and `storage-migration` — read the local filesystem by definition and are supposed to
-keep running on Node.
-
-This document is written to be actionable rather than reassuring. §2 records what is done and
-proven; §5 records defects found and fixed; §6 records what is left.
+What still stands between this repository and a deployment is §6.5–§6.6 (Access wiring, queue
+consumers, end-to-end tests, a fresh Worker preview, the cutover runbook) and the external items
+in §7.
 
 ---
 
@@ -123,7 +114,9 @@ Stated plainly, because the absence of a result is not a pass.
 * **No live Google Drive call has been made.** Drive code is exercised against
   `tests/helpers/fake-drive.ts`. No credentials were available.
 * **No live Cloudflare Access token has been verified.** The suite generates its own key pair.
-* **No migration has been run**, dry or otherwise, because the metadata tooling does not exist.
+* **No migration has been run against production-shaped data.** The tooling has been dry-run
+  against the development MongoDB (292 records, 0 failed); a real-snapshot rehearsal needs a
+  production snapshot.
 * **No UI walkthrough** has been performed against a running application.
 
 ## 5. Defects found and fixed
@@ -250,42 +243,14 @@ index shapes, and migration 0004 says why.
 
 ## 6. What remains
 
-### 6.1 Uploads assume a local filesystem — the largest single item
+### 6.1 Uploads assume a local filesystem — RESOLVED (`e023975`)
 
-Fully classified in `16-phase-7-storage-audit.md`. Summary: 17 `getStorageProvider()` call sites
-across 7 files, of which **8 in `upload.service.ts` are blocking**; the rest are operational
-paths a Worker does not run. Downloads and previews already resolve through
-`getObjectStore(record.provider)` and work unchanged for Drive-backed records.
-
-The Worker pipeline has to become: buffer the first 4 KB → signature check → reject early →
-stream to a Drive resumable upload in a staging folder, hashing in a passthrough → verify size
-and checksum → move staging → destination via `files.update` (a metadata change, not a byte
-copy) → record.
-
-`GOOGLE_DRIVE_STORAGE_ENABLED=true` is **not** sufficient today and setting it would be
-misleading: it changes where bytes are mirrored to, not where they are first written.
-
-#### 6.1.1 It needs a schema change, and that is the reason it is not done here
-
-`upload_sessions` has nowhere to put the two handles the Drive path needs between requests: the
-**resumable session URI** and the **staged Drive file id**. `receiveStream` and `finalize` are
-separate HTTP requests, so both have to be persisted.
-
-Overloading the existing nullable `quarantineKey` to hold a `drive:<id>` handle would make
-single-shot uploads work with no migration, and it was rejected: it makes one column mean two
-different things depending on a flag, and the chunked path needs a *second* handle anyway, which
-would push it to encoding JSON in a string column. That is a decision the next person would have
-to undo.
-
-The right shape is migration `0005` adding `external_upload_uri` and `external_staged_id`, the
-matching Mongoose fields, and the contract change — then the staging abstraction with a local and
-a Drive implementation, so `upload.service.ts` picks one instead of calling
-`getStorageProvider()` eight times.
-
-The resumable machinery itself already exists and is tested: `GoogleDriveHttpClient` does
-chunked resumable uploads with offset re-query before every retry
-(`tests/unit/drive-resumable-upload.test.ts`). What is missing is the session plumbing above it,
-not the transfer.
+The staging backend (`storage/staging/`) gives `upload.service.ts` one call instead of eight
+`getStorageProvider()` calls. Drive staging buffers the first 4 KB for the signature check,
+streams a resumable upload into `.upload-staging/`, verifies size and checksum, and promotes with
+`files.update` (a metadata change). Migration 0005 added `external_upload_uri` and
+`external_staged_id`. `/api/health/ready` no longer reports `local` for external staging.
+Details and verification: `20-phase-7-worker-uploads.md`.
 
 ### 6.2 The repository list is closed — RESOLVED
 
@@ -306,16 +271,14 @@ the reasoning, including two deliberate divergences between the engines.
 The UI is done too: receive/issue/adjust from the item page, a stock-history table showing the
 running total per row, and an overview page with the four counts a store manager checks first.
 
-### 6.4 No Mongo → D1 metadata migration tooling
+### 6.4 Mongo → D1 metadata migration tooling — CODE COMPLETE (`03adb14`)
 
-Nothing exists. `scripts/validate-acl-uniqueness.ts` is one validator; there is no reader, no
-loader, no dry run, no count/sample/ACL comparison and no JSON report. This is Phase 9 in full,
-across roughly twenty domains, and it is what makes a cutover rehearsable.
-
-By contrast the **byte**-migration tooling (Phase 10) largely exists and is tested:
-`services/storage-migration/` has a planner, runner, transfer, pending-transfer queue and
-local-copy retention, with tests covering resume, idempotency ("adopts an object orphaned by a
-crash instead of uploading a second one"), retry and rollback.
+`npm run migrate:validate`, `migrate:d1` and `migrate:verify`. 33 steps, ids preserved, dry run
+by default, checkpointed resume, delta pass, count / relationship / ACL / search verification.
+18 integration tests on real `mongod` + workerd SQLite and 17 unit tests on the gateways. Three
+defects found in review were fixed before commit (delta-pass reference seeding, failed-step
+checkpoint, continuing past a failed step). Not yet run against a production snapshot — that is a
+rehearsal action, not code.
 
 ### 6.5 Cloudflare Access is verified but not wired to a route
 
@@ -423,9 +386,8 @@ Apply migrations with `npm run db:migrate:production` (or `:staging`, `:local`).
 
 ## 11. Migration, cutover and rollback
 
-The metadata tooling does not exist (§6.4), so the procedures are **not** reproduced here as
-though they were runnable. Writing a runbook before the tooling exists produces a document that
-looks like an instruction and is not one.
+The metadata tooling now exists (§6.4). The operational cutover and rollback runbooks are still
+to be written in this pass.
 
 **Rollback today is trivial, and is the state the repository is in.** Every `DATA_SOURCE_*`
 variable is unset, MongoDB serves every request, and the local object store holds every byte.
@@ -462,10 +424,6 @@ Two flags are not independently movable, and both are runbook items rather than 
 * The version validator's `missing_parent_file` check cannot be provoked on D1, because
   `file_versions.file_id` is a real foreign key. It stays because it targets a copy of the Mongo
   corpus loaded before constraints are enforced.
-* `/api/health/ready` reports `storage.provider: "local"` because `health-service.ts` calls
-  `getStorageProvider()`. Cosmetic today; actively misleading the moment a Worker is deployed.
-  It should be fixed *with* the upload pipeline, not before — changing it in isolation would make
-  the endpoint claim Drive on a deployment that still writes to disk.
 * Audit records are written after the business commit rather than inside it, so a process death
   in the gap can lose an audit row. The alternative — writing inside the transaction — can record
   a success for a write that rolled back, which is worse.
