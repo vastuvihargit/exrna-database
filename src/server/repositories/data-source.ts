@@ -207,6 +207,31 @@ function transitiveRequirements(start: DataSourceModule): DataSourceModule[] {
 }
 
 /**
+ * Modules that must be on the same engine in **both** directions.
+ *
+ * `DATA_SOURCE_DEPENDENCIES` catches a child on D1 with its parent on MongoDB — a foreign key
+ * that cannot resolve. It does not catch the reverse, and for these groups the reverse is just
+ * as broken: their multi-table writes are single D1 `batch()`es (`d1-unit-of-work.ts`,
+ * `d1-review-unit-of-work.ts`), and those engines refuse to run half of one on each database.
+ * Before this list that refusal happened on a user's folder move, upload or approval; now it
+ * happens at startup, like every other matrix violation.
+ */
+export const DATA_SOURCE_MOVE_TOGETHER: ReadonlyArray<{ modules: DataSourceModule[]; why: string }> = [
+  {
+    modules: ['folders', 'files'],
+    why: 'folder move, trash, restore and archive rewrite folders and the files under them in one D1 batch',
+  },
+  {
+    modules: ['files', 'fileVersions'],
+    why: 'an upload or new version writes the version row and the file pointing at it in one D1 batch',
+  },
+  {
+    modules: ['reviews', 'files', 'fileVersions'],
+    why: 'a review request or decision updates the review, the file and the exact version in one D1 batch',
+  },
+];
+
+/**
  * Every unsafe split in the current configuration.
  *
  * Returns them all rather than the first, and resolves transitively, because an operator fixing
@@ -232,6 +257,23 @@ export function dataSourceViolations(): DataSourceViolation[] {
           `the "${name}" tables carry a foreign key into "${requirement}", which is still on ` +
           `MongoDB. Every write would fail on a constraint violation.`,
       });
+    }
+  }
+
+  for (const group of DATA_SOURCE_MOVE_TOGETHER) {
+    const moved = group.modules.filter(onD1);
+    if (moved.length === 0 || moved.length === group.modules.length) continue;
+    for (const behind of group.modules.filter((name) => !onD1(name))) {
+      for (const ahead of moved) {
+        if (violations.some((v) => v.module === ahead && v.requires === behind)) continue;
+        violations.push({
+          module: ahead,
+          requires: behind,
+          message:
+            `${envVarFor(ahead)}=d1 requires ${envVarFor(behind)}=d1: ${group.why}, so the ` +
+            'two must move together.',
+        });
+      }
     }
   }
 

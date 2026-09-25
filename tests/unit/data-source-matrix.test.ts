@@ -103,7 +103,8 @@ describe('a split that would cross a foreign key', () => {
   });
 
   it('falls silent once the whole chain is on D1', () => {
-    onD1('fileVersions', 'files', 'folders', 'departments', 'organizations', 'users');
+    // `reviews` as well: files and versions move with it (DATA_SOURCE_MOVE_TOGETHER).
+    onD1('fileVersions', 'files', 'folders', 'reviews', 'departments', 'organizations', 'users');
 
     expect(dataSourceViolations()).toEqual([]);
     expect(() => assertDataSourceMatrix()).not.toThrow();
@@ -119,6 +120,25 @@ describe('a split that would cross a foreign key', () => {
 
     const offenders = new Set(dataSourceViolations().map((violation) => violation.module));
     expect(offenders).toEqual(new Set(['sessions', 'reviews']));
+  });
+});
+
+describe('modules that must move together', () => {
+  it('refuses folders on D1 with files still on MongoDB, the reverse of a foreign-key split', () => {
+    onD1('folders', 'departments', 'organizations', 'users');
+    const violations = dataSourceViolations();
+    expect(violations.some((v) => v.module === 'folders' && v.requires === 'files')).toBe(true);
+    expect(() => assertDataSourceMatrix()).toThrow(/DATA_SOURCE_FILES=d1/);
+  });
+
+  it('refuses files and versions on D1 with reviews still on MongoDB', () => {
+    onD1('fileVersions', 'files', 'folders', 'departments', 'organizations', 'users');
+    expect(dataSourceViolations().some((v) => v.requires === 'reviews')).toBe(true);
+  });
+
+  it('accepts the whole drive core moved together', () => {
+    onD1('folders', 'files', 'fileVersions', 'reviews', 'departments', 'organizations', 'users');
+    expect(dataSourceViolations()).toEqual([]);
   });
 });
 

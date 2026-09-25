@@ -306,6 +306,12 @@ export interface VerifyOptions {
   aclSample?: number;
   /** How many files to search for by name. 0 disables the check. */
   ftsSample?: number;
+  /**
+   * Cutover gate: every version must be Drive-backed, because a Worker has no local storage.
+   * A version still recorded as `local` would be a file that migrated as metadata and cannot
+   * be opened. Off by default — a staging rehearsal may legitimately still have local bytes.
+   */
+  requireDriveStorage?: boolean;
   onProgress?: (message: string) => void;
 }
 
@@ -339,6 +345,23 @@ export async function verifyMigration(options: VerifyOptions): Promise<Verificat
       sample: rows.map((row) => String(Object.values(row)[0])),
     });
     log(`FINDING ${check.name}: ${rows.length} row(s)`);
+  }
+
+  if (options.requireDriveStorage) {
+    const rows = await gateway.query<{ id: string }>(
+      "SELECT id FROM file_versions WHERE storage_provider IS NOT 'google_drive' LIMIT 20",
+    );
+    if (rows.length > 0) {
+      findings.push({
+        check: 'versions-not-in-drive',
+        severity: 'error',
+        detail:
+          'File versions are still recorded as local storage. A Worker cannot read them: finish ' +
+          'the byte migration (storage-migration job + drive:drain) and re-run the delta pass.',
+        sample: rows.map((row) => row.id),
+      });
+      log(`FINDING versions-not-in-drive: ${rows.length} row(s)`);
+    }
   }
 
   const aclSampled = await compareAcls(gateway, options.aclSample ?? 200, findings);

@@ -49,6 +49,7 @@ async function main(): Promise<void> {
     database,
     env,
     remote: process.argv.includes('--remote'),
+    ...(value('--persist-to') ? { persistTo: value('--persist-to') as string } : {}),
     workDir: defaultWorkDir('verify'),
     writeSql,
   }));
@@ -57,6 +58,7 @@ async function main(): Promise<void> {
     gateway,
     aclSample: Number(value('--acl-sample', '200')),
     ftsSample: Number(value('--fts-sample', '25')),
+    requireDriveStorage: process.argv.includes('--require-drive-storage'),
     onProgress: (message) => console.log(`  ${message}`),
   });
 

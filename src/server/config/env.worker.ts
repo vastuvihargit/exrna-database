@@ -137,6 +137,9 @@ const workerEnvSchema = z.object({
   CF_ACCESS_TEAM_DOMAIN: z.string().optional(),
   CF_ACCESS_AUD: z.string().optional(),
 
+  /** The cutover window: off | read_only | maintenance. See runtime/maintenance.ts. */
+  MAINTENANCE_MODE: z.enum(['off', 'read_only', 'maintenance']).default('off'),
+
   MAX_UPLOAD_SIZE_MB: int(2048, 1, 1024 * 1024),
   SESSION_IDLE_TIMEOUT_MINUTES: int(480, 5),
   SESSION_ABSOLUTE_TIMEOUT_MINUTES: int(720, 5),

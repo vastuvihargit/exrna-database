@@ -8,6 +8,7 @@
 import type { NextRequest } from 'next/server';
 import { requestLogger } from '@/server/logging/logger';
 import { toErrorResponse } from './api-response';
+import { assertRequestAllowed } from '@/server/runtime/maintenance';
 
 export interface RequestContext {
   requestId: string;
@@ -59,6 +60,9 @@ export function withRouteHandler<TParams = Record<string, string>>(handler: Hand
     const startedAt = Date.now();
 
     try {
+      // Maintenance and write-freeze modes are enforced here, in front of every API route, so
+      // no route can forget them.
+      assertRequestAllowed(requestContext.method, requestContext.path);
       const params = ((await routeContext?.params) ?? {}) as TParams;
       const response = await handler(request, { params, requestContext });
       // Make the id available to the client for support requests, always.

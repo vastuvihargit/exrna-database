@@ -102,6 +102,12 @@ export interface WranglerGatewayOptions {
   env: string;
   /** `--remote` against the real database, `--local` against the wrangler state directory. */
   remote: boolean;
+  /**
+   * Local only: a wrangler state directory other than `.wrangler/state`. Used by the E2E
+   * harness to load an isolated database, and by anyone rehearsing without touching the
+   * development database.
+   */
+  persistTo?: string;
   /** Where the generated `.sql` files are written. Kept after the run, as the audit trail. */
   workDir: string;
   /**
@@ -141,6 +147,7 @@ export class WranglerGateway implements D1Gateway {
       '--env',
       this.options.env,
       this.options.remote ? '--remote' : '--local',
+      ...(!this.options.remote && this.options.persistTo ? ['--persist-to', this.options.persistTo] : []),
     ];
   }
 

@@ -36,6 +36,7 @@ interface Options {
   env: string;
   database: string | null;
   remote: boolean;
+  persistTo: string | null;
   runId: string | null;
   resume: boolean;
   since: Date | null;
@@ -85,6 +86,7 @@ function parseArgs(argv: string[]): Options {
     env,
     database: value('--database') ?? `biotech-drive-${env === 'development' ? 'dev' : env}`,
     remote: argv.includes('--remote'),
+    persistTo: value('--persist-to'),
     runId: resume ?? value('--run-id'),
     resume: resume !== null,
     since: sinceDate,
@@ -123,6 +125,7 @@ function buildGateway(options: Options): D1Gateway {
     database: options.database as string,
     env: options.env,
     remote: options.remote,
+    ...(options.persistTo ? { persistTo: options.persistTo } : {}),
     workDir: defaultWorkDir(options.runId ?? 'adhoc'),
     writeSql,
   });
