@@ -18,7 +18,7 @@
  */
 import { Readable } from 'node:stream';
 import { createHash } from 'node:crypto';
-import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it } from 'vitest';
+import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import { startTestDb, stopTestDb, type TestDb } from '../helpers/test-db';
 import { actorFor, seedFixture, TEST_META, type Fixture } from '../helpers/fixtures';
@@ -310,5 +310,114 @@ describe('uploads staged in Google Drive', () => {
     // Content staged in Drive is already in Drive; recording it as local would make every
     // subsequent read look for a file on a disk that was never written.
     expect(() => loadEnv()).toThrow(/UPLOAD_STAGING/);
+  });
+});
+
+/**
+ * The HTTP malware-scanning boundary, in the pipeline a Worker actually runs.
+ *
+ * The property that matters is ordering: the scan happens while the bytes are in the Drive
+ * staging folder, and an upload is only promoted — and only gets a version record any download
+ * path can resolve — after a `clean` verdict. So an infected or unscannable file must leave no
+ * file, no version and nothing in staging.
+ */
+describe('HTTP malware scanning of Drive-staged uploads', () => {
+  const ENDPOINT = 'https://scanner.example/scan';
+  const SECRET = 'scan-secret-0123456789';
+  let received: { authorization: string | null; body: Buffer }[];
+
+  function scanWith(respond: () => Response | Promise<Response>, options: { failClosed?: boolean } = {}) {
+    process.env.MALWARE_SCAN_MODE = 'http';
+    process.env.MALWARE_SCAN_ENDPOINT = ENDPOINT;
+    process.env.MALWARE_SCAN_SECRET = SECRET;
+    process.env.MALWARE_SCAN_TIMEOUT_MS = '2000';
+    if (options.failClosed !== undefined) process.env.MALWARE_SCAN_FAIL_CLOSED = String(options.failClosed);
+    resetEnvCache();
+    received = [];
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async (input: unknown, init?: RequestInit & { body?: ReadableStream<Uint8Array> }) => {
+        if (String(input) !== ENDPOINT) throw new Error(`unexpected fetch to ${String(input)}`);
+        const chunks: Uint8Array[] = [];
+        const reader = init?.body?.getReader();
+        for (;;) {
+          const next = await reader?.read();
+          if (!next || next.done) break;
+          chunks.push(next.value);
+        }
+        received.push({
+          authorization: new Headers(init?.headers).get('authorization'),
+          body: Buffer.concat(chunks),
+        });
+        return respond();
+      }),
+    );
+  }
+
+  beforeEach(async () => {
+    const { setMalwareScanner } = await import('@/server/security/malware-scanner');
+    setMalwareScanner(null);
+  });
+
+  afterEach(async () => {
+    vi.unstubAllGlobals();
+    const { setMalwareScanner } = await import('@/server/security/malware-scanner');
+    setMalwareScanner(null);
+  });
+
+  async function upload(name: string, content: Buffer) {
+    const { uploadService } = await services();
+    const alice = await actorFor(fixture.users.scientistA);
+    const folderId = await makeFolder(alice, `Scan ${name}`);
+    const ticket = await uploadService.authorizeUpload(
+      alice,
+      { folderId, filename: name, size: content.byteLength },
+      TEST_META,
+    );
+    await uploadService.receiveStream(alice, ticket.sessionId, Readable.from(content), TEST_META);
+    return { finalize: () => uploadService.finalize(alice, ticket.sessionId, TEST_META) };
+  }
+
+  async function nothingLeftBehind(name: string) {
+    const { FileModel } = await import('@/server/db/models');
+    expect(await FileModel.countDocuments({ displayName: name }).setOptions({ withDeleted: true })).toBe(0);
+    const staging = drive.snapshot().find((item) => item.name === '.upload-staging');
+    const staged = drive.snapshot().filter((item) => staging && item.parents?.includes(staging.id));
+    expect(staged, 'nothing may remain in the staging folder').toEqual([]);
+  }
+
+  it('sends the exact staged bytes with the shared secret, and stores the file on a clean verdict', async () => {
+    if (skipUnlessDb()) return;
+    scanWith(() => Response.json({ status: 'clean' }));
+    const content = pdf('clean assay export');
+
+    const result = await (await upload('clean.pdf', content)).finalize();
+
+    expect(result.fileId).toBeTruthy();
+    expect(received).toHaveLength(1);
+    expect(received[0]?.authorization).toBe(`Bearer ${SECRET}`);
+    expect(received[0]?.body).toEqual(content);
+  });
+
+  it('refuses an infected file and leaves no file, version or staged object behind', async () => {
+    if (skipUnlessDb()) return;
+    scanWith(() => Response.json({ status: 'infected', signature: 'Eicar-Test-Signature' }));
+
+    const pending = await upload('infected.pdf', pdf('X5O!P%@AP[4\PZX54(P^)7CC)7}$EICAR'));
+    await expect(pending.finalize()).rejects.toThrow(/Malware detected \(Eicar-Test-Signature\)/);
+    await nothingLeftBehind('infected.pdf');
+  });
+
+  it('refuses when the scanner is unreachable or answers nonsense, when failing closed', async () => {
+    if (skipUnlessDb()) return;
+    scanWith(() => new Response('upstream exploded', { status: 502 }), { failClosed: true });
+    const down = await upload('down.pdf', pdf('scanner down'));
+    await expect(down.finalize()).rejects.toThrow(/could not check this file/);
+    await nothingLeftBehind('down.pdf');
+
+    scanWith(() => Response.json({ verdict: 'probably fine' }), { failClosed: true });
+    const garbled = await upload('garbled.pdf', pdf('garbled'));
+    await expect(garbled.finalize()).rejects.toThrow(/could not check this file/);
+    await nothingLeftBehind('garbled.pdf');
   });
 });

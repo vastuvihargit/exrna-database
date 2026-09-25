@@ -92,6 +92,16 @@ const envSchema = z
     // Malware scanning (Phase 11). Disabled by default: a deployment with no antivirus
     // is a stated risk reported on the admin system page, never a silent one.
     MALWARE_SCAN_ENABLED: bool(false),
+    /**
+     * Which scanner, stated explicitly. Wins over `MALWARE_SCAN_ENABLED`, which remains as the
+     * older spelling of `clamav`. `http` is the vendor-neutral boundary a Worker can use — clamd
+     * needs a raw TCP socket, which workerd does not have. See `security/malware-scanner.ts` for
+     * the wire contract.
+     */
+    MALWARE_SCAN_MODE: z.enum(['disabled', 'clamav', 'http']).optional(),
+    MALWARE_SCAN_ENDPOINT: z.string().url().optional(),
+    MALWARE_SCAN_SECRET: z.string().optional(),
+    MALWARE_SCAN_TIMEOUT_MS: int(120_000, 1000, 900_000),
     CLAMAV_HOST: z.string().default('clamav'),
     CLAMAV_PORT: int(3310, 1, 65535),
     CLAMAV_TIMEOUT_MS: int(60_000, 1000, 600_000),
@@ -131,6 +141,15 @@ const envSchema = z
       .url('ALERT_WEBHOOK_URL must be a URL')
       .optional()
       .or(z.literal('').transform(() => undefined)),
+
+    /**
+     * Cloudflare Access in front of the application. When both are set, Access is the sign-in
+     * method: every request must carry a valid Access assertion for the same person as its
+     * session, and password / Google sign-in are switched off. Unset — local development and
+     * the existing Node deployment — nothing about sign-in changes. See `auth/access-session.ts`.
+     */
+    CF_ACCESS_TEAM_DOMAIN: z.string().optional(),
+    CF_ACCESS_AUD: z.string().optional(),
 
     // OAuth (required only once Phase 2 enables the provider)
     GOOGLE_CLIENT_ID: z.string().optional(),
@@ -287,6 +306,45 @@ const envSchema = z
       });
     }
 
+    /**
+     * The HTTP scanner fails at configuration time, not on somebody's upload. A shared secret
+     * shorter than 16 characters is refused because it authenticates this application to the
+     * scanning service, and a guessable one lets anybody spend its quota — or, worse, answer in
+     * its place if the endpoint is ever misrouted.
+     */
+    // Half of an Access configuration is the dangerous half: a team domain with no audience
+    // would verify any Access application's token on the same team.
+    if (Boolean(v.CF_ACCESS_TEAM_DOMAIN?.trim()) !== Boolean(v.CF_ACCESS_AUD?.trim())) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: [v.CF_ACCESS_TEAM_DOMAIN ? 'CF_ACCESS_AUD' : 'CF_ACCESS_TEAM_DOMAIN'],
+        message: 'CF_ACCESS_TEAM_DOMAIN and CF_ACCESS_AUD must be set together, or neither',
+      });
+    }
+
+    if (v.MALWARE_SCAN_MODE === 'http') {
+      if (!v.MALWARE_SCAN_ENDPOINT) {
+        ctx.addIssue({
+          code: z.ZodIssueCode.custom,
+          path: ['MALWARE_SCAN_ENDPOINT'],
+          message: 'is required when MALWARE_SCAN_MODE is "http"',
+        });
+      } else if (v.NODE_ENV === 'production' && !v.MALWARE_SCAN_ENDPOINT.startsWith('https://')) {
+        ctx.addIssue({
+          code: z.ZodIssueCode.custom,
+          path: ['MALWARE_SCAN_ENDPOINT'],
+          message: 'must use https:// in production — file content is sent to it',
+        });
+      }
+      if (!v.MALWARE_SCAN_SECRET || v.MALWARE_SCAN_SECRET.length < 16) {
+        ctx.addIssue({
+          code: z.ZodIssueCode.custom,
+          path: ['MALWARE_SCAN_SECRET'],
+          message: 'must be at least 16 characters when MALWARE_SCAN_MODE is "http"',
+        });
+      }
+    }
+
     if (v.UPLOAD_STAGING === 'google_drive' && !v.GOOGLE_DRIVE_STORAGE_ENABLED) {
       ctx.addIssue({
         code: z.ZodIssueCode.custom,
@@ -403,6 +461,15 @@ function assertDevSwitcherNotRequestedInProduction(
 
 export type RawEnv = z.infer<typeof envSchema>;
 
+export type MalwareScanMode = 'disabled' | 'clamav' | 'http';
+
+export function resolveMalwareScanMode(v: {
+  MALWARE_SCAN_MODE?: MalwareScanMode | undefined;
+  MALWARE_SCAN_ENABLED: boolean;
+}): MalwareScanMode {
+  return v.MALWARE_SCAN_MODE ?? (v.MALWARE_SCAN_ENABLED ? 'clamav' : 'disabled');
+}
+
 /**
  * Storage roots resolved to absolute paths.
  *
@@ -432,6 +499,8 @@ export interface AppEnv extends RawEnv {
   googleDriveUploadChunkBytes: number;
   /** Above this, a new upload is queued for Drive instead of transferred inline. */
   uploadDriveSyncThresholdBytes: number;
+  /** The scanner actually in force: `MALWARE_SCAN_MODE`, else the legacy boolean. */
+  malwareScanMode: MalwareScanMode;
 }
 
 const GB = 1024 ** 3;
@@ -488,7 +557,7 @@ export function loadEnv(source: NodeJS.ProcessEnv = process.env): AppEnv {
   const v: RawEnv = {
     ...raw,
     MALWARE_SCAN_FAIL_CLOSED:
-      raw.NODE_ENV === 'production' && raw.MALWARE_SCAN_ENABLED
+      raw.NODE_ENV === 'production' && resolveMalwareScanMode(raw) !== 'disabled'
         ? source.MALWARE_SCAN_FAIL_CLOSED === 'false' || source.MALWARE_SCAN_FAIL_CLOSED === '0'
           ? false
           : true
@@ -524,6 +593,7 @@ export function loadEnv(source: NodeJS.ProcessEnv = process.env): AppEnv {
     defaultDepartmentQuotaBytes: v.DEFAULT_DEPARTMENT_STORAGE_QUOTA_GB * GB,
     googleDriveUploadChunkBytes: v.GOOGLE_DRIVE_UPLOAD_CHUNK_MB * MB,
     uploadDriveSyncThresholdBytes: v.UPLOAD_DRIVE_SYNC_THRESHOLD_MB * MB,
+    malwareScanMode: resolveMalwareScanMode(v),
   };
 }
 

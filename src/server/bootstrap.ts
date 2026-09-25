@@ -22,6 +22,15 @@ async function run(): Promise<void> {
   const env = getEnv();
   const log = getLogger();
 
+  // A deployment without malware scanning is allowed, but never quietly: it is logged here at
+  // startup, reported on the admin system page, and has to be chosen explicitly in a Worker.
+  if (env.malwareScanMode === 'disabled') {
+    log.warn(
+      { malwareScanMode: 'disabled' },
+      'Malware scanning is DISABLED: uploaded files are stored without being scanned',
+    );
+  }
+
   try {
     await getStorageProvider().ensureReady();
     log.info(

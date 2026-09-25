@@ -115,6 +115,24 @@ const workerEnvSchema = z.object({
   GOOGLE_CLIENT_ID: z.string().optional(),
   GOOGLE_CLIENT_SECRET: z.string().optional(),
 
+  /**
+   * Malware scanning has to be *decided* in a Worker: there is no default.
+   *
+   * `clamav` is impossible (clamd needs a raw TCP socket), so the choice is the HTTP boundary or
+   * an explicit `disabled`. A Worker with neither refuses to boot — the alternative is a
+   * deployment that stores unscanned files because nobody got round to choosing, which is the
+   * silent version of a decision that should be made out loud.
+   */
+  MALWARE_SCAN_MODE: z.enum(['disabled', 'http'], {
+    errorMap: () => ({
+      message:
+        'must be set to "http" (with MALWARE_SCAN_ENDPOINT and MALWARE_SCAN_SECRET) or, as an ' +
+        'explicit and logged decision, "disabled". clamav cannot run in a Worker.',
+    }),
+  }),
+  MALWARE_SCAN_ENDPOINT: z.string().url().optional(),
+  MALWARE_SCAN_SECRET: z.string().optional(),
+
   // Cloudflare Access. Optional until Phase 8 turns it on, then required in production.
   CF_ACCESS_TEAM_DOMAIN: z.string().optional(),
   CF_ACCESS_AUD: z.string().optional(),
@@ -227,6 +245,29 @@ export function loadWorkerEnv(source: Record<string, string | undefined>): Worke
       'Invalid Worker environment configuration:\n' +
         '  • SESSION_SECRET: AUTH_SECRET and SESSION_SECRET must differ in production',
     );
+  }
+
+  // Half an Access configuration reads as "not configured" to `accessConfigFrom`, which outside
+  // production would silently mean "no Access check". Refused here instead, in every environment.
+  if (Boolean(v.CF_ACCESS_TEAM_DOMAIN?.trim()) !== Boolean(v.CF_ACCESS_AUD?.trim())) {
+    throw new Error(
+      'Invalid Worker environment configuration:\n' +
+        '  • CF_ACCESS_TEAM_DOMAIN / CF_ACCESS_AUD: must be set together, or neither',
+    );
+  }
+
+  if (v.MALWARE_SCAN_MODE === 'http') {
+    const problems: string[] = [];
+    if (!v.MALWARE_SCAN_ENDPOINT) problems.push('MALWARE_SCAN_ENDPOINT: is required when MALWARE_SCAN_MODE is "http"');
+    else if (v.NODE_ENV === 'production' && !v.MALWARE_SCAN_ENDPOINT.startsWith('https://')) {
+      problems.push('MALWARE_SCAN_ENDPOINT: must use https:// in production');
+    }
+    if (!v.MALWARE_SCAN_SECRET || v.MALWARE_SCAN_SECRET.length < 16) {
+      problems.push('MALWARE_SCAN_SECRET: must be at least 16 characters when MALWARE_SCAN_MODE is "http"');
+    }
+    if (problems.length > 0) {
+      throw new Error(`Invalid Worker environment configuration:\n${problems.map((p) => `  • ${p}`).join('\n')}`);
+    }
   }
 
   // A split that puts a foreign key across two databases. Same check the Node deployment runs,

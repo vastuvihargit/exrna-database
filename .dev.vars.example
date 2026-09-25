@@ -48,63 +48,39 @@ GOOGLE_SERVICE_ACCOUNT_PRIVATE_KEY="-----BEGIN PRIVATE KEY-----\n...\n-----END P
 GOOGLE_CLIENT_ID=
 GOOGLE_CLIENT_SECRET=
 
-# ── Which database backs which module (Phase 3) ───────────────────────────────────────
-# Not secrets. Listed here because they are the switch that decides where reads and writes
-# go, and because the safe value is "absent".
+# ── Which database backs which module ─────────────────────────────────────────────
+# Not secrets. Unset (or anything but the exact string "d1") means MongoDB. Only "d1" moves a
+# module; the flag is read per call, so reverting is deleting the variable.
 #
-# Unset (or anything other than the exact string "d1") means MongoDB — the database that
-# serves production today. Only an exact "d1" moves a module across, and each module moves
-# independently so any one of them can be reverted without touching the others.
+# Every module below has a D1 implementation. A Worker cannot reach MongoDB at all, so a
+# Worker needs ALL of them set to d1 — loadWorkerEnv() refuses to boot a production Worker
+# otherwise, and warns elsewhere. The full matrix, with the safe and unsafe combinations, is
+# docs/cloudflare-migration/DATA-SOURCE-FLAGS.md.
 #
-# Reverting is deleting the variable. It takes effect on the next request; the flag is read
-# per call, not cached at startup.
-#
-# Migrated so far: users, departments (module 1); roles (module 2);
-# projects, experiments (module 3); folders (module 5).
-#
-# `files` has a flag but no D1 implementation yet (module 6 is in progress). Setting it to
-# "d1" does not fall back to MongoDB - it raises, on purpose. A flag that silently served
-# the old database would make a soak test meaningless and the mistake would only surface
-# later, against the wrong data.
-#
-# `roles` and `users` are best moved together: user.service.ts decorates every user summary
-# with that user's grants, so a directory listing reads both on one request. Ids are preserved
-# across both databases, so a split works — but only for rows that exist in both, which is not
-# true until Phase 5 has loaded the data.
-# `projects` and `experiments` likewise: experiment listings are scoped to the set of project
-# ids the project repository returned, so a split means one database deciding visibility for
-# rows held in another.
+# DATA_SOURCE_ORGANIZATIONS=d1
 # DATA_SOURCE_USERS=d1
 # DATA_SOURCE_DEPARTMENTS=d1
 # DATA_SOURCE_ROLES=d1
 # DATA_SOURCE_PROJECTS=d1
 # DATA_SOURCE_EXPERIMENTS=d1
-# `folders` and `files` must be set together. A folder move rewrites the folder tree and the
-# files inside it, and no transaction spans two databases — so rather than committing one half
-# to each, a folder move is **refused with a 409** whenever these two flags disagree. Reads are
-# unaffected. Setting only this one is still fine for a read-only soak of the folder module.
 # DATA_SOURCE_FOLDERS=d1
-#
-# The D1 file repository exists as of Phase 3 module 6, so this flag selects it rather than
-# failing. Set it **together with** DATA_SOURCE_FOLDERS: as of module 7 a folder move is one
-# atomic D1 batch covering folders and files, and a configuration with the two modules on
-# different databases **refuses folder moves outright** (409) rather than committing one half
-# to each. That is deliberate — no transaction spans MongoDB and D1. Reads still work under a
-# split configuration; only hierarchy mutations are blocked.
-#
-# With both on d1 the move is genuinely atomic: see
-# docs/cloudflare-migration/09-phase-3-module-7-atomic-moves.md.
 # DATA_SOURCE_FILES=d1
 # DATA_SOURCE_FILE_VERSIONS=d1
 # DATA_SOURCE_SEARCH=d1
 # DATA_SOURCE_REVIEWS=d1
 # DATA_SOURCE_AUDIT_LOGS=d1
-# DATA_SOURCE_ORGANIZATIONS=d1
-# DATA_SOURCE_SESSIONS=d1
+# DATA_SOURCE_INVENTORY=d1
 # DATA_SOURCE_NOTIFICATIONS=d1
+# DATA_SOURCE_SESSIONS=d1
 # DATA_SOURCE_LOGIN_HISTORY=d1
 # DATA_SOURCE_STORAGE_USAGE=d1
 # DATA_SOURCE_ACTIVITIES=d1
+# DATA_SOURCE_COMMENTS=d1
+# DATA_SOURCE_DRIVE_SYNC=d1
+# DATA_SOURCE_UPLOAD_SESSIONS=d1
+# DATA_SOURCE_COLLABORATION=d1
+# DATA_SOURCE_JOBS=d1
+# DATA_SOURCE_APP_SETTINGS=d1
 #
 # ── The matrix is enforced, not advisory ──────────────────────────────────────────────
 #
@@ -147,5 +123,18 @@ GOOGLE_CLIENT_SECRET=
 # The Worker verifies the Access JWT's signature, issuer, audience, exp and nbf. It never trusts
 # the Cf-Access-Authenticated-User-Email header — that is plaintext and forgeable by anything
 # that can reach the Worker directly, and a Worker URL is public.
+#
+# Configuring these turns Access ON as the sign-in method, in any environment: every request
+# must carry a valid assertion for the same person as its session, and password sign-in is
+# switched off. Leave both EMPTY for local preview without Access — sign-in then behaves as in
+# development (but note a production-mode preview refuses to boot without them).
+# Setup steps: docs/cloudflare-migration/22-cloudflare-access.md.
 CF_ACCESS_TEAM_DOMAIN=
 CF_ACCESS_AUD=
+
+# ── Malware scanning ──────────────────────────────────────────────────────────────────
+# MALWARE_SCAN_MODE is a var in wrangler.jsonc ("disabled" for development only; staging and
+# production deliberately unset, so they refuse to boot until a scanner is chosen). When it is
+# "http", the endpoint is a var and the shared secret is this secret (16+ characters).
+# Contract and trade-offs: docs/cloudflare-migration/24-malware-scanning.md.
+MALWARE_SCAN_SECRET=

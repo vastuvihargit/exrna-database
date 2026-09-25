@@ -264,7 +264,9 @@ export function evaluateMalwareScanning(input: {
       label: 'Malware scanning',
       severity: 'warning',
       detail:
-        'No antivirus is configured. Uploads are checked for type and signature but not scanned for malware.',
+        'Malware scanning is disabled (MALWARE_SCAN_MODE=disabled). Uploads are checked for type and ' +
+        'signature but not scanned for malware, so an infected file of an allowed type is stored ' +
+        'and can be downloaded. Choose a scanner and set MALWARE_SCAN_MODE to close this.',
     };
   }
 
