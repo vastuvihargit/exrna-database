@@ -250,7 +250,7 @@ export async function verifyAccessJwt(
  * is the fallback for a same-origin `fetch` that Access has already stamped. Only these two —
  * never a query parameter, which would end up in logs and in browser history.
  */
-export function readAccessToken(headers: Headers): string | null {
+export function readAccessToken(headers: { get(name: string): string | null }): string | null {
   const fromHeader = headers.get(ACCESS_JWT_HEADER);
   if (fromHeader) return fromHeader.trim();
 

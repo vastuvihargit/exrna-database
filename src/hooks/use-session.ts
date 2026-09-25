@@ -35,10 +35,16 @@ export function useLogout() {
 
   return useMutation({
     mutationFn: (scope: 'this' | 'all' = 'this') =>
-      apiRequest(scope === 'all' ? '/api/auth/logout-all' : '/api/auth/logout', { method: 'POST' }),
-    onSuccess: () => {
+      apiRequest<{ redirectTo?: string }>(
+        scope === 'all' ? '/api/auth/logout-all' : '/api/auth/logout',
+        { method: 'POST' },
+      ),
+    onSuccess: (result) => {
       queryClient.clear();
-      window.location.href = '/login';
+      // The server decides: '/login', or the Cloudflare Access logout when Access is in front.
+      // Only a same-origin path is followed.
+      const target = result?.redirectTo;
+      window.location.href = target && target.startsWith('/') && !target.startsWith('//') ? target : '/login';
     },
   });
 }

@@ -3,6 +3,7 @@ import { NextResponse } from 'next/server';
 import { withRouteHandler } from '@/server/http/route-handler';
 import { getEnv } from '@/server/config/env';
 import { beginGoogleLogin } from '@/server/auth/google-oauth';
+import { isAccessEnforced } from '@/server/auth/access-session';
 
 export const runtime = 'nodejs';
 export const dynamic = 'force-dynamic';
@@ -20,6 +21,8 @@ export const OAUTH_NONCE_COOKIE = 'bd_oauth_nonce';
  */
 export const GET = withRouteHandler(async () => {
   const env = getEnv();
+  // Access is the sign-in method when it is configured; this flow would be a second one.
+  if (isAccessEnforced()) return NextResponse.redirect(new URL('/api/auth/access', env.APP_URL));
   const hint = env.COMPANY_EMAIL_DOMAINS[0];
   const start = await beginGoogleLogin(hint);
 

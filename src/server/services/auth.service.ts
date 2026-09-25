@@ -36,6 +36,7 @@ import { enforce, reset, RATE_LIMITS } from '@/server/auth/rate-limit';
 import { generateToken, hashToken } from '@/server/auth/tokens';
 import { issueSession, revokeAllSessions, type IssuedSession } from '@/server/auth/session.service';
 import { Types } from 'mongoose';
+import { isAccessEnforced } from '@/server/auth/access-session';
 
 const FAILED_LOGIN_LOCK_THRESHOLD = 5;
 const GENERIC_LOGIN_ERROR = 'Incorrect email address or password';
@@ -52,7 +53,19 @@ export interface LoginInput {
  * Note the ordering: rate limits first (cheap), then domain check, then the account
  * lookup. Regardless of which check fails, the caller sees one message.
  */
+/** Refuses password flows when Cloudflare Access is the configured sign-in method. */
+function assertPasswordAuthAvailable(): void {
+  if (isAccessEnforced()) {
+    throw new ForbiddenError(
+      'Sign-in is handled by your company single sign-on. Password sign-in is not available here.',
+    );
+  }
+}
+
 export async function loginWithPassword(input: LoginInput, meta: RequestMeta): Promise<IssuedSession> {
+  // With Cloudflare Access in front, Access is the only way in. A password path left open
+  // beside it would be a second front door that bypasses the company identity provider.
+  assertPasswordAuthAvailable();
   const env = getEnv();
 
   enforce(`login:ip:${meta.ip}`, RATE_LIMITS.login);
@@ -399,6 +412,9 @@ export async function requestPasswordReset(
   emailInput: string,
   meta: RequestMeta,
 ): Promise<{ token: string; email: string; userId: string } | null> {
+  // With Cloudflare Access in front, Access is the only way in. A password path left open
+  // beside it would be a second front door that bypasses the company identity provider.
+  assertPasswordAuthAvailable();
   const env = getEnv();
 
   enforce(`pwreset:ip:${meta.ip}`, RATE_LIMITS.passwordResetPerIp);
@@ -443,6 +459,9 @@ export async function completePasswordReset(
   input: { token: string; password: string },
   meta: RequestMeta,
 ): Promise<void> {
+  // With Cloudflare Access in front, Access is the only way in. A password path left open
+  // beside it would be a second front door that bypasses the company identity provider.
+  assertPasswordAuthAvailable();
   await connectToDatabase();
 
   const record = await PasswordResetTokenModel.findOne({
@@ -532,6 +551,7 @@ export async function changePassword(
 export const authService = {
   loginWithPassword,
   completeOAuthLogin,
+  completeAccessLogin,
   logout,
   logoutEverywhere,
   requestPasswordReset,
