@@ -5,6 +5,9 @@
  * rests on, so they are asserted against the gateways themselves rather than trusted to every
  * caller only ever passing a SELECT.
  */
+import { mkdtemp, rm } from 'node:fs/promises';
+import os from 'node:os';
+import path from 'node:path';
 import { describe, expect, it } from 'vitest';
 import {
   DryRunGateway,
@@ -130,4 +133,30 @@ describe('SQL rendering', () => {
     expect(() => renderStatement({ sql: 'SELECT ?', params: [] })).toThrow();
     expect(() => renderStatement({ sql: 'SELECT 1', params: [1] })).toThrow();
   });
+});
+
+describe('WranglerGateway against the real wrangler binary', () => {
+  // The default `exec`, not a stub: the regression was in how the process was spawned. On
+  // Windows `shell: true` split `--command SELECT COUNT(*) AS n …` into separate arguments, so
+  // every verification query failed while every stubbed test passed.
+  it('passes a multi-word SQL command through as one argument', async () => {
+    const persistTo = await mkdtemp(path.join(os.tmpdir(), 'gateway-spawn-'));
+    try {
+      const gateway = new WranglerGateway({
+        database: 'biotech-drive-dev',
+        env: 'development',
+        remote: false,
+        persistTo,
+        workDir: persistTo,
+        writeSql: async () => undefined,
+      });
+      const rows = await gateway.query<{ n: number; s: string }>(
+        "SELECT COUNT(*) AS n, 'two words' AS s FROM sqlite_master WHERE ? = ?",
+        [1, 1],
+      );
+      expect(rows).toEqual([{ n: 0, s: 'two words' }]);
+    } finally {
+      await rm(persistTo, { recursive: true, force: true });
+    }
+  }, 120_000);
 });

@@ -13,6 +13,7 @@
  * verification, and differ only in which of these three objects they were handed.
  */
 import { spawn } from 'node:child_process';
+import { createRequire } from 'node:module';
 import os from 'node:os';
 import path from 'node:path';
 import type { D1Database } from '@cloudflare/workers-types';
@@ -195,25 +196,51 @@ export function parseWranglerJson<T>(output: string): T[] {
   return parsed.flatMap((entry) => entry.results ?? []);
 }
 
+/**
+ * Kills a wrangler child that has not exited after this long and fails the call.
+ *
+ * A local `d1 execute` finishes its SQL in milliseconds, but the E2E rehearsal saw the process
+ * take tens of minutes to *exit* while workerd was starved by other load — and a child that never
+ * closes is a migration that stops without saying so. Failing loudly is safe: the step is left
+ * `failed` in its checkpoint and `--resume` re-applies it, every statement being an upsert or an
+ * insert-if-absent. Overridable with `MIGRATION_WRANGLER_TIMEOUT_MS` for a large remote batch.
+ */
+const WRANGLER_TIMEOUT_MS = Number(process.env.MIGRATION_WRANGLER_TIMEOUT_MS ?? 10 * 60_000);
+
 function runWrangler(args: string[]): Promise<string> {
   return new Promise((resolve, reject) => {
-    // `npx` rather than a bare `wrangler`: the dependency is local, and an operator running the
-    // cutover should not have to have installed it globally at the right version.
-    const child = spawn('npx', ['--yes', 'wrangler', ...args], {
-      shell: process.platform === 'win32',
-      env: process.env,
+    // wrangler's own entry script under the running Node, not `npx` through a shell. On Windows
+    // `shell: true` hands cmd.exe one unquoted string, so `--command SELECT COUNT(*) AS n …`
+    // arrived as five arguments and every verification query failed. No shell, no quoting.
+    // Resolved from the working directory, which `npm run` sets to the repository root.
+    // (`bin/` is not in wrangler's `exports`, so the package root is found via its manifest.)
+    const manifest = createRequire(path.resolve('package.json')).resolve('wrangler/package.json');
+    const entry = path.join(path.dirname(manifest), 'bin', 'wrangler.js');
+    const child = spawn(process.execPath, [entry, ...args], {
+      shell: false,
+      windowsHide: true,
+      // Telemetry off: a metrics POST with no network is one more thing that can hold the exit.
+      env: { ...process.env, WRANGLER_SEND_METRICS: 'false' },
     });
 
     let stdout = '';
     let stderr = '';
+    const timer = setTimeout(() => {
+      child.kill();
+      reject(new Error(`wrangler ${args.join(' ')} did not exit within ${WRANGLER_TIMEOUT_MS} ms`));
+    }, WRANGLER_TIMEOUT_MS);
     child.stdout.on('data', (chunk: Buffer) => {
       stdout += chunk.toString();
     });
     child.stderr.on('data', (chunk: Buffer) => {
       stderr += chunk.toString();
     });
-    child.on('error', reject);
+    child.on('error', (error) => {
+      clearTimeout(timer);
+      reject(error);
+    });
     child.on('close', (code) => {
+      clearTimeout(timer);
       if (code === 0) resolve(stdout);
       else reject(new Error(`wrangler ${args.join(' ')} exited ${code}\n${stderr || stdout}`));
     });
