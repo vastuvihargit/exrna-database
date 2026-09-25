@@ -37,10 +37,11 @@ import * as folderRepository from '@/server/repositories/folder.repository';
 import * as projectRepository from '@/server/repositories/project.repository';
 import * as roleRepository from '@/server/repositories/role.repository';
 import * as userRepository from '@/server/repositories/user.repository';
-import * as notificationRepository from '@/server/repositories/notification.repository';
 import type { RequestMeta } from '@/server/http/request-meta';
 import { fileCan, requireFile, type FileContext } from './file-access';
 import { folderCan, requireFolder, type FolderContext } from './folder-access';
+import { detach } from '@/server/runtime/detach';
+import { dispatchNotifications, newEventKey } from '@/server/queues/notification-dispatch';
 
 export type ShareTargetType = 'file' | 'folder';
 
@@ -182,21 +183,23 @@ export async function share(
     severity: input.deny ? 'warning' : 'notice',
   });
 
-  void activityRepository
-    .append({
-      organizationId: actor.organizationId,
-      actorUserId: actor.userId,
-      actorName: actor.name,
-      action: 'file.share',
-      entityType: targetType,
-      entityId: targetId,
-      entityLabel: context.name,
-      detail: `${input.deny ? 'blocked' : 'shared with'} ${principal.name} (${input.accessLevel})`,
-      contextFolderIds: context.contextFolderIds,
-      departmentId: context.departmentId,
-      projectId: context.projectId,
-    })
-    .catch(() => undefined);
+  detach(
+    activityRepository
+      .append({
+        organizationId: actor.organizationId,
+        actorUserId: actor.userId,
+        actorName: actor.name,
+        action: 'file.share',
+        entityType: targetType,
+        entityId: targetId,
+        entityLabel: context.name,
+        detail: `${input.deny ? 'blocked' : 'shared with'} ${principal.name} (${input.accessLevel})`,
+        contextFolderIds: context.contextFolderIds,
+        departmentId: context.departmentId,
+        projectId: context.projectId,
+      }),
+    'activity.append',
+  );
 
   // Notify the people who just gained access — but never on a deny, which would tell
   // someone they have been specifically excluded from something they may not know exists.
@@ -607,17 +610,24 @@ async function notifyRecipients(
   if (input.principalType !== 'user') return;
   if (input.principalId === actor.userId) return;
 
-  await notificationRepository.create({
-    organizationId: actor.organizationId,
-    userId: input.principalId,
-    type: 'share.received',
-    actorUserId: actor.userId,
-    actorName: actor.name,
-    entityType: targetType,
-    entityId: targetId,
-    entityLabel: context.name,
-    message: `${actor.name} shared "${context.name}" with you (${input.accessLevel})`,
-  });
+  // A fresh event key per share: sharing the same item twice is two events and two
+  // notifications; only a redelivery of *this* one is deduplicated.
+  await dispatchNotifications(
+    [
+      {
+        organizationId: actor.organizationId,
+        userId: input.principalId,
+        type: 'share.received',
+        actorUserId: actor.userId,
+        actorName: actor.name,
+        entityType: targetType,
+        entityId: targetId,
+        entityLabel: context.name,
+        message: `${actor.name} shared "${context.name}" with you (${input.accessLevel})`,
+      },
+    ],
+    newEventKey(`share:${targetType}:${targetId}`),
+  );
 }
 
 export const sharingService = {

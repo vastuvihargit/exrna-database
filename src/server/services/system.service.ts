@@ -36,6 +36,7 @@ import { getMalwareScanner } from '@/server/security/malware-scanner';
 import { countPending as countPendingDriveTransfers } from './storage-migration/pending-transfers';
 import { getSyncStatus, syncIntervalMinutes } from './drive-sync.service';
 import { summarizeLocalCopies } from './storage-migration/local-copies';
+import { isWorkerRuntime } from '@/server/runtime';
 import {
   evaluateApprovalIntegrity,
   evaluateBackup,
@@ -144,7 +145,9 @@ export async function collectSystemStatus(): Promise<SystemStatus> {
       // Never allowed to fail the whole page: the panel whose job is to explain a broken
       // Drive connection must still render when the connection is broken.
       checkDriveConnection().catch(() => null),
-      countPendingDriveTransfers().catch(() => 0),
+      // Local-to-Drive transfer queues and retained local copies belong to the Node deployment's
+      // byte migration. A Worker has neither, and asking would only fail on a MongoDB connection.
+      isWorkerRuntime() ? Promise.resolve(0) : countPendingDriveTransfers().catch(() => 0),
       versionRepository.countSupersededApprovals().catch(() => 0),
       // Same rule as the connection check: the panel whose job is to explain that
       // synchronization has stopped must still render when it has stopped.
@@ -154,7 +157,7 @@ export async function collectSystemStatus(): Promise<SystemStatus> {
         conflicts: 0,
         minutesSinceLastPoll: null,
       })),
-      summarizeLocalCopies().catch(() => ({
+      (isWorkerRuntime() ? Promise.reject(new Error('not applicable')) : summarizeLocalCopies()).catch(() => ({
         retained: 0,
         retainedBytes: 0,
         eligible: 0,

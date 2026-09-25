@@ -3,7 +3,7 @@
 **Status: code complete and tested locally.** It has been dry-run against the development
 MongoDB (292 records, 0 failed, 0 skipped). It has **not** been run against a production snapshot,
 because no snapshot is available to this repository. That run is a rehearsal step in
-`22-cutover-runbook.md`, not a code gap.
+`CUTOVER-RUNBOOK.md`, not a code gap.
 
 This closes item §6.4 of the previous readiness report ("no Mongo → D1 metadata migration
 tooling"). Byte migration (Phase 10, `services/storage-migration/`) is separate and already existed.

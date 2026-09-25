@@ -26,6 +26,7 @@ import { getObjectStore } from '@/server/storage';
 import { buildOriginalKey, newStorageId } from '@/server/storage/keys';
 import type { RequestMeta } from '@/server/http/request-meta';
 import { requireFile } from './file-access';
+import { detach } from '@/server/runtime/detach';
 
 export interface RestoreVersionInput {
   versionId: string;
@@ -206,21 +207,23 @@ export async function restoreVersion(
       severity: 'notice',
     });
 
-    void activityRepository
-      .append({
-        organizationId: actor.organizationId,
-        actorUserId: actor.userId,
-        actorName: actor.name,
-        action: 'file.version_restore',
-        entityType: 'file',
-        entityId: fileId,
-        entityLabel: context.file.displayName,
-        detail: `restored version ${source.versionNumber} as version ${created.versionNumber}`,
-        contextFolderIds: context.file.folderPathAncestors,
-        departmentId: context.file.departmentId,
-        projectId: context.file.projectId,
-      })
-      .catch(() => undefined);
+    detach(
+      activityRepository
+        .append({
+          organizationId: actor.organizationId,
+          actorUserId: actor.userId,
+          actorName: actor.name,
+          action: 'file.version_restore',
+          entityType: 'file',
+          entityId: fileId,
+          entityLabel: context.file.displayName,
+          detail: `restored version ${source.versionNumber} as version ${created.versionNumber}`,
+          contextFolderIds: context.file.folderPathAncestors,
+          departmentId: context.file.departmentId,
+          projectId: context.file.projectId,
+        }),
+      'activity.append',
+    );
 
     return created;
   } catch (error) {

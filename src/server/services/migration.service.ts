@@ -67,6 +67,7 @@ import {
   type DriveReader,
 } from '@/server/migration/google-drive-client';
 import { requireFolder } from './folder-access';
+import { detach } from '@/server/runtime/detach';
 
 /** Bytes read back from staging to check the file is what its extension claims. */
 const SIGNATURE_SAMPLE_BYTES = 4096;
@@ -925,21 +926,23 @@ async function importItem(
         severity: 'notice',
       });
 
-      void activityRepository
-        .append({
-          organizationId: job.organizationId,
-          actorUserId: actor.userId,
-          actorName: actor.name,
-          action: 'file.upload',
-          entityType: 'file',
-          entityId: created.fileId,
-          entityLabel: displayName,
-          contextFolderIds: [...folder.pathAncestors, folder.id],
-          departmentId: folder.departmentId,
-          projectId: folder.projectId,
-          detail: { importedFrom: 'google_drive' },
-        })
-        .catch(() => undefined);
+      detach(
+        activityRepository
+          .append({
+            organizationId: job.organizationId,
+            actorUserId: actor.userId,
+            actorName: actor.name,
+            action: 'file.upload',
+            entityType: 'file',
+            entityId: created.fileId,
+            entityLabel: displayName,
+            contextFolderIds: [...folder.pathAncestors, folder.id],
+            departmentId: folder.departmentId,
+            projectId: folder.projectId,
+            detail: { importedFrom: 'google_drive' },
+          }),
+        'activity.append',
+      );
 
       return 'imported';
     } catch (error) {

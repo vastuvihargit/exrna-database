@@ -1,7 +1,9 @@
 {
   "$schema": "node_modules/wrangler/config-schema.json",
   "name": "biotech-research-drive",
-  "main": ".open-next/worker.js",
+  // The entrypoint wraps OpenNext's generated `.open-next/worker.js` with the configuration
+  // gate, the queue consumers and the cron trigger. See cloudflare-worker.ts.
+  "main": "cloudflare-worker.ts",
   "compatibility_date": "2026-07-01",
 
   // `nodejs_compat` gives workerd the Node built-ins this codebase still leans on
@@ -41,7 +43,8 @@
   // Declared now so every environment is shaped identically from Phase 1 onward, even
   // though nothing reads them until Phase 3 (DB) and Phase 4 (queues).
   //
-  // `database_id` values are placeholders. Create the real databases with
+  // !! PRODUCTION BLOCKER: every `database_id` below is the all-zero PLACEHOLDER, and a
+  // remote deploy or `--remote` migration with it fails. Create the real databases with
   //   npx wrangler d1 create biotech-drive-dev
   // and paste the returned id here. `wrangler dev` ignores the id and uses a local SQLite
   // file, so development works before any remote database exists.
@@ -59,11 +62,28 @@
     "producers": [
       { "binding": "SYNC_QUEUE", "queue": "biotech-drive-sync-dev" },
       { "binding": "NOTIFICATION_QUEUE", "queue": "biotech-drive-notifications-dev" }
+    ],
+    // Retries back off in the consumer; after max_retries a message lands in the
+    // dead-letter queue, which is where a failed delivery becomes visible. Nothing
+    // consumes the DLQs automatically: an operator reads and replays them.
+    "consumers": [
+      {
+        "queue": "biotech-drive-sync-dev",
+        "max_batch_size": 1,
+        "max_retries": 3,
+        "dead_letter_queue": "biotech-drive-sync-dlq-dev"
+      },
+      {
+        "queue": "biotech-drive-notifications-dev",
+        "max_batch_size": 10,
+        "max_batch_timeout": 5,
+        "max_retries": 5,
+        "dead_letter_queue": "biotech-drive-notifications-dlq-dev"
+      }
     ]
-    // Consumers, dead-letter queues and retry policy arrive in Phase 4 together with the
-    // handlers that service them. A consumer declared without a handler is a queue that
-    // silently swallows messages.
   },
+  // Enqueues one Drive synchronization every 15 minutes (DRIVE_SYNC_INTERVAL_MINUTES).
+  "triggers": { "crons": ["*/15 * * * *"] },
 
   // MIGRATION_WORKFLOW is deliberately absent until Phase 5.
   //
@@ -84,6 +104,9 @@
     "development": {
       "vars": {
         "NODE_ENV": "development",
+        // Explicit, and logged at startup. Staging and production leave it unset on purpose,
+        // so they refuse to boot until somebody decides.
+        "MALWARE_SCAN_MODE": "disabled",
         "APP_NAME": "Biotech Research Drive",
         "LOG_LEVEL": "debug",
         // Storage. A Worker has no persistent filesystem, so these are the only values it can
@@ -105,8 +128,28 @@
         "producers": [
           { "binding": "SYNC_QUEUE", "queue": "biotech-drive-sync-dev" },
           { "binding": "NOTIFICATION_QUEUE", "queue": "biotech-drive-notifications-dev" }
+        ],
+        // Retries back off in the consumer; after max_retries a message lands in the
+        // dead-letter queue, which is where a failed delivery becomes visible. Nothing
+        // consumes the DLQs automatically: an operator reads and replays them.
+        "consumers": [
+          {
+            "queue": "biotech-drive-sync-dev",
+            "max_batch_size": 1,
+            "max_retries": 3,
+            "dead_letter_queue": "biotech-drive-sync-dlq-dev"
+          },
+          {
+            "queue": "biotech-drive-notifications-dev",
+            "max_batch_size": 10,
+            "max_batch_timeout": 5,
+            "max_retries": 5,
+            "dead_letter_queue": "biotech-drive-notifications-dlq-dev"
+          }
         ]
-      }
+      },
+      // Enqueues one Drive synchronization every 15 minutes (DRIVE_SYNC_INTERVAL_MINUTES).
+      "triggers": { "crons": ["*/15 * * * *"] }
     },
 
     "staging": {
@@ -133,11 +176,35 @@
         "producers": [
           { "binding": "SYNC_QUEUE", "queue": "biotech-drive-sync-staging" },
           { "binding": "NOTIFICATION_QUEUE", "queue": "biotech-drive-notifications-staging" }
+        ],
+        // Retries back off in the consumer; after max_retries a message lands in the
+        // dead-letter queue, which is where a failed delivery becomes visible. Nothing
+        // consumes the DLQs automatically: an operator reads and replays them.
+        "consumers": [
+          {
+            "queue": "biotech-drive-sync-staging",
+            "max_batch_size": 1,
+            "max_retries": 3,
+            "dead_letter_queue": "biotech-drive-sync-dlq-staging"
+          },
+          {
+            "queue": "biotech-drive-notifications-staging",
+            "max_batch_size": 10,
+            "max_batch_timeout": 5,
+            "max_retries": 5,
+            "dead_letter_queue": "biotech-drive-notifications-dlq-staging"
+          }
         ]
-      }
+      },
+      // Enqueues one Drive synchronization every 15 minutes (DRIVE_SYNC_INTERVAL_MINUTES).
+      "triggers": { "crons": ["*/15 * * * *"] }
     },
 
     "production": {
+      // The only way in is the Access-protected custom domain. A *.workers.dev hostname would be a
+      // route around Access; the per-request assertion check refuses such requests anyway, and
+      // this removes the route entirely.
+      "workers_dev": false,
       "vars": {
         "NODE_ENV": "production",
         "APP_NAME": "Biotech Research Drive",
@@ -163,8 +230,28 @@
         "producers": [
           { "binding": "SYNC_QUEUE", "queue": "biotech-drive-sync-production" },
           { "binding": "NOTIFICATION_QUEUE", "queue": "biotech-drive-notifications-production" }
+        ],
+        // Retries back off in the consumer; after max_retries a message lands in the
+        // dead-letter queue, which is where a failed delivery becomes visible. Nothing
+        // consumes the DLQs automatically: an operator reads and replays them.
+        "consumers": [
+          {
+            "queue": "biotech-drive-sync-production",
+            "max_batch_size": 1,
+            "max_retries": 3,
+            "dead_letter_queue": "biotech-drive-sync-dlq-production"
+          },
+          {
+            "queue": "biotech-drive-notifications-production",
+            "max_batch_size": 10,
+            "max_batch_timeout": 5,
+            "max_retries": 5,
+            "dead_letter_queue": "biotech-drive-notifications-dlq-production"
+          }
         ]
-      }
+      },
+      // Enqueues one Drive synchronization every 15 minutes (DRIVE_SYNC_INTERVAL_MINUTES).
+      "triggers": { "crons": ["*/15 * * * *"] }
     }
   }
 
@@ -180,6 +267,17 @@
   //   GOOGLE_SERVICE_ACCOUNT_PRIVATE_KEY
   //   GOOGLE_SHARED_DRIVE_ID
   //   GOOGLE_WORKSPACE_DOMAIN
+  //   CF_ACCESS_TEAM_DOMAIN          required in production (loadWorkerEnv refuses to boot)
+  //   CF_ACCESS_AUD                  required in production, together with the team domain
+  //   MALWARE_SCAN_SECRET            only when MALWARE_SCAN_MODE=http
+  //
+  // Non-secret, set per environment under "vars" once decided:
+  //
+  //   MALWARE_SCAN_MODE              "http" or "disabled". Deliberately NOT set for staging or
+  //                                  production: choosing a scanner is a business decision, and
+  //                                  a Worker with no value refuses to boot rather than
+  //                                  silently running without one.
+  //   MALWARE_SCAN_ENDPOINT          https URL of the scanning service, when mode is "http"
   //
   // Locally they come from `.dev.vars`, which is git-ignored. See `.dev.vars.example`.
 }

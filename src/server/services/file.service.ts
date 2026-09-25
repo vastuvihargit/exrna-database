@@ -55,6 +55,7 @@ import {
 } from './file-access';
 import { requireFolder } from './folder-access';
 import { experimentService } from './experiment.service';
+import { detach } from '@/server/runtime/detach';
 
 export interface FileView extends FileRecord {
   isStarred: boolean;
@@ -68,15 +69,17 @@ export async function getFile(actor: Actor, fileId: string): Promise<FileView> {
   const context = await requireFile(actor, fileId, 'file.view');
   const starred = await starRepository.starredIdsAmong(actor.userId, 'file', [fileId]);
 
-  void recentRepository
-    .touch({
-      userId: actor.userId,
-      organizationId: actor.organizationId,
-      entityType: 'file',
-      entityId: fileId,
-      action: 'opened',
-    })
-    .catch(() => undefined);
+  detach(
+    recentRepository
+      .touch({
+        userId: actor.userId,
+        organizationId: actor.organizationId,
+        entityType: 'file',
+        entityId: fileId,
+        action: 'opened',
+      }),
+    'recent.touch',
+  );
 
   return toView(context, actor, starred.has(fileId));
 }
@@ -1071,20 +1074,22 @@ async function record(
     ...extra,
   });
 
-  void activityRepository
-    .append({
-      organizationId: actor.organizationId,
-      actorUserId: actor.userId,
-      actorName: actor.name,
-      action,
-      entityType: 'file',
-      entityId: file.id,
-      entityLabel: file.displayName,
-      contextFolderIds: file.folderPathAncestors,
-      departmentId: file.departmentId,
-      projectId: file.projectId,
-    })
-    .catch(() => undefined);
+  detach(
+    activityRepository
+      .append({
+        organizationId: actor.organizationId,
+        actorUserId: actor.userId,
+        actorName: actor.name,
+        action,
+        entityType: 'file',
+        entityId: file.id,
+        entityLabel: file.displayName,
+        contextFolderIds: file.folderPathAncestors,
+        departmentId: file.departmentId,
+        projectId: file.projectId,
+      }),
+    'activity.append',
+  );
 }
 
 export const fileService = {

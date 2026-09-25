@@ -23,6 +23,12 @@ const PUBLIC_ROUTES = new Set([
   'auth/reset-password/route.ts',
   'auth/google/route.ts',
   'auth/callback/google/route.ts',
+  // The Cloudflare Access sign-in bridge: how a session is obtained, so it cannot require one.
+  // It verifies the signed Access assertion itself and is 404 when Access is not configured.
+  'auth/access/route.ts',
+  // Queue delivery from the Worker entrypoint. Not a public route in any useful sense: it
+  // demands an in-process token that never leaves the isolate, and is 404 otherwise.
+  'internal/queues/route.ts',
   // Development-only. Unauthenticated because the switcher has to work while signed
   // out, which is the moment it is most useful. They are not protected by a session —
   // they are protected by not existing outside development, which the tests below
@@ -179,5 +185,21 @@ describe('API route protection', () => {
     }
 
     expect(leaks, `Routes referencing internal fields: ${leaks.join(', ')}`).toEqual([]);
+  });
+
+  it('the internal queue route refuses anything without the in-process token', async () => {
+    const source = await fsp.readFile(path.join(API_ROOT, 'internal/queues/route.ts'), 'utf8');
+    // Constant-time comparison against the isolate's token, before the body is even parsed.
+    expect(source).toContain('internalQueueToken()');
+    expect(source).toContain('safeCompare(');
+    expect(source.indexOf('safeCompare(')).toBeLessThan(source.indexOf('request.json()'));
+    expect(source).toContain("throw new NotFoundError('Not found')");
+  });
+
+  it('the Access bridge exists only when Access is configured and trusts only the signed assertion', async () => {
+    const source = await fsp.readFile(path.join(API_ROOT, 'auth/access/route.ts'), 'utf8');
+    expect(source).toContain('if (!config) throw new NotFoundError');
+    expect(source).toContain('readAccessToken(request.headers)');
+    expect(source.toLowerCase()).not.toContain('cf-access-authenticated-user-email');
   });
 });

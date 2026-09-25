@@ -42,7 +42,6 @@ import * as activityRepository from '@/server/repositories/activity.repository';
 import * as commentRepository from '@/server/repositories/comment.repository';
 import * as fileRepository from '@/server/repositories/file.repository';
 import * as versionRepository from '@/server/repositories/file-version.repository';
-import * as notificationRepository from '@/server/repositories/notification.repository';
 import * as reviewRepository from '@/server/repositories/review.repository';
 import type { ReviewRecord } from '@/server/repositories/review.repository';
 import * as userRepository from '@/server/repositories/user.repository';
@@ -53,6 +52,8 @@ import {
   fingerprintForReview,
 } from './approval-integrity.service';
 import { fileCan, requireFile, type FileContext } from './file-access';
+import { detach } from '@/server/runtime/detach';
+import { dispatchNotifications, newEventKey } from '@/server/queues/notification-dispatch';
 
 export interface ReviewView extends ReviewRecord {
   /** What the *viewer* may do with this request. */
@@ -168,24 +169,26 @@ export async function submitForReview(
     severity: 'notice',
   });
 
-  void activityRepository
-    .append({
-      organizationId: actor.organizationId,
-      actorUserId: actor.userId,
-      actorName: actor.name,
-      action: 'file.review_requested',
-      entityType: 'file',
-      entityId: fileId,
-      entityLabel: context.file.displayName,
-      detail: `submitted version ${version.versionNumber} for review`,
-      contextFolderIds: context.file.folderPathAncestors,
-      departmentId: context.file.departmentId,
-      projectId: context.file.projectId,
-    })
-    .catch(() => undefined);
+  detach(
+    activityRepository
+      .append({
+        organizationId: actor.organizationId,
+        actorUserId: actor.userId,
+        actorName: actor.name,
+        action: 'file.review_requested',
+        entityType: 'file',
+        entityId: fileId,
+        entityLabel: context.file.displayName,
+        detail: `submitted version ${version.versionNumber} for review`,
+        contextFolderIds: context.file.folderPathAncestors,
+        departmentId: context.file.departmentId,
+        projectId: context.file.projectId,
+      }),
+    'activity.append',
+  );
 
-  void notificationRepository
-    .createMany(
+  detach(
+    dispatchNotifications(
       reviewers.map((reviewer) => ({
         organizationId: actor.organizationId,
         userId: reviewer.id,
@@ -197,8 +200,10 @@ export async function submitForReview(
         entityLabel: context.file.displayName,
         message: `${actor.name} asked you to review "${context.file.displayName}" (version ${version.versionNumber})`,
       })),
-    )
-    .catch(() => undefined);
+      `review-requested:${review.id}`,
+    ),
+    'notifications.review-requested',
+  );
 
   return toView(actor, review, context);
 }
@@ -423,42 +428,50 @@ export async function decide(
     severity: 'notice',
   });
 
-  void activityRepository
-    .append({
-      organizationId: actor.organizationId,
-      actorUserId: actor.userId,
-      actorName: actor.name,
-      action: input.decision === 'approve' ? 'file.approve' : 'file.reject',
-      entityType: 'file',
-      entityId: review.fileId,
-      entityLabel: review.fileName,
-      detail: `${input.decision.replace('_', ' ')} on version ${review.versionNumber}`,
-      contextFolderIds: context.file.folderPathAncestors,
-      departmentId: context.file.departmentId,
-      projectId: context.file.projectId,
-    })
-    .catch(() => undefined);
+  detach(
+    activityRepository
+      .append({
+        organizationId: actor.organizationId,
+        actorUserId: actor.userId,
+        actorName: actor.name,
+        action: input.decision === 'approve' ? 'file.approve' : 'file.reject',
+        entityType: 'file',
+        entityId: review.fileId,
+        entityLabel: review.fileName,
+        detail: `${input.decision.replace('_', ' ')} on version ${review.versionNumber}`,
+        contextFolderIds: context.file.folderPathAncestors,
+        departmentId: context.file.departmentId,
+        projectId: context.file.projectId,
+      }),
+    'activity.append',
+  );
 
-  void notificationRepository
-    .create({
-      organizationId: actor.organizationId,
-      userId: review.requestedBy,
-      type: 'review.decided',
-      actorUserId: actor.userId,
-      actorName: actor.name,
-      entityType: 'file',
-      entityId: review.fileId,
-      entityLabel: review.fileName,
-      message:
-        close?.status === 'approved'
-          ? `${actor.name} approved "${review.fileName}" version ${review.versionNumber}`
-          : close?.status === 'rejected'
-            ? `${actor.name} rejected "${review.fileName}" version ${review.versionNumber}`
-            : close?.status === 'changes_requested'
-              ? `${actor.name} requested changes to "${review.fileName}" version ${review.versionNumber}`
-              : `${actor.name} recorded a decision on "${review.fileName}"`,
-    })
-    .catch(() => undefined);
+  detach(
+    dispatchNotifications(
+      [
+        {
+          organizationId: actor.organizationId,
+          userId: review.requestedBy,
+          type: 'review.decided',
+          actorUserId: actor.userId,
+          actorName: actor.name,
+          entityType: 'file',
+          entityId: review.fileId,
+          entityLabel: review.fileName,
+          message:
+            close?.status === 'approved'
+              ? `${actor.name} approved "${review.fileName}" version ${review.versionNumber}`
+              : close?.status === 'rejected'
+                ? `${actor.name} rejected "${review.fileName}" version ${review.versionNumber}`
+                : close?.status === 'changes_requested'
+                  ? `${actor.name} requested changes to "${review.fileName}" version ${review.versionNumber}`
+                  : `${actor.name} recorded a decision on "${review.fileName}"`,
+        },
+      ],
+      newEventKey(`review-decided:${review.id}`),
+    ),
+    'notifications.review-decided',
+  );
 
   return toView(actor, updated, context);
 }

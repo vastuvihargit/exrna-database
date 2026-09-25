@@ -25,6 +25,8 @@ import * as userRepository from '@/server/repositories/user.repository';
 import * as versionRepository from '@/server/repositories/file-version.repository';
 import type { RequestMeta } from '@/server/http/request-meta';
 import { fileCan, fileResource, loadFileContext, requireFile, type FileContext } from './file-access';
+import { detach } from '@/server/runtime/detach';
+import { dispatchNotifications } from '@/server/queues/notification-dispatch';
 
 export interface CommentView extends CommentRecord {
   replies: CommentRecord[];
@@ -130,23 +132,25 @@ export async function addComment(
     },
   });
 
-  void activityRepository
-    .append({
-      organizationId: actor.organizationId,
-      actorUserId: actor.userId,
-      actorName: actor.name,
-      action: 'file.comment',
-      entityType: 'file',
-      entityId: fileId,
-      entityLabel: context.file.displayName,
-      detail: parent ? 'replied to a comment' : 'commented',
-      contextFolderIds: context.file.folderPathAncestors,
-      departmentId: context.file.departmentId,
-      projectId: context.file.projectId,
-    })
-    .catch(() => undefined);
+  detach(
+    activityRepository
+      .append({
+        organizationId: actor.organizationId,
+        actorUserId: actor.userId,
+        actorName: actor.name,
+        action: 'file.comment',
+        entityType: 'file',
+        entityId: fileId,
+        entityLabel: context.file.displayName,
+        detail: parent ? 'replied to a comment' : 'commented',
+        contextFolderIds: context.file.folderPathAncestors,
+        departmentId: context.file.departmentId,
+        projectId: context.file.projectId,
+      }),
+    'activity.append',
+  );
 
-  void notify(actor, context, comment, parent, mentioned).catch(() => undefined);
+  detach(notify(actor, context, comment, parent, mentioned), 'notifications.comment');
 
   return { ...comment, replies: [], capabilities: capabilitiesFor(actor, context, comment) };
 }
@@ -403,8 +407,8 @@ async function notify(
     });
   }
 
-  void comment;
-  await notificationRepository.createMany(queue);
+  // Keyed on the comment, so a redelivered queue message cannot notify anybody twice.
+  await dispatchNotifications(queue, `comment:${comment.id}`);
 }
 
 async function hasViewAccess(userId: string, context: FileContext): Promise<boolean> {

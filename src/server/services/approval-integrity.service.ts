@@ -41,7 +41,6 @@ import { withTransaction } from '@/server/db/connection';
 import { getLogger } from '@/server/logging/logger';
 import { auditService } from '@/server/audit/audit.service';
 import * as fileRepository from '@/server/repositories/file.repository';
-import * as notificationRepository from '@/server/repositories/notification.repository';
 import * as versionRepository from '@/server/repositories/file-version.repository';
 import type {
   VersionApprovalBinding,
@@ -54,6 +53,7 @@ import type {
   GoogleDriveObjectStore,
 } from '@/server/storage/google/google-drive-object-store';
 import { isMissingObjectError } from '@/server/storage/missing-object';
+import { dispatchNotifications, newEventKey } from '@/server/queues/notification-dispatch';
 
 /**
  * What a check concluded.
@@ -334,19 +334,18 @@ async function supersedeApproval(input: {
   // detached to keep a person's request fast; nobody is waiting on this one, and telling the
   // owner their approval no longer holds is the point of the whole exercise rather than a
   // nicety that can be dropped if the process ends first.
-  await notificationRepository
-    .createMany(
-      [...recipients].map((userId) => ({
-        organizationId: file.organizationId,
-        userId,
-        type: 'review.reopened' as const,
-        entityType: 'file',
-        entityId: binding.fileId,
-        entityLabel: file.displayName,
-        message,
-      })),
-    )
-    .catch(() => undefined);
+  await dispatchNotifications(
+    [...recipients].map((userId) => ({
+      organizationId: file.organizationId,
+      userId,
+      type: 'review.reopened' as const,
+      entityType: 'file',
+      entityId: binding.fileId,
+      entityLabel: file.displayName,
+      message,
+    })),
+    newEventKey(`review-reopened:${binding.fileId}`),
+  ).catch(() => undefined);
 
   /**
    * Deliberately no activity-feed entry.

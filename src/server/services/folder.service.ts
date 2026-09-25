@@ -63,6 +63,7 @@ import {
 } from './folder-access';
 import { can } from '@/server/permissions/authorize';
 import { copyFilesForFolderCopy, purgeExpiredTrash as purgeExpiredFiles } from './file.service';
+import { detach } from '@/server/runtime/detach';
 
 /** Guard rail on recursive copy: a runaway copy is a denial-of-service on disk. */
 const MAX_COPY_FOLDERS = 2000;
@@ -90,15 +91,17 @@ export async function getFolder(
 
   // Opening a folder is what puts it in Recent. Failing to record that must never
   // fail the read itself.
-  void recentRepository
-    .touch({
-      userId: actor.userId,
-      organizationId: actor.organizationId,
-      entityType: 'folder',
-      entityId: context.folder.id,
-      action: 'opened',
-    })
-    .catch(() => undefined);
+  detach(
+    recentRepository
+      .touch({
+        userId: actor.userId,
+        organizationId: actor.organizationId,
+        entityType: 'folder',
+        entityId: context.folder.id,
+        action: 'opened',
+      }),
+    'recent.touch',
+  );
 
   return {
     folder: toView(context, actor, starred.has(context.folder.id)),
@@ -981,20 +984,22 @@ async function record(
   });
 
   // The activity feed is best-effort: it is a convenience, not the compliance record.
-  void activityRepository
-    .append({
-      organizationId: actor.organizationId,
-      actorUserId: actor.userId,
-      actorName: actor.name,
-      action,
-      entityType: 'folder',
-      entityId: folder.id,
-      entityLabel: folder.name,
-      contextFolderIds: folder.pathAncestors,
-      departmentId: folder.departmentId,
-      projectId: folder.projectId,
-    })
-    .catch(() => undefined);
+  detach(
+    activityRepository
+      .append({
+        organizationId: actor.organizationId,
+        actorUserId: actor.userId,
+        actorName: actor.name,
+        action,
+        entityType: 'folder',
+        entityId: folder.id,
+        entityLabel: folder.name,
+        contextFolderIds: folder.pathAncestors,
+        departmentId: folder.departmentId,
+        projectId: folder.projectId,
+      }),
+    'activity.append',
+  );
 }
 
 export const folderService = {

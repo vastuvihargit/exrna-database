@@ -78,6 +78,7 @@ import { getMalwareScanner, verdictBlocksContent } from '@/server/security/malwa
 import type { RequestMeta } from '@/server/http/request-meta';
 import { requireFolder } from './folder-access';
 import { requireFile } from './file-access';
+import { detach } from '@/server/runtime/detach';
 
 /**
  * Bytes inspected to check the file really is what it claims.
@@ -202,16 +203,18 @@ export async function authorizeUpload(
     expiresAt: new Date(Date.now() + env.INCOMPLETE_UPLOAD_RETENTION_HOURS * 3600_000),
   });
 
-  void auditService
-    .recordForActor(actor, meta, {
-      action: 'file.upload',
-      entityType: 'upload_session',
-      entityId: session.id,
-      entityLabel: displayName,
-      newValue: { folderId: folder.folder.id, declaredSize: input.size, extension },
-      outcome: 'success',
-    })
-    .catch(() => undefined);
+  detach(
+    auditService
+      .recordForActor(actor, meta, {
+        action: 'file.upload',
+        entityType: 'upload_session',
+        entityId: session.id,
+        entityLabel: displayName,
+        newValue: { folderId: folder.folder.id, declaredSize: input.size, extension },
+        outcome: 'success',
+      }),
+    'audit.recordForActor',
+  );
 
   return {
     sessionId: session.id,
@@ -624,21 +627,23 @@ async function buildFileFromSession(
       severity: 'notice',
     });
 
-    void activityRepository
-      .append({
-        organizationId: folder.organizationId,
-        actorUserId: actor.userId,
-        actorName: actor.name,
-        action: result.isNewFile ? 'file.upload' : 'file.version_upload',
-        entityType: 'file',
-        entityId: fileId,
-        entityLabel: session.displayName,
-        contextFolderIds: [...folder.pathAncestors, folder.id],
-        departmentId: folder.departmentId,
-        projectId: folder.projectId,
-        detail: { versionNumber: result.versionNumber, sizeBytes: measuredSize },
-      })
-      .catch(() => undefined);
+    detach(
+      activityRepository
+        .append({
+          organizationId: folder.organizationId,
+          actorUserId: actor.userId,
+          actorName: actor.name,
+          action: result.isNewFile ? 'file.upload' : 'file.version_upload',
+          entityType: 'file',
+          entityId: fileId,
+          entityLabel: session.displayName,
+          contextFolderIds: [...folder.pathAncestors, folder.id],
+          departmentId: folder.departmentId,
+          projectId: folder.projectId,
+          detail: { versionNumber: result.versionNumber, sizeBytes: measuredSize },
+        }),
+      'activity.append',
+    );
 
     await cleanupChunks(stagingSession);
 
