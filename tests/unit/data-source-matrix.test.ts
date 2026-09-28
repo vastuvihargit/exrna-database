@@ -17,6 +17,8 @@
  * Plus one structural check: every dependency named in the table must be a real module, since a
  * typo there would silently disable the guard for that edge.
  */
+import fs from 'node:fs';
+import path from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
 import {
   assertDataSourceMatrix,
@@ -184,6 +186,31 @@ describe('the table itself', () => {
     };
 
     for (const name of DATA_SOURCE_MODULES) visit(name, []);
+  });
+
+  /**
+   * A flag no repository reads is a production switch that does nothing: an operator flips it at
+   * cutover and believes something moved. `collaboration` and `jobs` were exactly that.
+   */
+  it('lists only modules that some repository actually routes on', () => {
+    const root = path.resolve(__dirname, '../../src');
+    const sources: string[] = [];
+    const walk = (dir: string): void => {
+      for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
+        const full = path.join(dir, entry.name);
+        if (entry.isDirectory()) walk(full);
+        else if (/\.tsx?$/.test(entry.name) && !full.endsWith('data-source.ts')) {
+          sources.push(fs.readFileSync(full, 'utf8'));
+        }
+      }
+    };
+    walk(root);
+    const code = sources.join('\n');
+
+    for (const name of DATA_SOURCE_MODULES) {
+      const read = new RegExp(`(?:isD1|dataSourceFor|configuredDataSourceFor)\\(\\s*['"]${name}['"]`);
+      expect(read.test(code), `${envVarFor(name)} is declared but no code routes on it`).toBe(true);
+    }
   });
 
   it('derives the environment variable name from the module name', () => {

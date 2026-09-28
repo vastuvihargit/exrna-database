@@ -24,8 +24,14 @@
 /**
  * Every module in the Phase 3 plan, in migration order.
  *
- * Listed in full from the start so the flag surface is fixed before the modules land, and so
- * `dataSourceSummary()` reports the ones still on Mongo rather than silently omitting them.
+ * Listed in full so `dataSourceSummary()` reports the ones still on Mongo rather than silently
+ * omitting them.
+ *
+ * Every entry is read by a repository façade; `tests/unit/data-source-matrix.test.ts` fails
+ * otherwise. `collaboration` and `jobs` were listed here once and named nothing — the
+ * collaboration tables have their own flags (comments, reviews, notifications), and the job
+ * tables belong to Node-only migration tools with no D1 repository. A switch that does nothing
+ * is worse than none: see DATA-SOURCE-FLAGS.md §2.1.
  */
 export const DATA_SOURCE_MODULES = [
   'organizations',
@@ -49,8 +55,6 @@ export const DATA_SOURCE_MODULES = [
   'comments',
   'driveSync',
   'uploadSessions',
-  'collaboration',
-  'jobs',
   'appSettings',
 ] as const;
 
@@ -170,8 +174,6 @@ export const DATA_SOURCE_DEPENDENCIES: Partial<Record<DataSourceModule, DataSour
   comments: ['organizations', 'users', 'files', 'fileVersions'],
   /** `result_file_id` and `result_version_id` are foreign keys, as are the folder and owner. */
   uploadSessions: ['organizations', 'users', 'folders', 'files', 'fileVersions'],
-  collaboration: ['organizations', 'users', 'files'],
-  jobs: ['organizations', 'users'],
   appSettings: ['organizations'],
 };
 

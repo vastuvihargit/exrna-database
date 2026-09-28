@@ -78,8 +78,6 @@ GOOGLE_CLIENT_SECRET=
 # DATA_SOURCE_COMMENTS=d1
 # DATA_SOURCE_DRIVE_SYNC=d1
 # DATA_SOURCE_UPLOAD_SESSIONS=d1
-# DATA_SOURCE_COLLABORATION=d1
-# DATA_SOURCE_JOBS=d1
 # DATA_SOURCE_APP_SETTINGS=d1
 #
 # ── The matrix is enforced, not advisory ──────────────────────────────────────────────

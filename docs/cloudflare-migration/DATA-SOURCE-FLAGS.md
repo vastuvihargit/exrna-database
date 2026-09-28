@@ -38,11 +38,31 @@ the two disagree, the code wins, and this document is wrong.
 | `DATA_SOURCE_COMMENTS` | comments, mentions | organizations, users, files, fileVersions | — |
 | `DATA_SOURCE_DRIVE_SYNC` | Drive change-feed cursor | — | — |
 | `DATA_SOURCE_UPLOAD_SESSIONS` | in-flight uploads | organizations, users, folders, files, fileVersions | — |
-| `DATA_SOURCE_COLLABORATION` | collaboration rows | organizations, users, files | — |
-| `DATA_SOURCE_JOBS` | job rows | organizations, users | — |
 | `DATA_SOURCE_APP_SETTINGS` | settings | organizations | — |
 
 ("+ x" means "everything the row above needs, plus x".)
+
+Twenty-two flags, and every one is read by a repository façade: setting it changes which database
+serves that module. `tests/unit/data-source-matrix.test.ts` fails if a flag is added that no repository
+reads.
+
+### 2.1 Removed: `DATA_SOURCE_COLLABORATION` and `DATA_SOURCE_JOBS`
+
+Both were listed from the start of Phase 3, "so the flag surface is fixed before the modules
+land", and both turned out to name nothing:
+
+* **Collaboration** — every table in `schema/collaboration.ts` already has its own flag:
+  comments (`COMMENTS`), reviews and approvals (`REVIEWS`), notifications (`NOTIFICATIONS`).
+* **Jobs** — the remaining tables in `schema/jobs.ts` belong to the Personal-Drive import and the
+  local-disk → Drive storage migration. Those tools read the local filesystem by definition, run
+  on Node only, and have no D1 repository (on a Worker their routes answer
+  `501 NODE_ONLY_OPERATION`). Upload sessions and the Drive cursor, the two job-like tables a
+  Worker does use, have their own flags.
+
+No code read either variable. A production switch that does nothing is worse than none: an
+operator would "flip" it at cutover and believe something had moved. They were removed from the
+matrix, from `workerReadinessGaps()`, and from the runbooks. A leftover
+`DATA_SOURCE_COLLABORATION` / `DATA_SOURCE_JOBS` in an environment is simply ignored.
 
 ## 3. Unsafe combinations fail closed, at startup
 
