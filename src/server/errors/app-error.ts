@@ -32,6 +32,8 @@ export type ErrorCode =
   | 'CIRCULAR_MOVE'
   | 'UPLOAD_SESSION_EXPIRED'
   | 'SERVICE_UNAVAILABLE'
+  /** A Node-only administrative tool reached on a Worker. See `http/node-only.ts`. */
+  | 'NODE_ONLY_OPERATION'
   | 'INTERNAL_ERROR';
 
 export class AppError extends Error {

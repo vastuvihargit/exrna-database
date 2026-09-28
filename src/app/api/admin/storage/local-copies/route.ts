@@ -1,7 +1,7 @@
 import type { NextRequest } from 'next/server';
 import { z } from 'zod';
 
-import { withAuthenticatedRoute } from '@/server/http/authenticated-route';
+import { NODE_ONLY_FEATURES, withNodeOnlyRoute } from '@/server/http/node-only';
 import { ok } from '@/server/http/api-response';
 import { assertCompanyPermission } from '@/server/permissions/authorize';
 import { localCopyService } from '@/server/services/storage-migration/local-copies';
@@ -27,7 +27,7 @@ const sweepSchema = z.object({
  * Read-only, and the natural first call: an administrator deciding whether to archive needs
  * to know how much disk it would return before deciding anything.
  */
-export const GET = withAuthenticatedRoute(async (_request: NextRequest, { actor }) => {
+export const GET = withNodeOnlyRoute(NODE_ONLY_FEATURES.localCopies, async (_request: NextRequest, { actor }) => {
   assertCompanyPermission(actor, 'access.manage');
   const [summary, candidates] = await Promise.all([
     localCopyService.summarizeLocalCopies(),
@@ -60,7 +60,7 @@ export const GET = withAuthenticatedRoute(async (_request: NextRequest, { actor 
  * Never scheduled, never a side effect of anything else. §18 of the brief asks for exactly
  * that, and the reason is that this is the only irreversible step in the whole migration.
  */
-export const POST = withAuthenticatedRoute(async (request: NextRequest, { actor, meta }) => {
+export const POST = withNodeOnlyRoute(NODE_ONLY_FEATURES.localCopies, async (request: NextRequest, { actor, meta }) => {
   assertCompanyPermission(actor, 'access.manage');
 
   const body: unknown = await request.json().catch(() => ({}));
