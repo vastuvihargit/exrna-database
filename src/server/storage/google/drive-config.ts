@@ -32,6 +32,7 @@
 import fs from 'fs';
 import { getEnv } from '@/server/config/env';
 import { StorageError } from '@/server/errors/app-error';
+import { isWorkerRuntime } from '@/server/runtime';
 
 export interface DriveStorageConfig {
   /** The Shared Drive every object lives in. Never an individual's My Drive. */
@@ -186,7 +187,8 @@ export function describeDriveStorage(): DriveStorageConfigSummary {
     const config = getDriveStorageConfig();
     const warnings: string[] = [];
 
-    if (config.keySource === 'inline' && env.isProduction) {
+    // A Worker has no filesystem to mount a key into; its Cloudflare secret *is* the secret store.
+    if (config.keySource === 'inline' && env.isProduction && !isWorkerRuntime()) {
       warnings.push(
         'The service-account key is set inline in the environment. In production it should be a mounted ' +
           'secret (GOOGLE_DRIVE_SERVICE_ACCOUNT_PRIVATE_KEY_FILE) so it is not visible to anything that can ' +

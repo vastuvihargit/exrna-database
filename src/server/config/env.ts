@@ -10,6 +10,7 @@
 import path from 'path';
 import { z } from 'zod';
 import { assertDataSourceMatrix } from '@/server/repositories/data-source';
+import { isWorkerRuntime } from '@/server/runtime';
 
 const bool = (defaultValue: boolean) =>
   z
@@ -537,9 +538,59 @@ function assertRootsArePrivate(roots: StorageRoots): void {
   }
 }
 
+/**
+ * The Node-only settings, as a Worker sees them.
+ *
+ * Application code reads this schema in both runtimes (`getEnv()`), but a Worker has no MongoDB
+ * and no filesystem, and is deliberately *not* configured with `MONGODB_URI` or the storage roots
+ * (EXTERNAL-SETUP.md §1.6). Without these, a Worker configured exactly as documented passes its
+ * own startup gate (`loadWorkerEnv`) and then fails every request that reads `getEnv()`.
+ *
+ * The values are unusable on purpose — an `.invalid` host (RFC 2606) and a root that says what it
+ * is — never a working fallback: Mongoose is refused in a Worker before it could connect
+ * (`db/connection.ts`), and nothing on the Worker path touches a storage root. A value that *is*
+ * set always wins, and on Node nothing changes: both remain required.
+ */
+const WORKER_NODE_ONLY_DEFAULTS: Readonly<Record<string, string>> = {
+  MONGODB_URI: 'mongodb://no-mongodb-on-a-worker.invalid/none',
+  LOCAL_STORAGE_ROOT: '/no-filesystem-on-a-worker/storage',
+  TEMP_UPLOAD_ROOT: '/no-filesystem-on-a-worker/temp',
+  QUARANTINE_ROOT: '/no-filesystem-on-a-worker/quarantine',
+  PREVIEW_ROOT: '/no-filesystem-on-a-worker/previews',
+  EXPORT_ROOT: '/no-filesystem-on-a-worker/exports',
+  BACKUP_ROOT: '/no-filesystem-on-a-worker/backups',
+};
+
+/**
+ * The Drive service-account names the Worker is configured with (`GOOGLE_SERVICE_ACCOUNT_*`,
+ * EXTERNAL-SETUP.md §1.6) and the longer ones this schema and the storage layer read
+ * (`GOOGLE_DRIVE_SERVICE_ACCOUNT_*`). `env.worker.ts` accepts both for its startup gate; without
+ * the same aliasing here, a Worker configured as documented passed that gate and then failed
+ * `getEnv()` on "GOOGLE_DRIVE_SERVICE_ACCOUNT_EMAIL is required". Either name works in either
+ * runtime; the longer one wins when both are set.
+ */
+const DRIVE_CREDENTIAL_ALIASES: ReadonlyArray<readonly [canonical: string, alias: string]> = [
+  ['GOOGLE_DRIVE_SERVICE_ACCOUNT_EMAIL', 'GOOGLE_SERVICE_ACCOUNT_EMAIL'],
+  ['GOOGLE_DRIVE_SERVICE_ACCOUNT_PRIVATE_KEY', 'GOOGLE_SERVICE_ACCOUNT_PRIVATE_KEY'],
+];
+
+function withRuntimeDefaults(source: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
+  const filled: NodeJS.ProcessEnv = { ...source };
+  for (const [canonical, alias] of DRIVE_CREDENTIAL_ALIASES) {
+    if (!filled[canonical] && filled[alias]) filled[canonical] = filled[alias];
+  }
+  if (isWorkerRuntime()) {
+    for (const [name, value] of Object.entries(WORKER_NODE_ONLY_DEFAULTS)) {
+      if (!filled[name]) filled[name] = value;
+    }
+  }
+  return filled;
+}
+
 let cached: AppEnv | null = null;
 
-export function loadEnv(source: NodeJS.ProcessEnv = process.env): AppEnv {
+export function loadEnv(input: NodeJS.ProcessEnv = process.env): AppEnv {
+  const source = withRuntimeDefaults(input);
   const parsed = envSchema.safeParse(source);
 
   if (!parsed.success) {
@@ -554,13 +605,17 @@ export function loadEnv(source: NodeJS.ProcessEnv = process.env): AppEnv {
   assertDevSwitcherNotRequestedInProduction(parsed.data, source);
 
   const raw = parsed.data;
-  // Scanning that is enabled in production fails closed unless the operator has
-  // explicitly said otherwise. Applied here rather than in the schema so the reason sits
-  // next to the decision.
+  // Scanning that is enabled fails closed unless the operator has explicitly said otherwise —
+  // in production, on staging (where the rehearsal runs on a production snapshot) and on any
+  // Worker. Only a developer's machine defaults to failing open, so a missing clamd does not
+  // stop anyone working. Applied here rather than in the schema so the reason sits next to the
+  // decision.
+  const failClosedByDefault =
+    raw.NODE_ENV === 'production' || raw.NODE_ENV === 'staging' || isWorkerRuntime();
   const v: RawEnv = {
     ...raw,
     MALWARE_SCAN_FAIL_CLOSED:
-      raw.NODE_ENV === 'production' && resolveMalwareScanMode(raw) !== 'disabled'
+      failClosedByDefault && resolveMalwareScanMode(raw) !== 'disabled'
         ? source.MALWARE_SCAN_FAIL_CLOSED === 'false' || source.MALWARE_SCAN_FAIL_CLOSED === '0'
           ? false
           : true
