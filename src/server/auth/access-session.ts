@@ -47,6 +47,7 @@ import {
 } from './cloudflare-access';
 import { resolveSession, type ResolvedSession } from './session.service';
 import { getLogger } from '@/server/logging/logger';
+import { isWorkerRuntime } from '@/server/runtime';
 
 export function accessConfig(): AccessConfig | null {
   return accessConfigFrom(getEnv());
@@ -54,6 +55,29 @@ export function accessConfig(): AccessConfig | null {
 
 export function isAccessEnforced(): boolean {
   return accessConfig() !== null;
+}
+
+/**
+ * What a user is told when the application does not own their password.
+ *
+ * With Cloudflare Access in front, identity — and so password recovery — belongs to the company
+ * identity provider (Google Workspace). Shared by the API refusal and the two recovery pages.
+ */
+export const EXTERNAL_PASSWORD_RECOVERY_MESSAGE =
+  'Sign-in is handled by your company single sign-on, so this application does not hold your ' +
+  'password. To recover access, use your identity provider’s account recovery (for Google ' +
+  'Workspace, “Forgot password?” on the Google sign-in page) or ask your Workspace administrator.';
+
+/**
+ * Whether the application's own password reset exists on this deployment.
+ *
+ * No when Access is enforced (identity is external), and no on a Worker at all: the reset-token
+ * store is a MongoDB collection with deliberately no D1 counterpart — a production Worker always
+ * runs behind Access, so building one would serve nobody — and the argon2 hash a reset writes
+ * cannot be computed there. The legacy Node deployment keeps the flow unchanged.
+ */
+export function isPasswordRecoveryAvailable(): boolean {
+  return !isAccessEnforced() && !isWorkerRuntime();
 }
 
 /**

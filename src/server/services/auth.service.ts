@@ -36,7 +36,11 @@ import { enforce, reset, RATE_LIMITS } from '@/server/auth/rate-limit';
 import { generateToken, hashToken } from '@/server/auth/tokens';
 import { issueSession, revokeAllSessions, type IssuedSession } from '@/server/auth/session.service';
 import { Types } from 'mongoose';
-import { isAccessEnforced } from '@/server/auth/access-session';
+import {
+  EXTERNAL_PASSWORD_RECOVERY_MESSAGE,
+  isAccessEnforced,
+  isPasswordRecoveryAvailable,
+} from '@/server/auth/access-session';
 
 const FAILED_LOGIN_LOCK_THRESHOLD = 5;
 const GENERIC_LOGIN_ERROR = 'Incorrect email address or password';
@@ -54,6 +58,16 @@ export interface LoginInput {
  * lookup. Regardless of which check fails, the caller sees one message.
  */
 /** Refuses password flows when Cloudflare Access is the configured sign-in method. */
+/**
+ * Password reset, request and completion alike. Refused before anything else runs — no rate-limit
+ * counter, no user lookup, no MongoDB — wherever the application does not own the password:
+ * behind Cloudflare Access, and on any Worker (see `isPasswordRecoveryAvailable`). The message
+ * sends the user to the identity provider's own recovery.
+ */
+function assertPasswordRecoveryAvailable(): void {
+  if (!isPasswordRecoveryAvailable()) throw new ForbiddenError(EXTERNAL_PASSWORD_RECOVERY_MESSAGE);
+}
+
 function assertPasswordAuthAvailable(): void {
   if (isAccessEnforced()) {
     throw new ForbiddenError(
@@ -68,12 +82,12 @@ export async function loginWithPassword(input: LoginInput, meta: RequestMeta): P
   assertPasswordAuthAvailable();
   const env = getEnv();
 
-  enforce(`login:ip:${meta.ip}`, RATE_LIMITS.login);
+  await enforce(`login:ip:${meta.ip}`, RATE_LIMITS.login);
 
   const parsed = parseEmail(input.email);
   const emailForLog = parsed?.normalized ?? String(input.email).slice(0, 320).toLowerCase();
 
-  enforce(`login:email:${emailForLog}`, RATE_LIMITS.loginPerEmail);
+  await enforce(`login:email:${emailForLog}`, RATE_LIMITS.loginPerEmail);
 
   const allowedDomains = await organizationRepository.getSignInDomains(env.COMPANY_EMAIL_DOMAINS);
   const email = normalizeCompanyEmail(input.email, allowedDomains);
@@ -195,7 +209,7 @@ export async function loginWithPassword(input: LoginInput, meta: RequestMeta): P
   });
 
   await userRepository.recordSuccessfulLogin(user.id);
-  reset(`login:email:${email}`);
+  await reset(`login:email:${email}`);
 
   await loginHistory.record({
     userId: user.id,
@@ -412,15 +426,13 @@ export async function requestPasswordReset(
   emailInput: string,
   meta: RequestMeta,
 ): Promise<{ token: string; email: string; userId: string } | null> {
-  // With Cloudflare Access in front, Access is the only way in. A password path left open
-  // beside it would be a second front door that bypasses the company identity provider.
-  assertPasswordAuthAvailable();
+  assertPasswordRecoveryAvailable();
   const env = getEnv();
 
-  enforce(`pwreset:ip:${meta.ip}`, RATE_LIMITS.passwordResetPerIp);
+  await enforce(`pwreset:ip:${meta.ip}`, RATE_LIMITS.passwordResetPerIp);
 
   const parsed = parseEmail(emailInput);
-  if (parsed) enforce(`pwreset:email:${parsed.normalized}`, RATE_LIMITS.passwordResetPerEmail);
+  if (parsed) await enforce(`pwreset:email:${parsed.normalized}`, RATE_LIMITS.passwordResetPerEmail);
 
   const allowedDomains = await organizationRepository.getSignInDomains(env.COMPANY_EMAIL_DOMAINS);
   const email = normalizeCompanyEmail(emailInput, allowedDomains);
@@ -459,9 +471,7 @@ export async function completePasswordReset(
   input: { token: string; password: string },
   meta: RequestMeta,
 ): Promise<void> {
-  // With Cloudflare Access in front, Access is the only way in. A password path left open
-  // beside it would be a second front door that bypasses the company identity provider.
-  assertPasswordAuthAvailable();
+  assertPasswordRecoveryAvailable();
   await connectToDatabase();
 
   const record = await PasswordResetTokenModel.findOne({
