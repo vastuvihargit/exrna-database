@@ -28,7 +28,7 @@ It is fixed by `cloudflare-worker.ts`, the new `main`.
 |---|---|
 | `fetch` | Runs `assertBindings` + `loadWorkerEnv` once per isolate. If they fail, every request gets a **503** with a generic body, and the reason is logged at `fatal` with `source: worker-entry`. If they pass, the request goes to the OpenNext handler, unchanged. |
 | `queue` | Maps the queue name to `sync` or `notifications` and hands each message to the consumer (see §3). The consumer's outcome decides the call: `ack`, `retry({ delaySeconds })`, or `drop`, which is an ack plus an error log. A batch arriving while the configuration is rejected is retried as a whole, never lost. |
-| `scheduled` | The cron trigger (`*/15 * * * *`). It enqueues one `drive.sync` message; it does not run the sync inline. |
+| `scheduled` | Two cron triggers, mapped to messages by `src/server/queues/schedule.ts`: `*/15 * * * *` enqueues one `drive.sync`; `7 * * * *` enqueues `maintenance.run` messages — `uploads.cleanup` and `approvals.check` hourly, plus `trash.purge` and `inventory.expire` at 03:07 UTC. Nothing runs inline; an unknown cron expression enqueues nothing and logs an error. |
 
 The startup log line records the Access and malware-scanning configuration. A deployment running
 with `MALWARE_SCAN_MODE=disabled` logs a `warn` saying so.
@@ -71,6 +71,21 @@ re-derived from the database.
   * Sync error → `retry` after 60 s.
   * After `max_retries: 3` → `biotech-drive-sync-dlq-<env>`.
 * `max_batch_size: 1`: two syncs in parallel would contend for one cursor for no gain.
+
+### 3.1a Scheduled maintenance (`SYNC_QUEUE`, `kind: 'maintenance.run'`)
+
+* Message: `{ kind: 'maintenance.run', job, trigger, requestedAt }`, strict; `job` is an enum
+  (`uploads.cleanup`, `approvals.check`, `trash.purge`, `inventory.expire`). A message cannot
+  choose an organization, a limit or a target.
+* The consumer (`consumeSyncQueue` → `consumeMaintenance`) calls
+  `services/maintenance.service.ts`, which calls the same service function the Node scheduler's
+  script calls, so the two deployments cannot drift.
+* **Idempotent:** trash already purged is gone, an expired batch already written off holds zero
+  (overlapping sweeps write it off once — `tests/d1/inventory-repository.test.ts`), a released
+  upload session no longer exists. A redelivery finds nothing to do.
+* **Outcomes:** malformed or unknown job → `drop` (logged at error); a thrown error → `retry`
+  with exponential backoff (30 s … 15 min), then the sync DLQ. Tests:
+  `tests/integration/queue-consumers.test.ts` § scheduled maintenance consumer.
 
 ### 3.2 Notifications (`NOTIFICATION_QUEUE`)
 
@@ -146,7 +161,8 @@ Declared identically for `development`, `staging` and `production`, and for the 
 
 * producers `SYNC_QUEUE` and `NOTIFICATION_QUEUE`, unchanged;
 * consumers with retry limits and dead-letter queues;
-* `triggers.crons: ["*/15 * * * *"]`.
+* `triggers.crons: ["*/15 * * * *", "7 * * * *"]` (`tests/unit/queue-schedule.test.ts` fails if an environment declares a trigger the code does not handle);
+* the `RATE_LIMITER` Durable Object binding and its `migrations` entry.
 
 **Queues to create per environment (external action):**
 

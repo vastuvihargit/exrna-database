@@ -132,7 +132,7 @@ Closing line: *"When someone asks 'who approved this and when', the answer exist
 | *"What if we lose the server?"* | Daily database backups, daily incremental + weekly full file backups, encrypted and copied off-server, with an automated weekly restore drill. |
 | *"Can someone sneak a virus in?"* | Uploads are quarantined, virus-scanned, and checked that the file's actual contents match its name before anything is stored. |
 | *"Can I delete something by mistake?"* | Deleting offers Undo immediately; trash is recoverable for 30 days. Folder deletion asks first. |
-| *"Is this a LIMS?"* | No — deliberately. It's a *drive*. Sample inventory, plate maps, and instrument integrations are explicitly out of scope. |
+| *"Is this a LIMS?"* | No — deliberately. It's a *drive*, with a reagent/consumable **inventory** alongside it (items, batches, receive and issue, an append-only stock ledger, automatic expiry write-off). Sample tracking, plate maps and instrument integrations are out of scope. |
 | *"Is it validated / 21 CFR Part 11 compliant?"* | **Do not claim this.** The design (immutable versions + full audit trail) is compatible with a future compliance project, but no compliance claim is being made today. |
 | *"What about editing documents in the browser?"* | Not built. The unit of change here is a new version, not live co-editing. |
 | *"Can we search inside file contents?"* | Not yet — today search covers names and metadata. Content search is the next planned phase. |
@@ -189,7 +189,10 @@ sell the product, so protect those and drop steps 1, 2 or 6 if time or luck runs
 
 Phases 0–11 are complete: architecture, authentication, drive core, upload, preview, metadata and
 versioning, sharing, review and approval, research organization, Google Drive migration, and
-production hardening. **369 automated tests pass.** Phase 12 (content search, object storage,
+production hardening. Inventory is complete. The move to Cloudflare (Worker + D1 + Google Shared Drive, behind Cloudflare
+Access) is code-complete and tested locally, and awaits a production-shaped rehearsal before
+cutover; see [`docs/cloudflare-migration/FINAL-READINESS.md`](./docs/cloudflare-migration/FINAL-READINESS.md)
+for current test counts and status. Phase 12 (content search, object storage,
 external collaborators, desktop sync) is deliberately deferred until the core is proven in real use.
 
 Deeper reading: [`README.md`](./README.md) · [`docs/employee-guide.md`](./docs/employee-guide.md) ·

@@ -1,6 +1,23 @@
 # Inventory Management — Phase 0 analysis
 
-Status: **analysis only, no code written.**
+Status: **implemented.** This was the Phase 0 analysis; the module now exists on both engines.
+What was built, and where it diverges from this analysis:
+
+* Items, batches and the append-only stock ledger — MongoDB and D1
+  (`docs/cloudflare-migration/18-phase-3-module-15-inventory.md`), with the stock UI (receive,
+  issue, adjust, history, overview).
+* **Expiry sweep, scheduled.** `stockService.sweepExpired` writes expired batches off (one
+  `expired` ledger row each, idempotent — a second run writes nothing, and overlapping runs write
+  each batch off once). It runs daily: `npm run inventory:expire` from the Node scheduler
+  (`docker/scheduler/crontab`, 03:20), and on the Cloudflare Worker from the `7 * * * *` cron at
+  03:07 UTC through the maintenance queue (`src/server/queues/schedule.ts`). Scoped to the
+  deployment's organization, resolved server-side; each automatic run that writes anything leaves
+  a system audit record.
+* Tests: `tests/d1/inventory-repository.test.ts` (both engines, stock integration and the
+  overlapping-sweep case), `tests/security/inventory-permissions.test.ts` (who may move stock,
+  the sweep's scope and idempotency), `e2e/20-inventory.spec.ts` (the UI).
+* **Not built:** the stock-request workflow (§9, deferred — see the end of this document). It is not required for the
+  current release.
 
 The Research Drive is a mature, strictly layered application (validation → permission →
 service → repository → MongoDB / storage). This module is added *inside* those layers, not

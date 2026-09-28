@@ -3,7 +3,15 @@
 A secure, company-internal, Google-Drive-like platform for R&D data: upload, organize, preview,
 search, share, review, version and audit every research file in one place.
 
-**MongoDB stores metadata. A private server volume stores the bytes. Nothing is public.**
+**Two deployments, one codebase. Nothing is public.**
+
+| | Stack | State |
+|---|---|---|
+| **Current production** (legacy) | Node + MongoDB metadata, bytes on a private server volume and/or the company Google Shared Drive | serving; the rollback target after cutover |
+| **Target** | Cloudflare Worker (OpenNext) + D1 metadata + Google Shared Drive bytes, behind Cloudflare Access | code complete and tested locally; **not yet deployed** — see [`docs/cloudflare-migration/FINAL-READINESS.md`](./docs/cloudflare-migration/FINAL-READINESS.md) |
+
+Which database serves each module is chosen per module by `DATA_SOURCE_*` flags
+([flag matrix](./docs/cloudflare-migration/DATA-SOURCE-FLAGS.md)); unset means MongoDB.
 
 ---
 
@@ -23,9 +31,14 @@ search, share, review, version and audit every research file in one place.
 | 9 | Research organization | ✅ Complete |
 | 10 | Google Drive migration | ✅ Complete |
 | 11 | Backup, security & production hardening | ✅ Complete |
+| — | Inventory (items, batches, stock ledger, scheduled expiry write-off) | ✅ Complete — [`docs/inventory/`](./docs/inventory/00-analysis.md) |
+| — | Cloudflare migration (Worker, D1, Access, queues, migration tooling, runbooks) | ✅ Code complete; production rehearsal pending — [`docs/cloudflare-migration/`](./docs/cloudflare-migration/FINAL-READINESS.md) |
 | 12 | Optional advanced features | 📋 Not started — deliberately deferred until the core is proven in use |
 
-**369 tests passing.** See the [changelog](./CHANGELOG.md) for what each phase decided and why.
+Test suites: `npm run test:mongo` (MongoDB + unit), `npm run test:d1` (D1 repositories on a real
+local workerd SQLite), `npm run test:e2e` (Playwright, real browser against D1). Current counts
+are in [`FINAL-READINESS.md`](./docs/cloudflare-migration/FINAL-READINESS.md) §3. See the
+[changelog](./CHANGELOG.md) for what each phase decided and why.
 
 ## Quick start (local, without Docker)
 
@@ -71,8 +84,14 @@ rebuilds, restarts and redeploys.
 | `npm run dev` / `build` / `start` | Next.js dev, production build, production server |
 | `npm run typecheck` | `tsc --noEmit` |
 | `npm run lint` | ESLint, including the architectural boundary rules |
-| `npm test` | Full Vitest suite (unit + integration) |
+| `npm test` | Both Vitest suites (`test:mongo` then `test:d1`) |
+| `npm run test:mongo` / `test:d1` | MongoDB + unit suites / D1 suites (needs `npm run db:migrate:local` once) |
+| `npm run test:e2e` | Playwright browser suite on a seeded local D1 ([how](./docs/cloudflare-migration/25-browser-e2e.md)) |
 | `npm run test:coverage` | Coverage, gated on the storage layer |
+| `npm run cf:build` / `cf:preview` | Cloudflare Worker build / local Worker preview (`-- --env development`) |
+| `npm run db:generate` / `db:migrate:local` | Drizzle migration generation (must be a no-op on a clean tree) / apply D1 migrations locally |
+| `npm run migrate:validate` / `migrate:d1` / `migrate:verify` | Mongo → D1: source validation, migration (dry run by default), verification |
+| `npm run inventory:expire` | Write off expired inventory stock (idempotent; scheduled daily) |
 | `npm run check:env` | Validate configuration without booting the app |
 | `npm run storage:init` | Create the storage tree and prove it is writable |
 | `npm run verify:storage` | Integrity check — run after every restore and every deploy |
@@ -175,6 +194,7 @@ damage what protects it. Admin → System shows what that reporting says.
 | Operators | [Runbook](./docs/operations/runbook.md) · [Backup and restore](./docs/operations/backup-and-restore.md) |
 | Security review | [Hardening](./docs/security/hardening.md) · [Threat model](./docs/phase-0/08-security-threat-model.md) |
 | Architecture | [`docs/phase-0/`](./docs/phase-0/README.md) — the design contract |
+| Cloudflare migration | [Readiness](./docs/cloudflare-migration/FINAL-READINESS.md) · [External setup](./docs/cloudflare-migration/EXTERNAL-SETUP.md) · [Rehearsal](./docs/cloudflare-migration/REHEARSAL.md) · [Cutover](./docs/cloudflare-migration/CUTOVER-RUNBOOK.md) · [Rollback](./docs/cloudflare-migration/ROLLBACK-RUNBOOK.md) |
 
 The design documents are the contract; [`CHANGELOG.md`](./CHANGELOG.md) records what each
 phase actually decided, including where it departed from the plan and why.

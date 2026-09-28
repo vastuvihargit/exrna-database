@@ -32,8 +32,9 @@ Deploying it would give a production-mode Worker bound to the dev D1.
 | Binding | Type | Used by |
 |---|---|---|
 | `DB` | D1 | every repository (`db/d1-context.ts`), health check |
-| `SYNC_QUEUE` | Queue producer | cron → Drive sync |
+| `SYNC_QUEUE` | Queue producer | cron → Drive sync and scheduled maintenance jobs |
 | `NOTIFICATION_QUEUE` | Queue producer | `dispatchNotifications` |
+| `RATE_LIMITER` | Durable Object namespace (class `RateLimiter`, exported by `cloudflare-worker.ts`) | `auth/rate-limit.ts` — exact rate-limit counters across isolates |
 | `ASSETS` | Static assets | OpenNext |
 
 ### 2.2 Resources per environment (`<env>` = `dev` | `staging` | `production`)
@@ -45,7 +46,8 @@ Deploying it would give a production-mode Worker bound to the dev D1.
 | Queue | `biotech-drive-sync-dlq-<env>` (dead letters; no consumer) |
 | Queue | `biotech-drive-notifications-<env>` (consumer: this Worker, batch 10, 5 retries) |
 | Queue | `biotech-drive-notifications-dlq-<env>` (dead letters; no consumer) |
-| Cron trigger | `*/15 * * * *` → enqueue a Drive sync |
+| Cron triggers | `*/15 * * * *` → enqueue a Drive sync; `7 * * * *` → enqueue the hourly maintenance jobs (expired uploads, approval check) and, at 03:07 UTC, the daily ones (trash purge, inventory expiry) |
+| Durable Object | `RateLimiter` (SQLite-backed, migration tag `v1-rate-limiter`; created by the first deploy, Workers Paid plan) |
 | Access application | one per public hostname (`22-cloudflare-access.md`) |
 
 ## 3. Required secrets, by name only
@@ -77,7 +79,7 @@ Non-secret vars already in `wrangler.jsonc` for every environment:
 Vars still to add per environment:
 
 * `MALWARE_SCAN_MODE`, `MALWARE_SCAN_ENDPOINT`;
-* the 24 `DATA_SOURCE_*=d1` flags (`DATA-SOURCE-FLAGS.md`), at cutover step 13;
+* the 22 `DATA_SOURCE_*=d1` flags (`DATA-SOURCE-FLAGS.md`), at cutover step 15;
 * `MAINTENANCE_MODE`, only when needed.
 
 ## 4. What the Worker refuses at boot
@@ -101,7 +103,7 @@ line with the reason. It refuses:
 * The Worker gate above was **never executed**: `main` pointed at OpenNext's output directly. It
   is now wired through `cloudflare-worker.ts`.
 * `.dev.vars.example` claimed `files` had no D1 implementation and listed eleven flags. It now
-  lists all 24 and points at the matrix.
+  lists all 22 and points at the matrix.
 * `wrangler.jsonc`:
   * no consumers, DLQs or cron (added);
   * production allowed `*.workers.dev` (disabled);

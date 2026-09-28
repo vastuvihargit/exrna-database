@@ -5,6 +5,10 @@ first, because that is how these arrive — as a symptom, not a diagnosis.
 
 Related: [backup and restore](./backup-and-restore.md) · [security hardening](../security/hardening.md)
 
+> **Scope.** The alerts below are for the **legacy Node + MongoDB deployment** (production until
+> the Cloudflare cutover, then the rollback target). For the Cloudflare deployment see
+> [§ Cloudflare deployment](#cloudflare-deployment) at the end.
+
 ---
 
 ## The stack
@@ -201,3 +205,19 @@ personally; they belong to the department and project drives and are unaffected.
 | Restore drill failing repeatedly | You do not currently have a recovery path |
 | Disk critical with no purgeable space | Uploads are refused and the platform is read-only |
 | Audit log write failures | Actions are happening that are not being recorded |
+
+---
+
+## Cloudflare deployment
+
+| Symptom | First look | Document |
+|---|---|---|
+| Every request answers `503 SERVICE_MISCONFIGURED` | Workers Logs, `level:fatal`, `Worker configuration rejected` — the reason is logged, never sent to the client | `docs/cloudflare-migration/23-worker-entrypoint-and-queues.md` |
+| Messages in `biotech-drive-*-dlq-production` | read the body; consumers log `Queue message dropped` / `… will be retried` with the reason. Fix the cause, then re-send the body to the main queue — consumers are idempotent | same |
+| Drive sync or maintenance not running | Workers Logs: `Scheduled work enqueued` every 15 min and at :07; `Queue message processed` with the job name | `src/server/queues/schedule.ts` |
+| Users locked out by rate limits | 429 with `Retry-After`; counters are per key in the `RATE_LIMITER` Durable Object and expire with their window | `docs/security/hardening.md` § Rate limiting |
+| "Forgot password" does nothing | expected: identity is Cloudflare Access / Google Workspace; the page says so | `docs/security/hardening.md` |
+| Admin → *Import from Drive* / *Drive storage* tabs are missing | expected: Node-only tools, answering `501 NODE_ONLY_OPERATION` on the Worker | `src/server/http/node-only.ts` |
+
+Deploying and rolling back: `CUTOVER-RUNBOOK.md` and `ROLLBACK-RUNBOOK.md`. A code-only
+revert of the Worker (no data-source change) is `npx wrangler rollback --env production`.
