@@ -30,6 +30,7 @@
     "storage:init": "tsx scripts/init-storage.ts",
     "verify:storage": "tsx scripts/verify-storage-integrity.ts",
     "purge:trash": "tsx scripts/purge-trash.ts",
+    "inventory:expire": "tsx scripts/inventory-expiry-sweep.ts",
     "cleanup:uploads": "tsx scripts/cleanup-uploads.ts",
     "monitor": "tsx scripts/monitor.ts",
     "review:indexes": "tsx scripts/review-indexes.ts",
@@ -40,7 +41,8 @@
     "acl:validate": "tsx scripts/validate-acl-uniqueness.ts",
     "migrate:d1": "tsx scripts/migrate-to-d1.ts",
     "migrate:verify": "tsx scripts/verify-d1-migration.ts",
-    "migrate:validate": "tsx scripts/validate-mongo-source.ts"
+    "migrate:validate": "tsx scripts/validate-mongo-source.ts",
+    "test:e2e": "playwright test"
   },
   "dependencies": {
     "@hookform/resolvers": "^5.5.7",
@@ -82,6 +84,7 @@
     "@cloudflare/workers-types": "^5.20260804.1",
     "@eslint/eslintrc": "^3.2.0",
     "@opennextjs/cloudflare": "^1.20.2",
+    "@playwright/test": "^1.63.0",
     "@testing-library/react": "^16.2.0",
     "@types/node": "^22.13.0",
     "@types/react": "^19.0.0",

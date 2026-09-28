@@ -63,3 +63,7 @@ Thumbs.db
 
 # Mongo → D1 migration reports (source ids and failure payloads)
 /migration-reports/
+
+# Playwright
+/test-results/
+/playwright-report/

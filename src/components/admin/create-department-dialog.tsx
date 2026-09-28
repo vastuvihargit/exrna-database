@@ -31,10 +31,16 @@ const schema = z.object({
     .max(20)
     .regex(/^[A-Za-z0-9-]+$/, 'Letters, digits and hyphens only'),
   description: z.string().trim().max(1000).optional(),
-  storageQuotaGb: z.coerce.number().int().min(1).max(1_000_000).optional(),
+  // An empty number input submits '', which `z.coerce.number()` turns into 0 — below the
+  // minimum — so the optional field made the whole form unsubmittable. Empty means "no quota".
+  storageQuotaGb: z.preprocess(
+    (value) => (value === '' || value === null ? undefined : value),
+    z.coerce.number().int('Whole gigabytes only').min(1, 'At least 1 GB').max(1_000_000).optional(),
+  ),
 });
 
-type FormValues = z.infer<typeof schema>;
+type FormInput = z.input<typeof schema>;
+type FormValues = z.output<typeof schema>;
 
 export function CreateDepartmentDialog() {
   const router = useRouter();
@@ -42,7 +48,7 @@ export function CreateDepartmentDialog() {
   const [error, setError] = React.useState<string | null>(null);
   const createDepartment = useCreateDepartment();
 
-  const form = useForm<FormValues>({
+  const form = useForm<FormInput, unknown, FormValues>({
     resolver: zodResolver(schema),
     defaultValues: { name: '', code: '', description: '' },
   });
@@ -113,6 +119,9 @@ export function CreateDepartmentDialog() {
           <div className="space-y-2">
             <Label htmlFor="dept-quota">Storage quota (GB)</Label>
             <Input id="dept-quota" type="number" min={1} placeholder="500" {...form.register('storageQuotaGb')} />
+            {form.formState.errors.storageQuotaGb ? (
+              <p className="text-xs text-destructive">{form.formState.errors.storageQuotaGb.message}</p>
+            ) : null}
           </div>
 
           {error ? (

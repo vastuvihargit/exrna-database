@@ -58,8 +58,62 @@ export class D1BindingUnavailableError extends Error {
   }
 }
 
+/**
+ * Development and E2E only: a *local* D1 for a Node dev server.
+ *
+ * `next dev` is a Node process, which normally has no D1 at all. Setting `D1_LOCAL_PROXY_PERSIST`
+ * to a directory gives it one through wrangler's platform proxy — the same Miniflare/workerd
+ * SQLite `wrangler dev --local` uses, persisted where the variable says. That is what lets the
+ * browser E2E suite drive the real UI against real D1 repositories.
+ *
+ * The value is wrangler's *state* directory (the `v3` folder), as `getPlatformProxy` takes it —
+ * so `wrangler d1 migrations apply --persist-to X` pairs with `D1_LOCAL_PROXY_PERSIST=X/v3`.
+ *
+ * Refused unless `NODE_ENV` is `development` or `test`: a deployed Node server is the MongoDB
+ * deployment, and a Worker ignores the variable entirely (its binding comes from Cloudflare).
+ * There is no path by which this reaches a deployed environment
+ * (`tests/unit/d1-local-proxy-guard.test.ts`).
+ *
+ * Held on `globalThis`, not in a module variable: `next dev` compiles every route into its own
+ * module graph, so a module-level cache starts one proxy — one `workerd` process — per route
+ * compiled, until the machine runs out of commit memory. One proxy per Node process.
+ */
+const LOCAL_PROXY_KEY = Symbol.for('biotech-drive.d1-local-proxy');
+type ProxyHolder = { [LOCAL_PROXY_KEY]?: Promise<D1Database> };
+
+async function localProxyBinding(persistPath: string): Promise<D1Database> {
+  // An allow-list, not a deny-list: `staging` or any unexpected value is a deployed server too.
+  const nodeEnv = process.env.NODE_ENV;
+  if (nodeEnv !== 'development' && nodeEnv !== 'test') {
+    throw new D1BindingUnavailableError(
+      `D1_LOCAL_PROXY_PERSIST is a development setting and is refused when NODE_ENV is "${nodeEnv ?? ''}".`,
+    );
+  }
+  const holder = globalThis as ProxyHolder;
+  holder[LOCAL_PROXY_KEY] ??= (async () => {
+    // Imported by a computed name so no bundler ever pulls wrangler into the application.
+    const wranglerModule = ['wr', 'angler'].join('');
+    const { getPlatformProxy } = (await import(/* webpackIgnore: true */ wranglerModule)) as {
+      getPlatformProxy: (options: Record<string, unknown>) => Promise<{ env: Record<string, unknown> }>;
+    };
+    const proxy = await getPlatformProxy({
+      environment: 'development',
+      persist: { path: persistPath },
+      envFiles: [],
+    });
+    const binding = proxy.env.DB as D1Database | undefined;
+    if (!binding) throw new D1BindingUnavailableError('The local platform proxy has no DB binding.');
+    return binding;
+  })();
+  return holder[LOCAL_PROXY_KEY];
+}
+
 export async function getD1Binding(): Promise<D1Database> {
   if (injected) return injected;
+
+  if (!isWorkerRuntime() && process.env.D1_LOCAL_PROXY_PERSIST) {
+    return localProxyBinding(process.env.D1_LOCAL_PROXY_PERSIST);
+  }
 
   if (!isWorkerRuntime()) {
     throw new D1BindingUnavailableError(
