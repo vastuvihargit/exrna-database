@@ -129,7 +129,7 @@ export async function authorizeUpload(
   //    and a successful authorization reserves quota and a quarantine slot that survive
   //    until the session expires — so this is the cheapest place to stop an abusive
   //    client, and the only place that stops it before it consumes anything.
-  enforce(`upload:authorize:${actor.userId}`, RATE_LIMITS.uploadAuthorize);
+  await enforce(`upload:authorize:${actor.userId}`, RATE_LIMITS.uploadAuthorize);
 
   // 1. Permission on the destination — uploading a new version is a different right
   //    from uploading a new file.

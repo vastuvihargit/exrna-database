@@ -1,44 +1,38 @@
 /**
- * Fixed-window rate limiting.
+ * Fixed-window rate limiting, with a store chosen by runtime.
  *
- * In-process for the MVP (single application node — assumption A9). The interface is
- * deliberately async and keyed by string so a Redis implementation can replace the
- * store without touching call sites.
+ *   • **Node** (the legacy deployment, tests, `next dev`): an in-process Map. The Node
+ *     deployment is a single application process, so a process-wide count is the whole count.
+ *   • **Cloudflare Worker**: the `RATE_LIMITER` Durable Object, one object per key
+ *     (`rate-limiter.durable-object.ts`). A Worker is many isolates in many locations; a Map
+ *     there would count one isolate's share of the traffic, and "5 sign-in attempts per 15
+ *     minutes" would silently become "5 per isolate". The Durable Object's count is exact.
  *
- * Note: this is the second layer. Nginx already applies coarse per-IP limits; this one
- * knows about accounts and endpoints.
+ * Both stores run the same arithmetic (`rate-limit-window.ts`), so they cannot disagree about
+ * what the limit means.
+ *
+ * ── Not silently ineffective ────────────────────────────────────────────────────────────
+ *
+ * The Worker refuses to start without the `RATE_LIMITER` binding (`assertBindings`), so a Worker
+ * that reaches this code has one. If a call to the object itself fails — a transient platform
+ * error — the attempt is still counted, in the isolate's own Map, and the failure is logged at
+ * error level. That is a weaker limit for the length of an outage, never no limit at all, and it
+ * never turns a platform hiccup into every user being refused sign-in.
+ *
+ * Nginx / Cloudflare's edge still applies coarse per-IP limits in front; this layer knows about
+ * accounts and endpoints.
  */
 import { RateLimitError } from '@/server/errors/app-error';
+import { getLogger } from '@/server/logging/logger';
+import { isWorkerRuntime } from '@/server/runtime';
+import {
+  applyFixedWindow,
+  type RateLimitResult,
+  type RateLimitRule,
+  type WindowState,
+} from './rate-limit-window';
 
-export interface RateLimitRule {
-  /** Max requests permitted inside the window. */
-  limit: number;
-  windowMs: number;
-}
-
-export interface RateLimitResult {
-  allowed: boolean;
-  remaining: number;
-  retryAfterSeconds: number;
-}
-
-interface Counter {
-  count: number;
-  resetAt: number;
-}
-
-const counters = new Map<string, Counter>();
-let lastSweep = Date.now();
-const SWEEP_INTERVAL_MS = 60_000;
-
-/** Drops expired counters so the map cannot grow without bound under a flood. */
-function sweep(now: number): void {
-  if (now - lastSweep < SWEEP_INTERVAL_MS) return;
-  lastSweep = now;
-  for (const [key, counter] of counters) {
-    if (counter.resetAt <= now) counters.delete(key);
-  }
-}
+export type { RateLimitResult, RateLimitRule } from './rate-limit-window';
 
 export const RATE_LIMITS = {
   login: { limit: 10, windowMs: 15 * 60_000 },
@@ -66,41 +60,117 @@ export const RATE_LIMITS = {
   search: { limit: 120, windowMs: 5 * 60_000 },
 } as const satisfies Record<string, RateLimitRule>;
 
-export function consume(key: string, rule: RateLimitRule, now = Date.now()): RateLimitResult {
+/* ------------------------------------------------------------------ in-process store */
+
+const counters = new Map<string, WindowState>();
+let lastSweep = Date.now();
+const SWEEP_INTERVAL_MS = 60_000;
+
+/** Drops expired counters so the map cannot grow without bound under a flood. */
+function sweep(now: number): void {
+  if (now - lastSweep < SWEEP_INTERVAL_MS) return;
+  lastSweep = now;
+  for (const [key, counter] of counters) {
+    if (counter.resetAt <= now) counters.delete(key);
+  }
+}
+
+/** The in-process count. Synchronous; `now` is injectable for tests. */
+export function consumeLocal(key: string, rule: RateLimitRule, now = Date.now()): RateLimitResult {
   sweep(now);
+  const { next, result } = applyFixedWindow(counters.get(key), rule, now);
+  counters.set(key, next);
+  return result;
+}
 
-  const existing = counters.get(key);
-  if (!existing || existing.resetAt <= now) {
-    counters.set(key, { count: 1, resetAt: now + rule.windowMs });
-    return { allowed: true, remaining: rule.limit - 1, retryAfterSeconds: 0 };
+/* ------------------------------------------------------------------ Durable Object store */
+
+/** The subset of a Durable Object namespace this module uses. Keeps workers-types out of `src`. */
+export interface RateLimiterNamespace {
+  idFromName(name: string): unknown;
+  get(id: unknown): { fetch(input: string, init?: RequestInit): Promise<Response> };
+}
+
+const CLOUDFLARE_CONTEXT = Symbol.for('__cloudflare-context__');
+let injectedNamespace: RateLimiterNamespace | null = null;
+
+/** Test-only: hand in a namespace double, so the Worker path runs without workerd. */
+export function setRateLimiterNamespaceForTesting(namespace: RateLimiterNamespace | null): void {
+  injectedNamespace = namespace;
+}
+
+function durableNamespace(): RateLimiterNamespace | null {
+  if (injectedNamespace) return injectedNamespace;
+  if (!isWorkerRuntime()) return null;
+  const context = (globalThis as Record<symbol, { env?: Record<string, unknown> } | undefined>)[
+    CLOUDFLARE_CONTEXT
+  ];
+  const binding = context?.env?.RATE_LIMITER as RateLimiterNamespace | undefined;
+  return binding && typeof binding.idFromName === 'function' ? binding : null;
+}
+
+async function callObject(
+  namespace: RateLimiterNamespace,
+  key: string,
+  path: '/consume' | '/reset',
+  body?: RateLimitRule,
+): Promise<Response> {
+  const stub = namespace.get(namespace.idFromName(key));
+  // The host is ignored by the object; it only needs to be a valid URL.
+  return stub.fetch(`https://rate-limiter${path}`, {
+    method: 'POST',
+    ...(body ? { body: JSON.stringify(body), headers: { 'content-type': 'application/json' } } : {}),
+  });
+}
+
+/* ------------------------------------------------------------------ public API */
+
+/** Counts one attempt against `key` in whichever store this runtime uses. */
+export async function consume(key: string, rule: RateLimitRule): Promise<RateLimitResult> {
+  const namespace = durableNamespace();
+  if (!namespace) {
+    if (isWorkerRuntime()) {
+      // Unreachable in a correctly started Worker: `assertBindings` requires RATE_LIMITER.
+      getLogger().error({ key }, 'RATE_LIMITER binding missing on a Worker; counting in-isolate only');
+    }
+    return consumeLocal(key, rule);
   }
 
-  existing.count += 1;
-  if (existing.count > rule.limit) {
-    return {
-      allowed: false,
-      remaining: 0,
-      retryAfterSeconds: Math.max(1, Math.ceil((existing.resetAt - now) / 1000)),
-    };
+  try {
+    const response = await callObject(namespace, key, '/consume', rule);
+    if (!response.ok) throw new Error(`rate limiter answered ${response.status}`);
+    return (await response.json()) as RateLimitResult;
+  } catch (error) {
+    getLogger().error(
+      { key, err: error instanceof Error ? error.message : String(error) },
+      'Rate limiter unavailable; counting in-isolate for this request',
+    );
+    return consumeLocal(key, rule);
   }
-
-  return { allowed: true, remaining: rule.limit - existing.count, retryAfterSeconds: 0 };
 }
 
 /** Consume one unit or throw a 429 carrying Retry-After. */
-export function enforce(key: string, rule: RateLimitRule, now = Date.now()): void {
-  const result = consume(key, rule, now);
+export async function enforce(key: string, rule: RateLimitRule): Promise<void> {
+  const result = await consume(key, rule);
   if (!result.allowed) {
     throw new RateLimitError(result.retryAfterSeconds, 'Too many attempts. Please try again later.');
   }
 }
 
 /** Clears a counter after a successful authentication, so one bad day is not punitive. */
-export function reset(key: string): void {
+export async function reset(key: string): Promise<void> {
   counters.delete(key);
+  const namespace = durableNamespace();
+  if (!namespace) return;
+  try {
+    await callObject(namespace, key, '/reset');
+  } catch (error) {
+    // Not clearing a counter is harmless: it expires with its window.
+    getLogger().warn({ key, err: error instanceof Error ? error.message : String(error) }, 'Rate limiter reset failed');
+  }
 }
 
-/** Test-only: drop all counters. */
+/** Test-only: drop all in-process counters. */
 export function resetAllRateLimits(): void {
   counters.clear();
 }

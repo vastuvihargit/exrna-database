@@ -30,7 +30,8 @@
   "vars": {
     "NODE_ENV": "production",
     "APP_NAME": "Biotech Research Drive",
-    "LOG_LEVEL": "info",
+    "LOG_LEVEL": "info"
+,
     // Storage. A Worker has no persistent filesystem, so these are the only values it can
     // run with — env.worker.ts refuses anything else at boot rather than per upload.
     "GOOGLE_DRIVE_STORAGE_ENABLED": "true",
@@ -82,23 +83,22 @@
       }
     ]
   },
-  // Enqueues one Drive synchronization every 15 minutes (DRIVE_SYNC_INTERVAL_MINUTES).
-  "triggers": { "crons": ["*/15 * * * *"] },
+  // Two schedules, both of which only *enqueue* work on SYNC_QUEUE (cloudflare-worker.ts):
+  //   */15 * * * *  one Drive synchronization (DRIVE_SYNC_INTERVAL_MINUTES)
+  //   7 * * * *     hourly maintenance: expired uploads, the Drive approval check; and at
+  //                 03:07 UTC also the trash purge and the inventory expiry sweep
+  "triggers": { "crons": ["*/15 * * * *", "7 * * * *"] },
 
-  // MIGRATION_WORKFLOW is deliberately absent until Phase 5.
-  //
-  // A `workflows` binding requires the Worker entrypoint to export the workflow class, and
-  // the OpenNext-generated entrypoint exports only the Next.js handler. Declaring the
-  // binding now would make `wrangler dev` and every deploy fail with a missing-export error.
-  // Phase 5 adds the class and this block together:
-  //
-  // "workflows": [
-  //   {
-  //     "binding": "MIGRATION_WORKFLOW",
-  //     "name": "biotech-drive-migration",
-  //     "class_name": "MongoToD1MigrationWorkflow"
-  //   }
-  // ],
+  // Rate-limit counters (src/server/auth/rate-limiter.durable-object.ts). A Map in an isolate
+  // counts one isolate's requests; a Durable Object counts every request for a key, exactly.
+  "durable_objects": {
+    "bindings": [{ "name": "RATE_LIMITER", "class_name": "RateLimiter" }]
+  },
+  "migrations": [{ "tag": "v1-rate-limiter", "new_sqlite_classes": ["RateLimiter"] }],
+
+  // No `workflows` binding. The Mongo → D1 metadata migration runs from an operator's machine
+  // (`npm run migrate:d1`, docs/cloudflare-migration/21-phase-9-mongo-to-d1-migration.md), not
+  // as a Cloudflare Workflow, so there is no workflow class to export or bind.
 
   "env": {
     "development": {
@@ -108,7 +108,8 @@
         // so they refuse to boot until somebody decides.
         "MALWARE_SCAN_MODE": "disabled",
         "APP_NAME": "Biotech Research Drive",
-        "LOG_LEVEL": "debug",
+        "LOG_LEVEL": "debug"
+,
         // Storage. A Worker has no persistent filesystem, so these are the only values it can
         // run with — env.worker.ts refuses anything else at boot rather than per upload.
         "GOOGLE_DRIVE_STORAGE_ENABLED": "true",
@@ -148,15 +149,20 @@
           }
         ]
       },
-      // Enqueues one Drive synchronization every 15 minutes (DRIVE_SYNC_INTERVAL_MINUTES).
-      "triggers": { "crons": ["*/15 * * * *"] }
+      // Drive sync every 15 minutes; hourly maintenance at :07 (see the top-level comment).
+      "triggers": { "crons": ["*/15 * * * *", "7 * * * *"] },
+      // Not inherited from  the top level: every environment declares its own bindings.
+      "durable_objects": {
+        "bindings": [{ "name": "RATE_LIMITER", "class_name": "RateLimiter" }]
+      }
     },
 
     "staging": {
       "vars": {
         "NODE_ENV": "staging",
         "APP_NAME": "Biotech Research Drive (Staging)",
-        "LOG_LEVEL": "debug",
+        "LOG_LEVEL": "debug"
+,
         // Storage. A Worker has no persistent filesystem, so these are the only values it can
         // run with — env.worker.ts refuses anything else at boot rather than per upload.
         "GOOGLE_DRIVE_STORAGE_ENABLED": "true",
@@ -196,8 +202,12 @@
           }
         ]
       },
-      // Enqueues one Drive synchronization every 15 minutes (DRIVE_SYNC_INTERVAL_MINUTES).
-      "triggers": { "crons": ["*/15 * * * *"] }
+      // Drive sync every 15 minutes; hourly maintenance at :07 (see the top-level comment).
+      "triggers": { "crons": ["*/15 * * * *", "7 * * * *"] },
+      // Not inherited from the top level: every environment declares its own bindings.
+      "durable_objects": {
+        "bindings": [{ "name": "RATE_LIMITER", "class_name": "RateLimiter" }]
+      }
     },
 
     "production": {
@@ -208,7 +218,8 @@
       "vars": {
         "NODE_ENV": "production",
         "APP_NAME": "Biotech Research Drive",
-        "LOG_LEVEL": "info",
+        "LOG_LEVEL": "info"
+,
         // Storage. A Worker has no persistent filesystem, so these are the only values it can
         // run with — env.worker.ts refuses anything else at boot rather than per upload.
         "GOOGLE_DRIVE_STORAGE_ENABLED": "true",
@@ -250,8 +261,12 @@
           }
         ]
       },
-      // Enqueues one Drive synchronization every 15 minutes (DRIVE_SYNC_INTERVAL_MINUTES).
-      "triggers": { "crons": ["*/15 * * * *"] }
+      // Drive sync every 15 minutes; hourly maintenance at :07 (see the top-level comment).
+      "triggers": { "crons": ["*/15 * * * *", "7 * * * *"] },
+      // Not inherited from the top level: every environment declares its own bindings.
+      "durable_objects": {
+        "bindings": [{ "name": "RATE_LIMITER", "class_name": "RateLimiter" }]
+      }
     }
   }
 
@@ -261,8 +276,9 @@
   //
   //   AUTH_SECRET
   //   SESSION_SECRET
-  //   GOOGLE_CLIENT_ID
-  //   GOOGLE_CLIENT_SECRET
+  //   APP_URL                        https://<hostname> (may be a var instead)
+  //   COMPANY_EMAIL_DOMAINS          comma-separated (may be a var instead)
+  //   GOOGLE_DRIVE_ROOT_FOLDER_ID    recommended
   //   GOOGLE_SERVICE_ACCOUNT_EMAIL
   //   GOOGLE_SERVICE_ACCOUNT_PRIVATE_KEY
   //   GOOGLE_SHARED_DRIVE_ID
@@ -280,4 +296,5 @@
   //   MALWARE_SCAN_ENDPOINT          https URL of the scanning service, when mode is "http"
   //
   // Locally they come from `.dev.vars`, which is git-ignored. See `.dev.vars.example`.
+  // The full external checklist: docs/cloudflare-migration/EXTERNAL-SETUP.md.
 }

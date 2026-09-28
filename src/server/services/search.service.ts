@@ -45,7 +45,7 @@ export async function search(actor: Actor, query: SearchQuery): Promise<SearchRe
   // Text-index scans filtered by permission are the most expensive read in the system,
   // and a scripted search loop is also how somebody probes for filenames they cannot
   // open. The limit is well above any human search rate.
-  enforce(`search:${actor.userId}`, RATE_LIMITS.search);
+  await enforce(`search:${actor.userId}`, RATE_LIMITS.search);
 
   const metadata: Record<string, string> = {};
   for (const key of METADATA_QUERY_KEYS) {

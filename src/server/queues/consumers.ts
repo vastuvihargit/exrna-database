@@ -20,8 +20,10 @@ import * as organizationRepository from '@/server/repositories/organization.repo
 import * as userRepository from '@/server/repositories/user.repository';
 import * as notificationRepository from '@/server/repositories/notification.repository';
 import { driveSyncService } from '@/server/services/drive-sync.service';
+import { runMaintenanceJob } from '@/server/services/maintenance.service';
 import {
   driveSyncMessageSchema,
+  maintenanceMessageSchema,
   notificationMessageSchema,
   type ConsumerOutcome,
   type QueueKind,
@@ -54,7 +56,7 @@ export async function processQueueMessage(delivery: QueueDelivery): Promise<Cons
   try {
     result =
       delivery.queue === 'sync'
-        ? await consumeDriveSync(delivery.body)
+        ? await consumeSyncQueue(delivery.body)
         : await consumeNotifications(delivery.body);
   } catch (error) {
     result = {
@@ -69,6 +71,36 @@ export async function processQueueMessage(delivery: QueueDelivery): Promise<Cons
   else log.error({ reason: result.reason }, 'Queue message dropped: it can never succeed');
 
   return result;
+}
+
+/* ------------------------------------------------------------------ the sync queue */
+
+/**
+ * `SYNC_QUEUE` carries two message kinds: Drive synchronization and the scheduled maintenance
+ * jobs (`queues/schedule.ts`). Routed on `kind`; each consumer validates its own shape strictly.
+ */
+export async function consumeSyncQueue(body: unknown): Promise<ConsumerOutcome> {
+  const kind = (body as { kind?: unknown } | null)?.kind;
+  if (kind === 'maintenance.run') return consumeMaintenance(body);
+  return consumeDriveSync(body);
+}
+
+/**
+ * One scheduled maintenance job. Every job is idempotent and bounded (see
+ * `maintenance.service.ts`), so a redelivery — or a cron run overlapping a manual one — finds
+ * nothing left to do rather than doing it twice. A thrown error is retried by
+ * `processQueueMessage` and, after `max_retries`, dead-lettered.
+ */
+export async function consumeMaintenance(body: unknown): Promise<ConsumerOutcome> {
+  const parsed = maintenanceMessageSchema.safeParse(body);
+  if (!parsed.success) {
+    return { outcome: 'drop', reason: `malformed maintenance.run message: ${parsed.error.message}` };
+  }
+  const result = await runMaintenanceJob(parsed.data.job);
+  return {
+    outcome: 'ack',
+    detail: { job: parsed.data.job, trigger: parsed.data.trigger, ...result },
+  };
 }
 
 /* ------------------------------------------------------------------ Drive sync */

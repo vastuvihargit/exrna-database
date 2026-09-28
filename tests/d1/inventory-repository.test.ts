@@ -734,6 +734,40 @@ describe.each(engines)('the expiry sweep — $name', (engine) => {
     // write-off row every night would bury the real ones.
     expect(await engine.repo.expire({ organizationId: ORG, now: NOW })).toHaveLength(0);
   });
+
+  it('writes a batch off once when two sweeps overlap', async () => {
+    // Cron and an administrator's click, or an at-least-once queue redelivery, can overlap. Both
+    // sweeps read the same candidates before either writes; only one may record the write-off.
+    const item = await makeItem(engine.repo);
+    await engine.repo.receive({
+      itemId: item.id,
+      quantity: 8,
+      batchNumber: 'STALE',
+      expiryDate: PAST,
+      performedBy: ALICE,
+      performedByName: 'Alice',
+      performedAt: new Date('2026-01-15T00:00:00.000Z'),
+    });
+
+    const [a, b] = await Promise.all([
+      engine.repo.expire({ organizationId: ORG, now: NOW }),
+      engine.repo.expire({ organizationId: ORG, now: NOW }),
+    ]);
+    expect(a.length + b.length).toBe(1);
+
+    const { transactions } = await engine.repo.listHistory({
+      organizationId: ORG,
+      itemId: item.id,
+      action: 'expired',
+      page: 1,
+      pageSize: 10,
+    });
+    expect(transactions).toHaveLength(1);
+    expect(transactions[0]?.quantityDelta).toBe(-8);
+    expect(transactions[0]?.previousQuantity).toBe(8);
+    expect(transactions[0]?.newQuantity).toBe(0);
+    expect((await engine.repo.findById(item.id))?.availableQuantity).toBe(0);
+  });
 });
 
 /* ------------------------------------------------------------------ listing and dashboard */

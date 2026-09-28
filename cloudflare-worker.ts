@@ -11,7 +11,9 @@
  *      failed check answers every request with 503 and logs the reason, rather than serving
  *      a deployment that fails per request in ways that look like application bugs.
  *   2. **Queue consumers** for `SYNC_QUEUE` and `NOTIFICATION_QUEUE`.
- *   3. **A cron trigger** that enqueues the periodic Drive synchronization.
+ *   3. **Cron triggers** that enqueue the periodic Drive synchronization and the scheduled
+ *      maintenance jobs (`src/server/queues/schedule.ts`).
+ *   4. **The `RateLimiter` Durable Object class**, bound as `RATE_LIMITER`.
  *
  * Consumer logic lives in `src/server/queues/consumers.ts` and runs *inside* the Next bundle,
  * reached through an in-process request — see `src/server/queues/internal-token.ts` for why,
@@ -33,7 +35,11 @@ import {
   INTERNAL_QUEUE_PATH,
   ensureInternalQueueToken,
 } from './src/server/queues/internal-token';
-import type { ConsumerOutcome, DriveSyncMessage, QueueKind } from './src/server/queues/messages';
+import type { ConsumerOutcome, QueueKind } from './src/server/queues/messages';
+import { scheduledMessages } from './src/server/queues/schedule';
+
+// Durable Object classes must be exported from the Worker's main module.
+export { RateLimiter } from './src/server/auth/rate-limiter.durable-object';
 
 type Env = Record<string, unknown> & { SYNC_QUEUE: Queue; APP_URL?: string };
 
@@ -207,12 +213,17 @@ export default {
       log('error', 'Scheduled run skipped: configuration rejected', { cron: controller.cron });
       return;
     }
-    const message: DriveSyncMessage = {
-      kind: 'drive.sync',
-      trigger: 'cron',
-      requestedAt: new Date(controller.scheduledTime).toISOString(),
-    };
-    await env.SYNC_QUEUE.send(message);
-    log('info', 'Drive synchronization enqueued', { cron: controller.cron });
+    const messages = scheduledMessages(controller.cron, new Date(controller.scheduledTime));
+    if (messages.length === 0) {
+      log('error', 'Scheduled run ignored: no work is defined for this cron expression', {
+        cron: controller.cron,
+      });
+      return;
+    }
+    await env.SYNC_QUEUE.sendBatch(messages.map((body) => ({ body })));
+    log('info', 'Scheduled work enqueued', {
+      cron: controller.cron,
+      work: messages.map((message) => (message.kind === 'maintenance.run' ? message.job : message.kind)),
+    });
   },
 };

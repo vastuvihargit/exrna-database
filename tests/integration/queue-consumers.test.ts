@@ -187,6 +187,56 @@ describe('Drive sync consumer', () => {
   });
 });
 
+describe('scheduled maintenance consumer', () => {
+  const maintenance = (job: string, extra: Record<string, unknown> = {}) => ({
+    kind: 'maintenance.run',
+    job,
+    trigger: 'cron',
+    requestedAt: new Date().toISOString(),
+    ...extra,
+  });
+
+  it('routes maintenance.run on the sync queue to the job, and a redelivery does nothing more', async () => {
+    const { processQueueMessage } = await import('@/server/queues/consumers');
+    const deliver = () =>
+      processQueueMessage({ queue: 'sync', messageId: 'm-1', attempts: 1, body: maintenance('inventory.expire') });
+
+    expect(await deliver()).toEqual({
+      outcome: 'ack',
+      detail: { job: 'inventory.expire', trigger: 'cron', itemsWrittenOff: 0 },
+    });
+    expect(await deliver()).toMatchObject({ outcome: 'ack', detail: { itemsWrittenOff: 0 } });
+  });
+
+  it('drops an unknown job, and a message that tries to add parameters, rather than retrying', async () => {
+    const { consumeSyncQueue } = await import('@/server/queues/consumers');
+    expect((await consumeSyncQueue(maintenance('database.drop'))).outcome).toBe('drop');
+    expect((await consumeSyncQueue(maintenance('inventory.expire', { organizationId: 'x' }))).outcome).toBe('drop');
+  });
+
+  it('retries with backoff when a job fails', async () => {
+    const service = await import('@/server/services/stock.service');
+    vi.spyOn(service.stockService, 'sweepExpired').mockRejectedValueOnce(new Error('D1_ERROR: busy'));
+    const { processQueueMessage } = await import('@/server/queues/consumers');
+    const result = await processQueueMessage({
+      queue: 'sync', messageId: 'm-2', attempts: 3, body: maintenance('inventory.expire'),
+    });
+    expect(result).toEqual({ outcome: 'retry', reason: 'D1_ERROR: busy', delaySeconds: 120 });
+  });
+
+  it('still delivers Drive sync messages on the same queue', async () => {
+    const { driveSyncService } = await import('@/server/services/drive-sync.service');
+    const { consumeSyncQueue } = await import('@/server/queues/consumers');
+    const spy = vi.spyOn(driveSyncService, 'syncDriveChanges').mockResolvedValue({
+      ran: false, initialized: false, pages: 0, changes: 0, unmanaged: 0, contentUpdated: 0, renamed: 0,
+      trashed: 0, restored: 0, missing: 0, conflicts: 0, approvalsReturnedToReview: 0,
+      reconciled: false, reconcileChecked: 0, error: null,
+    });
+    expect((await consumeSyncQueue({ kind: 'drive.sync', trigger: 'cron', requestedAt: new Date().toISOString() })).outcome).toBe('ack');
+    expect(spy).toHaveBeenCalledOnce();
+  });
+});
+
 describe('internal delivery route', () => {
   async function post(headers: Record<string, string>, body: unknown): Promise<Response> {
     const { POST } = await import('@/app/api/internal/queues/route');

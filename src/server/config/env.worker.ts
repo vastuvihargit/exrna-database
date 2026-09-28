@@ -31,7 +31,7 @@ import { z } from 'zod';
  * whole project, including the 118 Next.js route handlers that are typed against the DOM
  * lib — which produces hundreds of spurious errors and hides real ones.
  */
-import type { D1Database, Queue } from '@cloudflare/workers-types';
+import type { D1Database, DurableObjectNamespace, Queue } from '@cloudflare/workers-types';
 import {
   assertDataSourceMatrix,
   envVarFor,
@@ -167,19 +167,18 @@ export interface WorkerEnv extends RawWorkerEnv {
 }
 
 /**
- * The bindings declared in `wrangler.jsonc`.
- *
- * `MIGRATION_WORKFLOW` is optional because it is not declared until Phase 5 — see the
- * comment in `wrangler.jsonc` explaining why declaring it early breaks `wrangler dev`.
+ * The bindings declared in `wrangler.jsonc`. There is no workflow binding: the Mongo → D1
+ * migration runs from an operator machine, not as a Cloudflare Workflow.
  */
 export interface WorkerBindings {
   DB: D1Database;
   SYNC_QUEUE: Queue;
   NOTIFICATION_QUEUE: Queue;
-  MIGRATION_WORKFLOW?: unknown;
+  RATE_LIMITER: DurableObjectNamespace;
 }
 
-const REQUIRED_BINDINGS = ['DB', 'SYNC_QUEUE', 'NOTIFICATION_QUEUE'] as const;
+// RATE_LIMITER: without it sign-in and API limits would count per isolate — not a limit at all.
+const REQUIRED_BINDINGS = ['DB', 'SYNC_QUEUE', 'NOTIFICATION_QUEUE', 'RATE_LIMITER'] as const;
 
 export function assertBindings(source: Record<string, unknown>): WorkerBindings {
   const missing = REQUIRED_BINDINGS.filter((name) => source[name] === undefined);

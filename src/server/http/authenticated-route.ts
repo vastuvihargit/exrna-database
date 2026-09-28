@@ -50,7 +50,7 @@ export function withAuthenticatedRoute<TParams = Record<string, string>>(
       await assertCsrf(resolved.csrfTokenHash, request.headers.get(CSRF_HEADER) ?? undefined);
     }
 
-    enforce(`api:user:${resolved.actor.userId}`, RATE_LIMITS.authenticated);
+    await enforce(`api:user:${resolved.actor.userId}`, RATE_LIMITS.authenticated);
 
     const meta: RequestMeta = {
       requestId: requestContext.requestId,

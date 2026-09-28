@@ -18,6 +18,7 @@
  */
 import { z } from 'zod';
 import { NOTIFICATION_TYPES } from '@/server/db/models/notification.model';
+import { MAINTENANCE_JOBS } from '@/server/services/maintenance-jobs';
 
 export const QUEUE_KINDS = ['sync', 'notifications'] as const;
 export type QueueKind = (typeof QUEUE_KINDS)[number];
@@ -34,6 +35,30 @@ export const driveSyncMessageSchema = z
   .strict();
 
 export type DriveSyncMessage = z.infer<typeof driveSyncMessageSchema>;
+
+/* ------------------------------------------------------------------ scheduled maintenance */
+
+/**
+ * One scheduled maintenance job (`services/maintenance.service.ts`), enqueued by the Worker's
+ * cron trigger (`queues/schedule.ts`) on the same queue as Drive sync. The job name is the only
+ * input and is an enum: a message cannot choose an organization, a limit or a target.
+ */
+export const maintenanceMessageSchema = z
+  .object({
+    kind: z.literal('maintenance.run'),
+    job: z.enum(MAINTENANCE_JOBS),
+    trigger: z.enum(['cron', 'manual']),
+    requestedAt: z.string().datetime(),
+  })
+  .strict();
+
+export type MaintenanceMessage = z.infer<typeof maintenanceMessageSchema>;
+
+/** Everything `SYNC_QUEUE` carries. */
+export const syncQueueMessageSchema = z.discriminatedUnion('kind', [
+  driveSyncMessageSchema,
+  maintenanceMessageSchema,
+]);
 
 /* ------------------------------------------------------------------ notifications */
 
