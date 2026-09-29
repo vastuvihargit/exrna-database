@@ -101,24 +101,31 @@ async function list(
 export async function listVisible(input: VisibleProjectsInput): Promise<ProjectRecord[]> {
   const organizationId = maybeOid(input.organizationId);
   if (!organizationId) return [];
-  if (input.companyWide) return list({ organizationId });
-
+  // Role-scope routes in are limited to the actor's clearance; membership and lead are not.
+  const cleared = { confidentiality: { $in: input.clearance } };
   const userId = maybeOid(input.userId);
   const branches: FilterQuery<ProjectDocument>[] = [];
   if (userId) branches.push({ memberUserIds: userId }, { leadUserId: userId });
 
+  if (input.companyWide) {
+    branches.push(cleared);
+    return list({ organizationId, $or: branches });
+  }
+
   const departmentId = input.departmentId ? maybeOid(input.departmentId) : null;
-  if (departmentId) branches.push({ departmentId });
+  if (departmentId) branches.push({ departmentId, ...cleared });
 
   const departmentScopeIds = input.departmentScopeIds
     .map(maybeOid)
     .filter((id): id is Types.ObjectId => id !== null);
-  if (departmentScopeIds.length) branches.push({ departmentId: { $in: departmentScopeIds } });
+  if (departmentScopeIds.length) {
+    branches.push({ departmentId: { $in: departmentScopeIds }, ...cleared });
+  }
 
   const projectScopeIds = input.projectScopeIds
     .map(maybeOid)
     .filter((id): id is Types.ObjectId => id !== null);
-  if (projectScopeIds.length) branches.push({ _id: { $in: projectScopeIds } });
+  if (projectScopeIds.length) branches.push({ _id: { $in: projectScopeIds }, ...cleared });
 
   // No branches means no way in — return nothing rather than an unfiltered organization list.
   if (branches.length === 0) return [];

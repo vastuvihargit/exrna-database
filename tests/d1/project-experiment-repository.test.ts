@@ -11,6 +11,7 @@
  */
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from 'vitest';
 import type { D1Database } from '@cloudflare/workers-types';
+import type { ConfidentialityLevel } from '@/server/domain/permissions';
 import { startTestDb, stopTestDb, clearCollections } from '../helpers/test-db';
 import { startTestD1, stopTestD1, clearD1 } from '../helpers/test-d1';
 import { setD1BindingForTesting } from '@/server/db/d1-context';
@@ -196,6 +197,8 @@ function makeExperiment(
 const VISIBLE_BASE = {
   organizationId: ORG_A,
   companyWide: false,
+  // Every classification, so the tests below that are not about clearance are not limited by it.
+  clearance: ['public_internal', 'internal', 'confidential', 'restricted'] as ConfidentialityLevel[],
   departmentId: null,
   departmentScopeIds: [] as string[],
   projectScopeIds: [] as string[],
@@ -327,6 +330,64 @@ describe.each(ENGINES)('$name repositories', (engine) => {
         departmentScopeIds: [DEPT_B],
       });
       expect(otherDepartment).toEqual([]);
+    });
+
+    /**
+     * Role scope reaches a project only within the actor's clearance, the same gate files and
+     * folders apply. A Lab Technician (cleared to `internal`) with a department grant must not
+     * see a `confidential` project in that department — its name, members and description —
+     * until made a member.
+     */
+    it('limits role-scope routes to the clearance of the actor, but not membership', async () => {
+      const secret = await engine.projects.create(
+        makeProject({ code: 'SECRET', leadUserId: null, memberUserIds: [], confidentiality: 'confidential' }),
+      );
+      const open = await engine.projects.create(
+        makeProject({ code: 'OPEN', leadUserId: null, memberUserIds: [], confidentiality: 'internal' }),
+      );
+      const internalOnly: ConfidentialityLevel[] = ['public_internal', 'internal'];
+
+      const byDepartmentScope = await engine.projects.listVisible({
+        ...VISIBLE_BASE,
+        clearance: internalOnly,
+        userId: CAROL,
+        departmentScopeIds: [DEPT_A],
+      });
+      expect(byDepartmentScope.map((project) => project.code)).toEqual(['OPEN']);
+
+      const byOwnDepartment = await engine.projects.listVisible({
+        ...VISIBLE_BASE,
+        clearance: internalOnly,
+        userId: CAROL,
+        departmentId: DEPT_A,
+      });
+      expect(byOwnDepartment.map((project) => project.code)).toEqual(['OPEN']);
+
+      const byProjectScope = await engine.projects.listVisible({
+        ...VISIBLE_BASE,
+        clearance: internalOnly,
+        userId: CAROL,
+        projectScopeIds: [secret.id, open.id],
+      });
+      expect(byProjectScope.map((project) => project.code)).toEqual(['OPEN']);
+
+      const companyWide = await engine.projects.listVisible({
+        ...VISIBLE_BASE,
+        clearance: internalOnly,
+        companyWide: true,
+        userId: CAROL,
+      });
+      expect(companyWide.map((project) => project.code)).toEqual(['OPEN']);
+
+      // Membership is an explicit decision about this person, so classification does not apply.
+      await engine.projects.updateById(secret.id, { memberUserIds: [CAROL] });
+      const asMember = await engine.projects.listVisible({
+        ...VISIBLE_BASE,
+        clearance: internalOnly,
+        userId: CAROL,
+        departmentScopeIds: [DEPT_A],
+      });
+      expect(asMember.map((project) => project.code).sort()).toEqual(['OPEN', 'SECRET']);
     });
 
     it('returns nothing when an actor has no route to any project', async () => {

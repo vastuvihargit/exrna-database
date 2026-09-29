@@ -161,16 +161,8 @@ export async function listVisible(input: VisibleProjectsInput): Promise<ProjectR
   if (!input.organizationId) return [];
   const db = await getD1();
 
-  if (input.companyWide) {
-    const rows = await db
-      .select()
-      .from(projects)
-      .where(eq(projects.organizationId, input.organizationId))
-      .orderBy(asc(projects.name))
-      .limit(LIST_LIMIT);
-    return hydrate(db, rows);
-  }
-
+  // Role-scope routes in are limited to the actor's clearance; membership and lead are not.
+  const cleared = inList(projects.confidentiality, input.clearance);
   const branches: SQL[] = [];
 
   if (input.userId) {
@@ -179,15 +171,20 @@ export async function listVisible(input: VisibleProjectsInput): Promise<ProjectR
       eq(projects.leadUserId, input.userId),
     );
   }
-  if (input.departmentId) branches.push(eq(projects.departmentId, input.departmentId));
 
-  const departmentScopeIds = input.departmentScopeIds.filter(Boolean);
-  if (departmentScopeIds.length) {
-    branches.push(inList(projects.departmentId, departmentScopeIds));
+  if (input.companyWide) {
+    branches.push(cleared);
+  } else {
+    if (input.departmentId) branches.push(and(eq(projects.departmentId, input.departmentId), cleared)!);
+
+    const departmentScopeIds = input.departmentScopeIds.filter(Boolean);
+    if (departmentScopeIds.length) {
+      branches.push(and(inList(projects.departmentId, departmentScopeIds), cleared)!);
+    }
+
+    const projectScopeIds = input.projectScopeIds.filter(Boolean);
+    if (projectScopeIds.length) branches.push(and(inList(projects.id, projectScopeIds), cleared)!);
   }
-
-  const projectScopeIds = input.projectScopeIds.filter(Boolean);
-  if (projectScopeIds.length) branches.push(inList(projects.id, projectScopeIds));
 
   // No branches means no way in — return nothing rather than an unfiltered organization list.
   if (branches.length === 0) return [];

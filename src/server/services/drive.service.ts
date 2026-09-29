@@ -18,6 +18,7 @@ import type { FolderRecord } from '@/server/repositories/folder.repository';
 import * as departmentRepository from '@/server/repositories/department.repository';
 import * as projectRepository from '@/server/repositories/project.repository';
 import { departmentVisibilityFilter } from '@/server/permissions/visibility';
+import { canSeeProject, visibleProjectsInput } from '@/server/permissions/project-visibility';
 import { templateService } from './template.service';
 
 export function myDriveRootKey(userId: string): string {
@@ -105,17 +106,8 @@ export async function getProjectRoot(actor: Actor, projectId: string): Promise<F
   const project = await projectRepository.findById(projectId);
   if (!project || project.organizationId !== actor.organizationId) throw new NotFoundError();
 
-  const isMember =
-    project.memberUserIds.includes(actor.userId) || project.leadUserId === actor.userId;
-  const hasScopedGrant = actor.grants.some(
-    (grant) =>
-      grant.scopeType === 'company' ||
-      (grant.scopeType === 'project' && grant.scopeId === projectId) ||
-      (grant.scopeType === 'department' && grant.scopeId === project.departmentId),
-  );
-  if (!actor.isSuperAdmin && !actorHasCompanyWideRead(actor) && !isMember && !hasScopedGrant) {
-    throw new NotFoundError();
-  }
+  // Members always; everyone else by role scope *and* clearance, as the project list decides.
+  if (!canSeeProject(actor, project)) throw new NotFoundError();
 
   const root = await folderRepository.ensureRoot({
     rootKey: projectRootKey(projectId),
@@ -211,20 +203,7 @@ export async function listDrives(actor: Actor): Promise<{
 }
 
 export async function listVisibleProjects(actor: Actor) {
-  return projectRepository.listVisible({
-    organizationId: actor.organizationId,
-    companyWide: actor.isSuperAdmin || actorHasCompanyWideRead(actor),
-    userId: actor.userId,
-    departmentId: actor.departmentId,
-    departmentScopeIds: scopeIds(actor, 'department'),
-    projectScopeIds: scopeIds(actor, 'project'),
-  });
-}
-
-function scopeIds(actor: Actor, scopeType: 'department' | 'project'): string[] {
-  return actor.grants
-    .filter((grant) => grant.scopeType === scopeType && grant.scopeId)
-    .map((grant) => grant.scopeId as string);
+  return projectRepository.listVisible(visibleProjectsInput(actor));
 }
 
 /**

@@ -89,6 +89,12 @@ export interface ProjectPatch {
 export interface VisibleProjectsInput {
   organizationId: string;
   companyWide: boolean;
+  /**
+   * Classifications reachable through role scope. Applies to the company-wide, department and
+   * scope branches; membership and leadership see a project at any classification.
+   * Built by `visibleProjectsInput` in `permissions/project-visibility.ts`.
+   */
+  clearance: ConfidentialityLevel[];
   userId: string;
   departmentId: string | null;
   departmentScopeIds: string[];

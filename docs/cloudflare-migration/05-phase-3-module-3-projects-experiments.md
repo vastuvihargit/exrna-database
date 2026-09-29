@@ -72,6 +72,14 @@ One guard worth naming: when an actor has no route to any project — no user id
 no scope grants — `listVisible` returns `[]`. The absence of branches must mean "nothing", never
 "the whole organization". Asserted in both engines.
 
+**Later correction (2026-09-29, found by the browser suite):** as written here, and in the
+MongoDB original it was ported from, every role-scope branch ignored the project's
+classification, so a department grant revealed the department's `confidential` projects to
+someone cleared only to `internal`. `VisibleProjectsInput` now carries `clearance`; the
+company-wide, own-department and scope branches require `confidentiality ∈ clearance`, and the
+member/lead branches do not. `getProjectRoot` applies the same gate through `canSeeProject`
+(`permissions/project-visibility.ts`). See `25-browser-e2e.md` §5.
+
 ---
 
 ## 5. A hazard the migration introduces: FTS5 query syntax

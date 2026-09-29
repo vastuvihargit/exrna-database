@@ -9,7 +9,7 @@ import { ConflictError, ForbiddenError, NotFoundError, ValidationError } from '@
 import { sanitizeDisplayName } from '@/server/domain/naming';
 import type { ConfidentialityLevel } from '@/server/domain/permissions';
 import type { Actor } from '@/server/permissions/actor';
-import { actorHasCompanyWideRead } from '@/server/permissions/actor';
+import { visibleProjectsInput } from '@/server/permissions/project-visibility';
 import { auditService } from '@/server/audit/audit.service';
 import * as activityRepository from '@/server/repositories/activity.repository';
 import type { ActivityRecord } from '@/server/repositories/activity.repository';
@@ -29,14 +29,7 @@ import { templateService } from './template.service';
 import type { ExperimentView } from './experiment.service';
 
 export async function list(actor: Actor): Promise<ProjectRecord[]> {
-  return projectRepository.listVisible({
-    organizationId: actor.organizationId,
-    companyWide: actor.isSuperAdmin || actorHasCompanyWideRead(actor),
-    userId: actor.userId,
-    departmentId: actor.departmentId,
-    departmentScopeIds: scopeIds(actor, 'department'),
-    projectScopeIds: scopeIds(actor, 'project'),
-  });
+  return projectRepository.listVisible(visibleProjectsInput(actor));
 }
 
 export async function getById(actor: Actor, projectId: string): Promise<ProjectRecord> {
@@ -322,12 +315,6 @@ export async function overview(actor: Actor, projectId: string): Promise<Project
     activity,
     missingTemplateFolders,
   };
-}
-
-function scopeIds(actor: Actor, scopeType: 'department' | 'project'): string[] {
-  return actor.grants
-    .filter((grant) => grant.scopeType === scopeType && grant.scopeId)
-    .map((grant) => grant.scopeId as string);
 }
 
 export const projectService = { list, getById, create, update, applyTemplate, overview };
