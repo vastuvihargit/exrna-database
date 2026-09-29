@@ -30,6 +30,11 @@ import { UserStatusBadge } from './user-status-badge';
 
 const PAGE_SIZE = 25;
 
+// A stable empty list. TanStack Table resets the page index whenever `data` changes identity,
+// and that reset is a state update: `data?.items ?? []` hands it a fresh array on every render
+// while the list is loading, so each render schedules the next one.
+const NO_USERS: AdminUser[] = [];
+
 export function UsersManager({ companyDomains }: { companyDomains: string[] }) {
   const [search, setSearch] = React.useState('');
   const [debouncedSearch, setDebouncedSearch] = React.useState('');
@@ -159,7 +164,7 @@ export function UsersManager({ companyDomains }: { companyDomains: string[] }) {
   );
 
   const table = useReactTable({
-    data: data?.items ?? [],
+    data: data?.items ?? NO_USERS,
     columns,
     getCoreRowModel: getCoreRowModel(),
   });
