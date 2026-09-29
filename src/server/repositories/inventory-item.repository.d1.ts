@@ -962,8 +962,10 @@ export async function expire(input: ExpireStockInput): Promise<StockTransactionR
     const item = await loadItemRow(db, candidate.item_id);
     if (!item) continue;
 
-    const lost = Number(candidate.lost);
     const transactionId = newId();
+    const performedBy = input.performedBy ?? null;
+    const performedByName = input.performedByName ?? 'Expiry sweep';
+    const notes = 'Written off automatically: past expiry date';
 
     /**
      * One `batch()` per item rather than one for the whole sweep.
@@ -971,8 +973,33 @@ export async function expire(input: ExpireStockInput): Promise<StockTransactionR
      * A single transaction across hundreds of items would abort all of them because one had a
      * concurrent issue in flight, and the next run would abort for the same reason. Per item, a
      * conflict costs that item and the rest are still written off.
+     *
+     * **The ledger row is the first statement, and it derives everything from the rows as they
+     * stand when the batch runs** — the amount, the batch numbers, the before/after figures —
+     * with `HAVING SUM(quantity) > 0` as its guard. Two sweeps can overlap (the cron, an
+     * administrator's click, an at-least-once queue redelivery) and both read the same
+     * candidates above. The batches serialize: the first writes the item off; the second finds
+     * nothing left, inserts no row, and zeroes nothing. Built from the candidate read instead,
+     * the second sweep inserted a phantom `8 → 0` write-off of stock that was already gone.
      */
     const statements: BatchItem<'sqlite'>[] = [
+      db.insert(stockTransactions).select(
+        sql`SELECT ${transactionId}, i.organization_id, i.id, i.code, i.name, i.department_id,
+                   'expired', SUM(b.quantity), -SUM(b.quantity),
+                   i.available_quantity, i.available_quantity - SUM(b.quantity), i.unit,
+                   GROUP_CONCAT(b.batch_number, ', '), NULL, '', '',
+                   NULL, NULL, NULL, NULL, NULL, '',
+                   '', ${notes}, ${performedBy}, ${performedByName}, ${nowIso}, NULL, ${nowIso}
+              FROM inventory_batches b
+              JOIN inventory_items i ON i.id = b.item_id
+             WHERE b.item_id = ${item.id}
+               AND i.deleted_at IS NULL
+               AND b.quantity > 0
+               AND b.expiry_date IS NOT NULL
+               AND b.expiry_date < ${nowIso}
+             GROUP BY i.id
+            HAVING SUM(b.quantity) > 0`,
+      ),
       db
         .update(inventoryBatches)
         .set({ quantity: 0 })
@@ -988,26 +1015,11 @@ export async function expire(input: ExpireStockInput): Promise<StockTransactionR
         .update(inventoryItems)
         .set(summaryAssignments(item.id, nowIso))
         .where(eq(inventoryItems.id, item.id)),
-      ledgerInsert(db, {
-        id: transactionId,
-        item,
-        action: 'expired',
-        quantity: lost,
-        delta: -lost,
-        batchNumber: candidate.batches ?? '',
-        expiryDate: null,
-        context: {
-          performedBy: input.performedBy ?? null,
-          performedByName: input.performedByName ?? 'Expiry sweep',
-          performedAt: input.now,
-          notes: 'Written off automatically: past expiry date',
-        },
-        createdAt: nowIso,
-      }),
     ];
 
     await db.batch(statements as [BatchItem<'sqlite'>, ...BatchItem<'sqlite'>[]]);
 
+    // Present only if this sweep, not a concurrent one, wrote the item off.
     const [row] = await db.all<TransactionRow>(
       sql`SELECT * FROM stock_transactions WHERE id = ${transactionId} LIMIT 1`,
     );

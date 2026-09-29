@@ -83,6 +83,18 @@ The test that pins this issues ten times concurrently and then walks the ledger 
 counter each row left behind, asserting every row's `previousQuantity` equals the previous row's
 `newQuantity`. A single-row assertion would pass against the broken implementation.
 
+**The expiry sweep on D1 broke the same rule, and was fixed on 2026-09-29.** It read its
+candidates, then per item ran a batch of *zero the expired batches → refresh the counter →
+insert the ledger row*, with the amount taken from the candidate read. Zeroing was guarded
+(`quantity > 0`); the insert was not. Two overlapping sweeps — cron plus an administrator's
+click, or a queue redelivery — therefore wrote the item off twice: the second batch changed no
+stock and still recorded a phantom `8 → 0`. Found by the full `test:d1` run
+(`writes a batch off once when two sweeps overlap`). The ledger insert is now the batch's first
+statement, an `INSERT … SELECT` that takes the amount, batch numbers and before/after figures
+from the batch rows as they stand when it runs, guarded by `HAVING SUM(quantity) > 0`; a sweep
+that finds nothing left inserts nothing. The MongoDB sweep was already correct (it re-reads
+inside its transaction).
+
 ## 5. Two deliberate divergences between the engines
 
 ### 5.1 D1 keeps zero-quantity batch rows; MongoDB prunes them
