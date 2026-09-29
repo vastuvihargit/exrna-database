@@ -12,6 +12,11 @@ const REASONS: Record<string, string> = {
   permission: 'Your account does not have permission to view this area.',
   deactivated: 'Your account is not active. Contact your administrator.',
   not_provisioned: 'Your account has not been set up yet. Contact your administrator for access.',
+  domain: 'This account is not on an approved company domain.',
+  access_missing:
+    'Your company sign-in did not reach the application. Reload the page to sign in again.',
+  access_invalid:
+    'Your company sign-in could not be verified or has expired. Reload the page to sign in again.',
 };
 
 export default async function AccessDeniedPage({

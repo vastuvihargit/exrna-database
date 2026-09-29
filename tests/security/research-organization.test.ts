@@ -70,7 +70,7 @@ async function upload(actor: Actor, folderId: string, filename: string, content:
     { folderId, filename, size: content.byteLength },
     TEST_META,
   );
-  await uploadService.receiveStream(actor, ticket.sessionId, Readable.from(content));
+  await uploadService.receiveStream(actor, ticket.sessionId, Readable.from(content), TEST_META);
   const result = await uploadService.finalize(actor, ticket.sessionId, TEST_META);
   return fileService.getFile(actor, result.fileId);
 }
@@ -375,6 +375,65 @@ describe('the project dashboard counts only what the viewer can open', () => {
     await expect(projectService.overview(bob, project.id)).rejects.toMatchObject({ status: 404 });
   });
 
+  /**
+   * A trashed file is not project content, and every figure has to agree about that.
+   *
+   * This is a corrected defect rather than a new feature. `applySoftDeleteFilter` hooks
+   * `find`/`countDocuments` and six other query methods, but Mongoose does not route
+   * `aggregate` through query middleware at all — so four of the five figures below were
+   * computed by aggregates that counted trashed files, while `linkedToExperiment` is a
+   * `countDocuments` and was filtered. One dashboard, two populations.
+   *
+   * The assertion is deliberately on *all* of them together: fixing the aggregates but leaving
+   * one behind would look correct in a test that only checked `totalFiles`.
+   */
+  it('drops a trashed file out of every dashboard figure at once', async () => {
+    if (skipUnlessDb()) return;
+    const { projectService, driveService, folderService, fileService, experimentService } =
+      await services();
+
+    const project = await molbioProject('EXR-TRASH', 'Trash consistency');
+    const alice = await actorFor(fixture.users.scientistA);
+
+    const root = await driveService.getProjectRoot(alice, project.id);
+    const folder = await folderService.createFolder(
+      alice,
+      { name: 'Runs', parentFolderId: root.id },
+      TEST_META,
+    );
+    const experiment = await experimentService.create(
+      alice,
+      { projectId: project.id, code: 'EXP-TRASH-1', title: 'Run 1' },
+      TEST_META,
+    );
+
+    const keep = await upload(alice, folder.id, 'keep.pdf', pdf('trash-keep'));
+    const drop = await upload(alice, folder.id, 'drop.pdf', pdf('trash-drop'));
+    // Both linked to the experiment, so `linkedToExperiment` has something to disagree about.
+    for (const file of [keep, drop]) {
+      await fileService.updateFile(alice, file.id, { experimentId: experiment.id }, TEST_META);
+    }
+
+    const before = await projectService.overview(alice, project.id);
+    expect(before.content.totalFiles).toBe(2);
+    expect(before.content.linkedToExperiment).toBe(2);
+
+    await fileService.trashFile(alice, drop.id, TEST_META);
+
+    const after = await projectService.overview(alice, project.id);
+    expect(after.content.totalFiles).toBe(1);
+    expect(after.content.linkedToExperiment).toBe(1);
+    expect(after.content.totalBytes).toBe(keep.sizeBytes);
+
+    // The grouped figures are aggregates too, and they were the ones getting it wrong.
+    const categoryTotal = after.content.byCategory.reduce((sum, row) => sum + row.count, 0);
+    const documentTypeTotal = after.content.byDocumentType.reduce((sum, row) => sum + row.count, 0);
+    const reviewStatusTotal = after.content.byReviewStatus.reduce((sum, row) => sum + row.count, 0);
+    expect(categoryTotal).toBe(1);
+    expect(documentTypeTotal).toBe(1);
+    expect(reviewStatusTotal).toBe(1);
+  });
+
   it('reports template folders a drive is missing rather than creating them', async () => {
     if (skipUnlessDb()) return;
     const { projectService, folderService, driveService } = await services();
@@ -419,7 +478,7 @@ describe('templates', () => {
 
   it('applies an edited folder template to new project drives only', async () => {
     if (skipUnlessDb()) return;
-    const { templateService, projectService, folderService, driveService } = await services();
+    const { templateService, folderService, driveService } = await services();
 
     const admin = await actorFor(fixture.users.companyAdmin);
     const before = await molbioProject('EXR-TPL-OLD', 'Built before the edit');

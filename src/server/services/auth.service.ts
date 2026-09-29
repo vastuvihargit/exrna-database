@@ -19,6 +19,7 @@ import * as userRepository from '@/server/repositories/user.repository';
 import * as organizationRepository from '@/server/repositories/organization.repository';
 import * as loginHistory from '@/server/repositories/login-history.repository';
 import * as sessionRepository from '@/server/repositories/session.repository';
+import { verifyAccessJwt, type AccessConfig } from '@/server/auth/cloudflare-access';
 import { PasswordResetTokenModel } from '@/server/db/models';
 import { connectToDatabase } from '@/server/db/connection';
 import { auditService } from '@/server/audit/audit.service';
@@ -35,6 +36,12 @@ import { enforce, reset, RATE_LIMITS } from '@/server/auth/rate-limit';
 import { generateToken, hashToken } from '@/server/auth/tokens';
 import { issueSession, revokeAllSessions, type IssuedSession } from '@/server/auth/session.service';
 import { Types } from 'mongoose';
+import {
+  EXTERNAL_PASSWORD_RECOVERY_MESSAGE,
+  PASSWORD_AUTH_UNAVAILABLE_MESSAGE,
+  isPasswordAuthAvailable,
+  isPasswordRecoveryAvailable,
+} from '@/server/auth/access-session';
 
 const FAILED_LOGIN_LOCK_THRESHOLD = 5;
 const GENERIC_LOGIN_ERROR = 'Incorrect email address or password';
@@ -51,15 +58,34 @@ export interface LoginInput {
  * Note the ordering: rate limits first (cheap), then domain check, then the account
  * lookup. Regardless of which check fails, the caller sees one message.
  */
+/** Refuses password flows when Cloudflare Access is the configured sign-in method. */
+/**
+ * Password reset, request and completion alike. Refused before anything else runs — no rate-limit
+ * counter, no user lookup, no MongoDB — wherever the application does not own the password:
+ * behind Cloudflare Access, and on any Worker (see `isPasswordRecoveryAvailable`). The message
+ * sends the user to the identity provider's own recovery.
+ */
+function assertPasswordRecoveryAvailable(): void {
+  if (!isPasswordRecoveryAvailable()) throw new ForbiddenError(EXTERNAL_PASSWORD_RECOVERY_MESSAGE);
+}
+
+function assertPasswordAuthAvailable(): void {
+  // Behind Access, and on any Worker (which cannot compute Argon2id) — see isPasswordAuthAvailable.
+  if (!isPasswordAuthAvailable()) throw new ForbiddenError(PASSWORD_AUTH_UNAVAILABLE_MESSAGE);
+}
+
 export async function loginWithPassword(input: LoginInput, meta: RequestMeta): Promise<IssuedSession> {
+  // With Cloudflare Access in front, Access is the only way in. A password path left open
+  // beside it would be a second front door that bypasses the company identity provider.
+  assertPasswordAuthAvailable();
   const env = getEnv();
 
-  enforce(`login:ip:${meta.ip}`, RATE_LIMITS.login);
+  await enforce(`login:ip:${meta.ip}`, RATE_LIMITS.login);
 
   const parsed = parseEmail(input.email);
   const emailForLog = parsed?.normalized ?? String(input.email).slice(0, 320).toLowerCase();
 
-  enforce(`login:email:${emailForLog}`, RATE_LIMITS.loginPerEmail);
+  await enforce(`login:email:${emailForLog}`, RATE_LIMITS.loginPerEmail);
 
   const allowedDomains = await organizationRepository.getSignInDomains(env.COMPANY_EMAIL_DOMAINS);
   const email = normalizeCompanyEmail(input.email, allowedDomains);
@@ -181,7 +207,7 @@ export async function loginWithPassword(input: LoginInput, meta: RequestMeta): P
   });
 
   await userRepository.recordSuccessfulLogin(user.id);
-  reset(`login:email:${email}`);
+  await reset(`login:email:${email}`);
 
   await loginHistory.record({
     userId: user.id,
@@ -323,6 +349,47 @@ export async function completeOAuthLogin(
   return session;
 }
 
+/**
+ * Turns a verified Cloudflare Access assertion into an application session.
+ *
+ * ── Why this delegates rather than reimplements ─────────────────────────────────────────
+ *
+ * Everything after "who is this person" is identical to the OAuth path: the company-domain
+ * check, the auto-provisioning policy, the active-user enforcement, the login-history row, the
+ * audit record and the session issue. Writing that again here would create a second copy of the
+ * account-status policy, and the failure mode of two copies is that one of them keeps letting a
+ * deactivated employee in after the other stopped.
+ *
+ * So this function owns exactly one thing — establishing the email address from a signature —
+ * and hands the rest to `completeOAuthLogin`.
+ *
+ * ── Access proves identity, not authorization ───────────────────────────────────────────
+ *
+ * A valid assertion says Cloudflare authenticated this person against the configured IdP. It
+ * says nothing about whether they have an account here, whether it is active, or what they may
+ * do. All three remain the application's decision, which is why a token for an unknown or
+ * suspended address still fails below.
+ */
+export async function completeAccessLogin(
+  input: { token: string; config: AccessConfig },
+  meta: RequestMeta,
+): Promise<IssuedSession> {
+  const identity = await verifyAccessJwt(input.token, input.config);
+
+  return completeOAuthLogin(
+    {
+      email: identity.email,
+      // Access's `sub` is stable per user per application, which is what the provider-account
+      // link wants. Recorded as `google` because that is the IdP behind Access here; the
+      // provider enum has no `access` member and adding one would change the meaning of every
+      // historic row.
+      providerAccountId: identity.subject,
+      provider: 'google',
+    },
+    meta,
+  );
+}
+
 export async function logout(sessionId: string, userId: string, meta: RequestMeta): Promise<void> {
   await sessionRepository.revoke(sessionId, 'logout');
   await auditService.recordAnonymous(meta, {
@@ -357,12 +424,13 @@ export async function requestPasswordReset(
   emailInput: string,
   meta: RequestMeta,
 ): Promise<{ token: string; email: string; userId: string } | null> {
+  assertPasswordRecoveryAvailable();
   const env = getEnv();
 
-  enforce(`pwreset:ip:${meta.ip}`, RATE_LIMITS.passwordResetPerIp);
+  await enforce(`pwreset:ip:${meta.ip}`, RATE_LIMITS.passwordResetPerIp);
 
   const parsed = parseEmail(emailInput);
-  if (parsed) enforce(`pwreset:email:${parsed.normalized}`, RATE_LIMITS.passwordResetPerEmail);
+  if (parsed) await enforce(`pwreset:email:${parsed.normalized}`, RATE_LIMITS.passwordResetPerEmail);
 
   const allowedDomains = await organizationRepository.getSignInDomains(env.COMPANY_EMAIL_DOMAINS);
   const email = normalizeCompanyEmail(emailInput, allowedDomains);
@@ -375,7 +443,7 @@ export async function requestPasswordReset(
   const token = generateToken();
   await PasswordResetTokenModel.create({
     userId: new Types.ObjectId(user.id),
-    tokenHash: hashToken(token),
+    tokenHash: await hashToken(token),
     expiresAt: new Date(Date.now() + PASSWORD_RESET_TTL_MS),
     requestedIp: meta.ip,
   });
@@ -401,10 +469,11 @@ export async function completePasswordReset(
   input: { token: string; password: string },
   meta: RequestMeta,
 ): Promise<void> {
+  assertPasswordRecoveryAvailable();
   await connectToDatabase();
 
   const record = await PasswordResetTokenModel.findOne({
-    tokenHash: hashToken(input.token),
+    tokenHash: await hashToken(input.token),
     usedAt: null,
     expiresAt: { $gt: new Date() },
   }).exec();
@@ -450,6 +519,7 @@ export async function changePassword(
   input: { userId: string; currentPassword: string; newPassword: string; sessionId: string },
   meta: RequestMeta,
 ): Promise<IssuedSession> {
+  assertPasswordAuthAvailable();
   const user = await userRepository.findById(input.userId);
   if (!user) throw new UnauthenticatedError();
 
@@ -490,6 +560,7 @@ export async function changePassword(
 export const authService = {
   loginWithPassword,
   completeOAuthLogin,
+  completeAccessLogin,
   logout,
   logoutEverywhere,
   requestPasswordReset,

@@ -6,12 +6,10 @@
  * inventing their own folder names, which is the problem the template exists to solve.
  */
 import { ConflictError, ForbiddenError, NotFoundError, ValidationError } from '@/server/errors/app-error';
-import { withTransaction } from '@/server/db/connection';
 import { sanitizeDisplayName } from '@/server/domain/naming';
 import type { ConfidentialityLevel } from '@/server/domain/permissions';
 import type { Actor } from '@/server/permissions/actor';
-import { actorHasCompanyWideRead } from '@/server/permissions/actor';
-import { resourceVisibilityFilter } from '@/server/permissions/visibility';
+import { visibleProjectsInput } from '@/server/permissions/project-visibility';
 import { auditService } from '@/server/audit/audit.service';
 import * as activityRepository from '@/server/repositories/activity.repository';
 import type { ActivityRecord } from '@/server/repositories/activity.repository';
@@ -31,14 +29,7 @@ import { templateService } from './template.service';
 import type { ExperimentView } from './experiment.service';
 
 export async function list(actor: Actor): Promise<ProjectRecord[]> {
-  return projectRepository.listVisible({
-    organizationId: actor.organizationId,
-    companyWide: actor.isSuperAdmin || actorHasCompanyWideRead(actor),
-    userId: actor.userId,
-    departmentId: actor.departmentId,
-    departmentScopeIds: scopeIds(actor, 'department'),
-    projectScopeIds: scopeIds(actor, 'project'),
-  });
+  return projectRepository.listVisible(visibleProjectsInput(actor));
 }
 
 export async function getById(actor: Actor, projectId: string): Promise<ProjectRecord> {
@@ -86,27 +77,22 @@ export async function create(
   const members = await validMembers(actor, input.memberUserIds ?? [], input.leadUserId ?? null);
   const confidentiality = input.confidentiality ?? 'internal';
 
-  const project = await withTransaction(async (session) => {
-    const created = await projectRepository.create(
-      {
-        organizationId: actor.organizationId,
-        departmentId: input.departmentId,
-        name,
-        code,
-        ...(input.description !== undefined ? { description: input.description } : {}),
-        leadUserId: input.leadUserId ?? null,
-        memberUserIds: members,
-        confidentiality,
-        startDate: input.startDate ?? null,
-        targetEndDate: input.targetEndDate ?? null,
-        tags: input.tags ?? [],
-        createdBy: actor.userId,
-      },
-      session,
-    );
-
-    await projectRepository.syncMembership(created.id, members, session);
-    return created;
+  // The project row and its membership are written atomically by the repository — a Mongo
+  // session there, a D1 batch in the other implementation. D1 has no interactive transaction,
+  // so a session cannot cross the repository boundary; see project.repository.contract.ts.
+  const project = await projectRepository.create({
+    organizationId: actor.organizationId,
+    departmentId: input.departmentId,
+    name,
+    code,
+    ...(input.description !== undefined ? { description: input.description } : {}),
+    leadUserId: input.leadUserId ?? null,
+    memberUserIds: members,
+    confidentiality,
+    startDate: input.startDate ?? null,
+    targetEndDate: input.targetEndDate ?? null,
+    tags: input.tags ?? [],
+    createdBy: actor.userId,
   });
 
   // The drive is built outside the transaction so a slow template build cannot hold a
@@ -124,7 +110,7 @@ export async function create(
   });
 
   await applyTemplate(actor, root.id, confidentiality);
-  await projectRepository.updateById(project.id, { $set: { rootFolderId: root.id } });
+  await projectRepository.updateById(project.id, { rootFolderId: root.id });
 
   await auditService.recordForActor(actor, meta, {
     action: 'settings.updated',
@@ -178,7 +164,7 @@ export async function update(
   const project = await getById(actor, projectId);
   assertCanManageProjects(actor, project.departmentId);
 
-  const update: Record<string, unknown> = {};
+  const update: projectRepository.ProjectPatch = {};
   if (input.name !== undefined) update.name = sanitizeDisplayName(input.name);
   if (input.description !== undefined) update.description = input.description;
   if (input.leadUserId !== undefined) update.leadUserId = input.leadUserId;
@@ -196,12 +182,9 @@ export async function update(
     update.memberUserIds = members;
   }
 
-  const updated = await withTransaction(async (session) => {
-    const result = await projectRepository.updateById(projectId, { $set: update }, session);
-    if (!result) throw new NotFoundError();
-    if (members) await projectRepository.syncMembership(projectId, members, session);
-    return result;
-  });
+  // Row and membership land together, or neither does — see the note in `create` above.
+  const updated = await projectRepository.updateById(projectId, update);
+  if (!updated) throw new NotFoundError();
 
   await auditService.recordForActor(actor, meta, {
     action: 'settings.updated',
@@ -279,7 +262,6 @@ export interface ProjectOverview {
  */
 export async function overview(actor: Actor, projectId: string): Promise<ProjectOverview> {
   const project = await getById(actor, projectId);
-  const visibility = resourceVisibilityFilter(actor);
 
   const [department, memberRecords, content, experimentCounts, recentExperiments, activity] =
     await Promise.all([
@@ -287,7 +269,7 @@ export async function overview(actor: Actor, projectId: string): Promise<Project
       userRepository.findByIds(
         [...new Set([...project.memberUserIds, ...(project.leadUserId ? [project.leadUserId] : [])])],
       ),
-      fileRepository.projectContentBreakdown(visibility, project.id),
+      fileRepository.projectContentBreakdown(actor, project.id),
       experimentRepository.countByStatusForProject(project.id),
       experimentRepository.listForProject(project.id, 8),
       activityRepository.listForProject(project.id, 20),
@@ -333,12 +315,6 @@ export async function overview(actor: Actor, projectId: string): Promise<Project
     activity,
     missingTemplateFolders,
   };
-}
-
-function scopeIds(actor: Actor, scopeType: 'department' | 'project'): string[] {
-  return actor.grants
-    .filter((grant) => grant.scopeType === scopeType && grant.scopeId)
-    .map((grant) => grant.scopeId as string);
 }
 
 export const projectService = { list, getById, create, update, applyTemplate, overview };

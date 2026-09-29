@@ -20,6 +20,7 @@ import { LocalStorageProvider } from './local-provider';
 import { LocalObjectStore } from './local-object-store';
 import { getGoogleDriveStorage, isDriveStorageEnabled } from './google';
 import { storageRegistry } from './registry';
+import { isWorkerRuntime } from '@/server/runtime';
 import type { ObjectStore, StorageProvider, StorageProviderName } from './types';
 
 let provider: StorageProvider | null = null;
@@ -47,8 +48,15 @@ export function getStorageProvider(): StorageProvider {
 function registerProviders(): void {
   if (registered) return;
 
-  const local = new LocalObjectStore(getStorageProvider());
-  storageRegistry.register({ objects: local, hierarchy: local });
+  // Not on a Worker. workerd's `node:fs` is an empty in-memory filesystem, so a local read
+  // opened there "succeeds" and fails only after a 200 and its Content-Length have gone out: the
+  // browser saves a truncated file. Unregistered, a record still pointing at local disk fails as
+  // the registry's controlled "not available on this deployment" error before any byte is sent.
+  // (Cutover step 12 verifies no such record remains.)
+  if (!isWorkerRuntime()) {
+    const local = new LocalObjectStore(getStorageProvider());
+    storageRegistry.register({ objects: local, hierarchy: local });
+  }
 
   // Google Drive appears only when the operator has turned it on. With the flag off,
   // nothing here is imported, no credential is read and no Google call is made — and a

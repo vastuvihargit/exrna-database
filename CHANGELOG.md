@@ -2,6 +2,85 @@
 
 All notable changes to the Biotech Research Drive.
 
+## [Cloudflare migration — verification pass] — 2026-09-29
+
+Everything below was found by running the full gates — the browser suite to the end, the full
+D1 suite, and a fresh Worker preview — rather than by review. Results:
+`docs/cloudflare-migration/FINAL-READINESS.md`.
+
+### Security
+- **Confidential projects were visible below clearance**, on both engines. The project list (which
+  also gates `GET /api/projects/:id`) and the project drive let every role-scope route in
+  regardless of classification. Role scope now requires the project's classification to be within
+  the actor's clearance, as files and folders already did; members and the lead still see it.
+- **The per-IP sign-in limit was keyed on a client-written header.** The first
+  `X-Forwarded-For` entry is whatever the client sent (Cloudflare and nginx both append), so the
+  limit could be reset per attempt. Now `CF-Connecting-IP`, then `X-Real-IP`.
+
+### Fixed
+- **Overlapping D1 expiry sweeps wrote the same stock off twice** (a phantom ledger row). The
+  ledger insert is now guarded by the rows as they stand inside the atomic batch.
+- **A revoked session locked the person out of the sign-in page** (`ERR_TOO_MANY_REDIRECTS` after
+  any role change). A dead cookie is now cleared through `/api/auth/session-expired`.
+- **Password sign-in on a Worker** answered 500 for an unknown address and "incorrect password"
+  for a known one; it is now refused deliberately, like password reset.
+- **A record still on local disk downloaded from a Worker as a truncated file**; the local provider
+  is no longer registered there, so it fails before any byte is sent.
+- **The employee table re-rendered for ever while loading**, hanging the *Add employee* pickers.
+- **Cloudflare Workers Builds failed on its default commands** (`npm run build` +
+  `npx wrangler deploy`): a plain `next build` left no Worker and let the argon2 native addon
+  into the bundle. `npm run build` now runs `cf:build` when `WORKERS_CI=1`; elsewhere it is
+  unchanged. The Worker is renamed `exrna-database` to match the Cloudflare project.
+
+### Tests
+- Browser suite green: **34/34** on the D1 backend (was 18/32). Spec defects fixed along the way
+  are listed in `25-browser-e2e.md` §5; global setup now survives a path containing a space.
+- The route-protection test recognises `withNodeOnlyRoute` and pins that it authenticates.
+- Worker preview verification written up: `26-worker-preview.md`.
+
+## [Cloudflare migration — production readiness] — 2026-09-28
+
+The last locally-fixable gaps between "every module has a D1 repository" and "ready for a
+production-shaped rehearsal". Status and exact test results: `docs/cloudflare-migration/FINAL-READINESS.md`.
+
+### Added
+- **Browser E2E suite** (Playwright, `npm run test:e2e`): a scientist's working day with a second
+  user, inventory, and administration, through the real UI against a seeded local D1 that the
+  real migration tool loads and verifies on every run (`25-browser-e2e.md`).
+- **Scheduled maintenance on the Worker.** A second cron trigger (`7 * * * *`) enqueues expired
+  upload cleanup and the Drive approval check hourly, and the trash purge and **inventory expiry
+  sweep** daily, through the sync queue. The Node scheduler gains `inventory:expire`. Both call
+  the same service functions; every job is idempotent.
+- **Durable Object rate limiting on the Worker** (`RATE_LIMITER`). The in-process counter counted
+  per isolate there — a limit that mostly did not exist. Node keeps the in-process store.
+- **Node-only admin tools answer a Worker with `501 NODE_ONLY_OPERATION`** (Drive import, storage
+  migration, retained local copies) before any Mongo or filesystem code runs; their tabs are
+  hidden on the Worker.
+- CI: Drizzle schema-drift gate, Worker build and dry-run bundle, E2E job; `.dev.vars` added to
+  the committed-secrets check. A staging-only Cloudflare deploy workflow; production stays a
+  runbook step.
+
+### Changed
+- **Password reset** is refused, with a pointer to the identity provider's recovery, wherever the
+  application does not own the password: behind Cloudflare Access and on any Worker.
+- An HTTP malware scanner now **fails closed by default on every Worker and on staging**, not only
+  in production. Failing open requires an explicit `MALWARE_SCAN_FAIL_CLOSED=false`.
+
+### Fixed
+- A Worker configured as documented (no `MONGODB_URI`, no local storage roots) passed its startup
+  gate and then failed every request that read the shared environment schema. Local previews had
+  hidden it because a developer `.dev.vars` carried both.
+- `drizzle/migrations/meta` stopped at 0004: the next `db:generate` would have re-emitted 0004's
+  and 0005's columns as a colliding `0005_*.sql`. The journal and a current snapshot now describe
+  0005, and generation is a no-op.
+- `DATA_SOURCE_COLLABORATION` and `DATA_SOURCE_JOBS` were production switches no code read. Removed;
+  a test now fails if a declared flag has no reader.
+- `opennextjs-cloudflare deploy -- --env X` passed `--env` to wrangler only, so OpenNext's own
+  cache population targeted the top-level environment. The docs and workflow now use
+  `deploy --env X`.
+- The *New department* form could not be submitted with the optional quota left empty.
+- `D1_LOCAL_PROXY_PERSIST` (E2E's local D1) is refused unless `NODE_ENV` is development or test.
+
 ## [Drive Storage — Phase 11] — 2026-08-02 — Giving up the safety net, on purpose
 
 Every migrated version has kept its local bytes since Phase 5, and that retention has been

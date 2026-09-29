@@ -4,6 +4,9 @@ import { Card, CardDescription, CardHeader, CardTitle } from '@/components/ui/ca
 import { StorageMigrationManager } from '@/components/admin/storage-migration-manager';
 import { requireActor } from '@/server/http/page-guard';
 import { describeDriveStorage } from '@/server/storage';
+import { NodeOnlyNotice } from '@/components/admin/node-only-notice';
+import { NODE_ONLY_FEATURES } from '@/server/http/node-only';
+import { isWorkerRuntime } from '@/server/runtime';
 
 export const metadata: Metadata = { title: 'Drive storage' };
 export const dynamic = 'force-dynamic';
@@ -22,6 +25,7 @@ export const dynamic = 'force-dynamic';
  */
 export default async function StorageMigrationPage() {
   await requireActor('/admin/storage-migration');
+  if (isWorkerRuntime()) return <NodeOnlyNotice feature={NODE_ONLY_FEATURES.storageMigration} />;
   const drive = describeDriveStorage();
 
   if (!drive.enabled) {

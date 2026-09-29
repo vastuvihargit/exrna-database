@@ -24,6 +24,8 @@ const formSchema = z.object({
 type FormValues = z.infer<typeof formSchema>;
 
 interface Providers {
+  /** Cloudflare Access is in front: it is the only sign-in method. */
+  access: boolean;
   password: boolean;
   google: boolean;
   microsoft: boolean;
@@ -105,6 +107,20 @@ export function LoginForm() {
           </div>
         ) : null}
 
+        {providers?.access ? (
+          <>
+            <Button className="w-full" asChild>
+              <a href={`/api/auth/access?next=${encodeURIComponent(nextPath)}`}>
+                <LogIn className="size-4" aria-hidden="true" />
+                Continue with company sign-in
+              </a>
+            </Button>
+            <p className="text-center text-xs text-muted-foreground">
+              Sign-in is handled by your company&apos;s single sign-on.
+            </p>
+          </>
+        ) : null}
+
         {providers?.google ? (
           <>
             <Button variant="outline" className="w-full" asChild>
@@ -119,6 +135,7 @@ export function LoginForm() {
           </>
         ) : null}
 
+        {providers?.access ? null : (
         <form
           className="space-y-4"
           onSubmit={form.handleSubmit((values) => {
@@ -183,6 +200,7 @@ export function LoginForm() {
             Sign in
           </Button>
         </form>
+        )}
 
         <p className="text-center text-xs text-muted-foreground">
           Accounts are created by your administrator. There is no public sign-up.

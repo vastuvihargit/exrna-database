@@ -20,15 +20,25 @@ import {
 } from '@/server/errors/app-error';
 import { MAX_FOLDER_DEPTH } from '@/server/db/models';
 import { withTransaction } from '@/server/db/connection';
+import {
+  hierarchyMutationEngine,
+  moveFolderSubtreeWithFiles,
+  restoreFolderSubtreeWithFiles,
+  setFolderSubtreeStatusWithFiles,
+  trashFolderSubtreeWithFiles,
+} from '@/server/db/d1-unit-of-work';
 import { isValidDisplayName, nextAvailableName, sanitizeDisplayName } from '@/server/domain/naming';
 import type { ConfidentialityLevel } from '@/server/domain/permissions';
 import type { Actor } from '@/server/permissions/actor';
-import { childVisibilityFilter } from '@/server/permissions/visibility';
 import { auditService } from '@/server/audit/audit.service';
 import * as activityRepository from '@/server/repositories/activity.repository';
 import * as fileRepository from '@/server/repositories/file.repository';
 import * as folderRepository from '@/server/repositories/folder.repository';
-import type { FolderRecord, FolderSortField } from '@/server/repositories/folder.repository';
+import type {
+  FolderPatch,
+  FolderRecord,
+  FolderSortField,
+} from '@/server/repositories/folder.repository';
 import * as recentRepository from '@/server/repositories/recent-item.repository';
 import * as starRepository from '@/server/repositories/star.repository';
 import type { RequestMeta } from '@/server/http/request-meta';
@@ -53,6 +63,7 @@ import {
 } from './folder-access';
 import { can } from '@/server/permissions/authorize';
 import { copyFilesForFolderCopy, purgeExpiredTrash as purgeExpiredFiles } from './file.service';
+import { detach } from '@/server/runtime/detach';
 
 /** Guard rail on recursive copy: a runaway copy is a denial-of-service on disk. */
 const MAX_COPY_FOLDERS = 2000;
@@ -80,15 +91,17 @@ export async function getFolder(
 
   // Opening a folder is what puts it in Recent. Failing to record that must never
   // fail the read itself.
-  void recentRepository
-    .touch({
-      userId: actor.userId,
-      organizationId: actor.organizationId,
-      entityType: 'folder',
-      entityId: context.folder.id,
-      action: 'opened',
-    })
-    .catch(() => undefined);
+  detach(
+    recentRepository
+      .touch({
+        userId: actor.userId,
+        organizationId: actor.organizationId,
+        entityType: 'folder',
+        entityId: context.folder.id,
+        action: 'opened',
+      }),
+    'recent.touch',
+  );
 
   return {
     folder: toView(context, actor, starred.has(context.folder.id)),
@@ -112,8 +125,8 @@ export async function listChildFolders(
   const context = await requireFolder(actor, folderId, 'file.view');
 
   const { items, total } = await folderRepository.listChildrenOf({
+    actor,
     parentFolderId: folderId,
-    visibility: childVisibilityFilter(actor),
     ...(input.search ? { searchPrefix: input.search } : {}),
     page: input.page,
     pageSize: input.pageSize,
@@ -277,7 +290,8 @@ export async function renameFolder(
     revert: mirror.revert,
     commit: async () => {
       const result = await folderRepository.updateById(folderId, {
-        $set: { name, nameLower: name.toLowerCase(), updatedBy: actor.userId },
+        name,
+        updatedBy: actor.userId,
       });
       if (!result) throw new NotFoundError();
       return result;
@@ -334,7 +348,7 @@ export async function updateFolder(
 ): Promise<FolderView> {
   const context = await requireFolder(actor, folderId, 'metadata.edit');
 
-  const update: Record<string, unknown> = { updatedBy: actor.userId };
+  const update: FolderPatch = { updatedBy: actor.userId };
   if (input.description !== undefined) update.description = input.description;
   if (input.color !== undefined) update.color = input.color;
 
@@ -352,7 +366,7 @@ export async function updateFolder(
     update.inheritPermissions = input.inheritPermissions;
   }
 
-  const updated = await folderRepository.updateById(folderId, { $set: update });
+  const updated = await folderRepository.updateById(folderId, update);
   if (!updated) throw new NotFoundError();
 
   await record(actor, meta, updated, 'file.metadata_updated', {
@@ -431,44 +445,68 @@ export async function moveFolder(
     commit: () => moveFolderRecords(),
   });
 
+  /**
+   * The hierarchy write, dispatched on which databases are actually serving.
+   *
+   * A folder move rewrites two hierarchies that must agree — the folder tree and every
+   * contained file's ancestor chain — and the mechanism that keeps them in step is different
+   * for each engine. MongoDB has an interactive transaction; D1 has one prebuilt batch. There
+   * is no mechanism at all that spans both, which is why a split configuration is refused
+   * rather than attempted.
+   */
   async function moveFolderRecords(): Promise<void> {
-    await withTransaction(async (session) => {
-    await folderRepository.moveSubtree(
-      {
-        folderId,
-        newParentId: target.folder.id,
-        newPathAncestors: [...target.folder.pathAncestors, target.folder.id],
-        driveType: target.folder.driveType,
-        departmentId: target.folder.departmentId,
-        projectId: target.folder.projectId,
-        // Moving into a personal drive transfers ownership to that drive's owner;
-        // anywhere else the folder keeps its own owner.
-        ownerId: target.folder.driveType === 'my' ? target.folder.ownerId : context.folder.ownerId,
-        updatedBy: actor.userId,
-      },
-      session,
-    );
-    // Files carry a denormalized copy of their folder's ancestor path, so they move
-    // with it in the same transaction — otherwise a subtree search would miss them.
-    await fileRepository.reparentSubtree(
-      {
-        folderId,
-        newPathAncestorsForFolder: [...target.folder.pathAncestors, target.folder.id],
-        driveType: target.folder.driveType,
-        departmentId: target.folder.departmentId,
-        projectId: target.folder.projectId,
-      },
-      session,
-    );
+    const moveInput = {
+      folderId,
+      newParentId: target.folder.id,
+      newPathAncestors: [...target.folder.pathAncestors, target.folder.id],
+      driveType: target.folder.driveType,
+      departmentId: target.folder.departmentId,
+      projectId: target.folder.projectId,
+      // Moving into a personal drive transfers ownership to that drive's owner;
+      // anywhere else the folder keeps its own owner.
+      ownerId: target.folder.driveType === 'my' ? target.folder.ownerId : context.folder.ownerId,
+      updatedBy: actor.userId,
+    };
 
-    if (context.folder.parentFolderId) {
-      await folderRepository.adjustChildFolderCount(context.folder.parentFolderId, -1, session);
+    // Fails closed on a split configuration. Committing the folder half to one database and
+    // then attempting the file half against another is the exact inconsistency this design
+    // removes, with a wider window. Reads are unaffected; only this mutation is refused.
+    if (hierarchyMutationEngine('move') === 'd1') {
+      // One batch: folders, folder_ancestors, files, file_folder_ancestors and both child
+      // counts commit together or not at all. No Mongo session is opened — `withTransaction`
+      // would start one and it would govern none of these statements.
+      await moveFolderSubtreeWithFiles({
+        ...moveInput,
+        previousParentId: context.folder.parentFolderId,
+      });
+      return;
     }
-    await folderRepository.adjustChildFolderCount(target.folder.id, 1, session);
+
+    await withTransaction(async (session) => {
+      await folderRepository.moveSubtree(moveInput, session);
+      // Files carry a denormalized copy of their folder's ancestor path, so they move
+      // with it in the same transaction — otherwise a subtree search would miss them.
+      await fileRepository.reparentSubtree(
+        {
+          folderId,
+          newPathAncestorsForFolder: [...target.folder.pathAncestors, target.folder.id],
+          driveType: target.folder.driveType,
+          departmentId: target.folder.departmentId,
+          projectId: target.folder.projectId,
+        },
+        session,
+      );
+
+      if (context.folder.parentFolderId) {
+        await folderRepository.adjustChildFolderCount(context.folder.parentFolderId, -1, session);
+      }
+      await folderRepository.adjustChildFolderCount(target.folder.id, 1, session);
     });
   }
 
-  const moved = await folderRepository.findById(folderId);
+  // Internal on purpose: `resource.move` was asserted on this folder at the top of the
+  // request, and the row being re-read is the one this request has just written.
+  const moved = await folderRepository.findByIdInternal(folderId);
   if (!moved) throw new NotFoundError();
 
   await record(actor, meta, moved, 'folder.move', {
@@ -488,7 +526,7 @@ export async function moveFolder(
 }
 
 async function maxSubtreeDepth(folder: FolderRecord): Promise<number> {
-  const descendants = await folderRepository.listDescendants(folder.id);
+  const descendants = await folderRepository.listDescendantsInternal(folder.id);
   if (descendants.length === 0) return 0;
   return Math.max(...descendants.map((d) => d.depth)) - folder.depth;
 }
@@ -508,7 +546,7 @@ export async function copyFolder(
     throw new ConflictError('A folder cannot be copied into itself', 'CIRCULAR_MOVE');
   }
 
-  const descendants = await folderRepository.listDescendants(folderId);
+  const descendants = await folderRepository.listDescendantsInternal(folderId);
   if (descendants.length + 1 > MAX_COPY_FOLDERS) {
     throw new ValidationError(
       `That folder contains more than ${MAX_COPY_FOLDERS} subfolders, which is too many to copy in one operation`,
@@ -542,7 +580,9 @@ export async function copyFolder(
   for (const descendant of ordered) {
     const newParentId = descendant.parentFolderId ? idMap.get(descendant.parentFolderId) : undefined;
     if (!newParentId) continue; // Parent was skipped; skip the branch with it.
-    const parentRecord = await folderRepository.findById(newParentId);
+    // Internal: this is a folder the loop created moments ago, inside a copy the actor is
+    // already authorized for.
+    const parentRecord = await folderRepository.findByIdInternal(newParentId);
     if (!parentRecord) continue;
 
     const createdChild = await folderRepository.create({
@@ -619,6 +659,16 @@ export async function trashFolder(
   });
 
   async function trashFolderRecords(): Promise<{ folders: number; files: number }> {
+    // Fails closed on a split configuration, exactly as a move does: the folder half would
+    // commit to one database and the file half to another.
+    if (hierarchyMutationEngine('trash') === 'd1') {
+      return trashFolderSubtreeWithFiles({
+        folderId,
+        userId: actor.userId,
+        parentFolderId: context.folder.parentFolderId,
+      });
+    }
+
     return withTransaction(async (session) => {
     const count = await folderRepository.setSubtreeDeleted(
       { folderId, deleted: true, userId: actor.userId },
@@ -659,8 +709,13 @@ export async function restoreFolder(
 
   // Restoring into a parent that is itself in the trash would leave the folder
   // unreachable, so it goes back to the drive root instead.
+  // Internal: the question is whether the *parent* is still in the trash, and the answer must
+  // not depend on whether the restorer can see it — a folder the actor may not view can still
+  // be the reason their restore has to wait.
   const parent = context.folder.parentFolderId
-    ? await folderRepository.findById(context.folder.parentFolderId, { includeDeleted: true })
+    ? await folderRepository.findByIdInternal(context.folder.parentFolderId, {
+        includeDeleted: true,
+      })
     : null;
   if (parent?.deletedAt) {
     throw new ConflictError(
@@ -693,6 +748,15 @@ export async function restoreFolder(
   });
 
   async function restoreFolderRecords(): Promise<number> {
+    if (hierarchyMutationEngine('restore') === 'd1') {
+      const counts = await restoreFolderSubtreeWithFiles({
+        folderId,
+        userId: actor.userId,
+        parentFolderId: context.folder.parentFolderId,
+      });
+      return counts.folders;
+    }
+
     return withTransaction(async (session) => {
     const count = await folderRepository.setSubtreeDeleted(
       { folderId, deleted: false, userId: actor.userId },
@@ -709,7 +773,7 @@ export async function restoreFolder(
     });
   }
 
-  const restored = await folderRepository.findById(folderId);
+  const restored = await folderRepository.findByIdInternal(folderId);
   if (!restored) throw new NotFoundError();
 
   await record(actor, meta, restored, 'resource.restore', {
@@ -729,18 +793,18 @@ export async function setArchived(
   const context = await requireFolder(actor, folderId, archived ? 'resource.archive' : 'resource.restore');
   assertMutable(context.folder);
 
-  await withTransaction(async (session) => {
-    await folderRepository.setSubtreeStatus(
-      { folderId, status: archived ? 'archived' : 'active', userId: actor.userId },
-      session,
-    );
-    await fileRepository.setSubtreeStatus(
-      { folderId, status: archived ? 'archived' : 'active' },
-      session,
-    );
-  });
+  const status = archived ? ('archived' as const) : ('active' as const);
 
-  const updated = await folderRepository.findById(folderId);
+  if (hierarchyMutationEngine(archived ? 'archive' : 'unarchive') === 'd1') {
+    await setFolderSubtreeStatusWithFiles({ folderId, status, userId: actor.userId });
+  } else {
+    await withTransaction(async (session) => {
+      await folderRepository.setSubtreeStatus({ folderId, status, userId: actor.userId }, session);
+      await fileRepository.setSubtreeStatus({ folderId, status }, session);
+    });
+  }
+
+  const updated = await folderRepository.findByIdInternal(folderId);
   if (!updated) throw new NotFoundError();
 
   await record(actor, meta, updated, archived ? 'resource.archive' : 'resource.restore', {
@@ -759,15 +823,14 @@ export async function listTrash(
   // Only what the user deleted themselves — descendants swept in with a parent are
   // restored with it and would be noise here.
   const { items, total } = await folderRepository.listTrashed({
-    organizationId: actor.organizationId,
-    visibility: childVisibilityFilter(actor),
+    actor,
     page: input.page,
     pageSize: input.pageSize,
   });
 
   const views = await Promise.all(
     items.map(async (item) => {
-      const context = await loadFolderContext(item.id, { includeDeleted: true });
+      const context = await loadFolderContext(actor, item.id, { includeDeleted: true });
       return context ? toView(context, actor, false) : null;
     }),
   );
@@ -780,15 +843,14 @@ export async function listArchive(
   input: { page: number; pageSize: number },
 ): Promise<{ items: FolderView[]; total: number }> {
   const { items, total } = await folderRepository.listArchived({
-    organizationId: actor.organizationId,
-    visibility: childVisibilityFilter(actor),
+    actor,
     page: input.page,
     pageSize: input.pageSize,
   });
 
   const views = await Promise.all(
     items.map(async (item) => {
-      const context = await loadFolderContext(item.id);
+      const context = await loadFolderContext(actor, item.id);
       return context ? toView(context, actor, false) : null;
     }),
   );
@@ -811,7 +873,7 @@ export async function purgeExpiredTrash(): Promise<{
 
   const env = getEnv();
   const cutoff = new Date(Date.now() - env.TRASH_RETENTION_DAYS * 24 * 60 * 60 * 1000);
-  const expired = await folderRepository.findExpiredTrash(cutoff);
+  const expired = await folderRepository.findExpiredTrashInternal(cutoff);
   if (expired.length === 0) {
     return { purged: 0, purgedFiles: fileResult.files, reclaimedBytes: fileResult.bytes };
   }
@@ -861,7 +923,7 @@ export async function listRecent(actor: Actor): Promise<FolderView[]> {
  * re-authorized on every read rather than trusted because the row exists.
  */
 async function resolveMany(actor: Actor, ids: string[]): Promise<FolderView[]> {
-  const contexts = await Promise.all(ids.map((id) => loadFolderContext(id)));
+  const contexts = await Promise.all(ids.map((id) => loadFolderContext(actor, id)));
   const views: FolderView[] = [];
   const starred = await starRepository.starredIdsAmong(actor.userId, 'folder', ids);
 
@@ -922,20 +984,22 @@ async function record(
   });
 
   // The activity feed is best-effort: it is a convenience, not the compliance record.
-  void activityRepository
-    .append({
-      organizationId: actor.organizationId,
-      actorUserId: actor.userId,
-      actorName: actor.name,
-      action,
-      entityType: 'folder',
-      entityId: folder.id,
-      entityLabel: folder.name,
-      contextFolderIds: folder.pathAncestors,
-      departmentId: folder.departmentId,
-      projectId: folder.projectId,
-    })
-    .catch(() => undefined);
+  detach(
+    activityRepository
+      .append({
+        organizationId: actor.organizationId,
+        actorUserId: actor.userId,
+        actorName: actor.name,
+        action,
+        entityType: 'folder',
+        entityId: folder.id,
+        entityLabel: folder.name,
+        contextFolderIds: folder.pathAncestors,
+        departmentId: folder.departmentId,
+        projectId: folder.projectId,
+      }),
+    'activity.append',
+  );
 }
 
 export const folderService = {

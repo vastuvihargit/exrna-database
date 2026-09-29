@@ -1,6 +1,6 @@
 import type { NextRequest } from 'next/server';
 
-import { withAuthenticatedRoute } from '@/server/http/authenticated-route';
+import { NODE_ONLY_FEATURES, withNodeOnlyRoute } from '@/server/http/node-only';
 import { ok } from '@/server/http/api-response';
 import { migrationService } from '@/server/services/migration.service';
 import { objectIdSchema } from '@/server/validation/common';
@@ -16,7 +16,7 @@ export const dynamic = 'force-dynamic';
  * connection open for hours and lose everything to a single timeout. The client calls
  * this repeatedly, and any call can be the last one without losing work.
  */
-export const POST = withAuthenticatedRoute<{ jobId: string }>(
+export const POST = withNodeOnlyRoute<{ jobId: string }>(NODE_ONLY_FEATURES.driveImport,
   async (request: NextRequest, { actor, params, meta }) => {
     const jobId = objectIdSchema.parse(params.jobId);
     const body: unknown = await request.json().catch(() => ({}));

@@ -44,3 +44,10 @@
 # asks every question, and it is what catches whatever the change feed missed while its
 # cursor was expired.
 40 * * * *     su-exec nextjs sh /usr/local/bin/run.sh drive:check-approvals
+
+# ── Inventory ──────────────────────────────────────────────────────────────────────────
+#
+# Stock past its expiry date is written off: the batch goes to zero and one `expired` row
+# is appended to the item's ledger. Idempotent — a second run finds nothing. Daily, after
+# the trash purge. The Cloudflare Worker runs the same sweep from its own cron trigger.
+20 3 * * *     su-exec nextjs sh /usr/local/bin/run.sh inventory:expire

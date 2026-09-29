@@ -2,7 +2,8 @@
  * Authenticated route wrapper.
  *
  * Every protected API route is built with this. It performs, in order:
- *   1. session resolution (which re-checks user status on every request)
+ *   1. session resolution (which re-checks user status on every request) and, when Cloudflare
+ *      Access is in front, verification that the request's Access assertion is for the same user
  *   2. CSRF validation for state-changing methods
  *   3. a per-actor rate limit
  *
@@ -12,7 +13,8 @@
 import type { NextRequest } from 'next/server';
 import { UnauthenticatedError } from '@/server/errors/app-error';
 import { enforce, RATE_LIMITS } from '@/server/auth/rate-limit';
-import { assertCsrf, resolveSession } from '@/server/auth/session.service';
+import { assertCsrf } from '@/server/auth/session.service';
+import { resolveRequestSession } from '@/server/auth/access-session';
 import type { Actor } from '@/server/permissions/actor';
 import { withRouteHandler, type RequestContext } from './route-handler';
 import { CSRF_HEADER, SESSION_COOKIE } from './cookies';
@@ -37,7 +39,7 @@ export function withAuthenticatedRoute<TParams = Record<string, string>>(
 ) {
   return withRouteHandler<TParams>(async (request, { params, requestContext }) => {
     const token = request.cookies.get(SESSION_COOKIE)?.value;
-    const resolved = await resolveSession(token);
+    const resolved = await resolveRequestSession(token, request.headers);
 
     if (!resolved) throw new UnauthenticatedError();
 
@@ -45,10 +47,10 @@ export function withAuthenticatedRoute<TParams = Record<string, string>>(
       // Origin check first: a same-site check is cheap and catches the common case
       // before the token comparison.
       assertSameOrigin(request);
-      assertCsrf(resolved.csrfTokenHash, request.headers.get(CSRF_HEADER) ?? undefined);
+      await assertCsrf(resolved.csrfTokenHash, request.headers.get(CSRF_HEADER) ?? undefined);
     }
 
-    enforce(`api:user:${resolved.actor.userId}`, RATE_LIMITS.authenticated);
+    await enforce(`api:user:${resolved.actor.userId}`, RATE_LIMITS.authenticated);
 
     const meta: RequestMeta = {
       requestId: requestContext.requestId,
@@ -91,6 +93,6 @@ function assertSameOrigin(request: NextRequest): void {
 /** For routes that must know the actor if present but do not require one. */
 export async function optionalActor(request: NextRequest): Promise<Actor | null> {
   const token = request.cookies.get(SESSION_COOKIE)?.value;
-  const resolved = await resolveSession(token);
+  const resolved = await resolveRequestSession(token, request.headers);
   return resolved?.actor ?? null;
 }

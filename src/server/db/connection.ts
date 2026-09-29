@@ -8,6 +8,7 @@
 import mongoose, { type Connection } from 'mongoose';
 import { getEnv } from '@/server/config/env';
 import { getLogger } from '@/server/logging/logger';
+import { isWorkerRuntime } from '@/server/runtime';
 
 interface MongooseCache {
   conn: typeof mongoose | null;
@@ -85,9 +86,24 @@ export type DatabaseHealth =
   | { status: 'ok'; latencyMs: number; database: string }
   | { status: 'error'; error: string };
 
-/** Used by /api/health/ready. Never leaks the connection string. */
+/**
+ * Used by /api/health/ready and the admin System page. Never leaks the connection string.
+ *
+ * In a Worker the application's database is D1 and MongoDB is unreachable by construction, so
+ * pinging Mongo there would report every healthy Worker as down — the first thing an operator
+ * reads after a deploy. The Worker answer is a round trip through the D1 binding.
+ */
 export async function checkDatabaseHealth(): Promise<DatabaseHealth> {
   const started = Date.now();
+  if (isWorkerRuntime()) {
+    try {
+      const { getD1Binding } = await import('./d1-context');
+      await (await getD1Binding()).prepare('SELECT 1').first();
+      return { status: 'ok', latencyMs: Date.now() - started, database: 'd1' };
+    } catch (error) {
+      return { status: 'error', error: error instanceof Error ? error.message : 'D1 unavailable' };
+    }
+  }
   try {
     await connectToDatabase();
     const admin = mongoose.connection.db?.admin();
@@ -111,8 +127,25 @@ export async function checkDatabaseHealth(): Promise<DatabaseHealth> {
  *
  * Requires a replica set (a single-node rs0 is enough). Used wherever two collections
  * must agree — upload finalization, version restore, approval, folder move.
+ *
+ * ── In a Worker there is no MongoDB session to open ─────────────────────────────────────
+ *
+ * Several services wrap work in this helper and branch *inside* it on the D1 engine, where the
+ * atomicity comes from a D1 `batch()` (`createVersionWithFile`, the lifecycle and hierarchy
+ * units of work) and the Mongo session is ignored. On Node that costs an unused session. In a
+ * Worker it was fatal: `connectToDatabase()` needs a TCP socket workerd does not have, so the
+ * upload, new-version, file move / trash / restore and approval-integrity paths would all have
+ * failed after cutover — with every module correctly on D1. A Worker therefore runs the callback
+ * with no session; every module there is on D1 (`loadWorkerEnv` refuses a production Worker
+ * otherwise), and every D1 repository ignores the session argument.
  */
 export async function withTransaction<T>(fn: (session: mongoose.ClientSession) => Promise<T>): Promise<T> {
+  if (isWorkerRuntime()) {
+    // The callback's parameter stays typed as a session so the ~20 Node call sites are
+    // unchanged; nothing on the D1 path dereferences it.
+    return fn(undefined as unknown as mongoose.ClientSession);
+  }
+
   await connectToDatabase();
   const session = await mongoose.startSession();
   try {

@@ -2,6 +2,7 @@ import type { NextRequest } from 'next/server';
 
 import { withAuthenticatedRoute } from '@/server/http/authenticated-route';
 import { noContent, ok } from '@/server/http/api-response';
+import { detach } from '@/server/runtime/detach';
 import { toSavedSearchDto } from '@/server/http/dto';
 import { NotFoundError } from '@/server/errors/app-error';
 import * as savedSearchRepository from '@/server/repositories/saved-search.repository';
@@ -22,7 +23,7 @@ export const GET = withAuthenticatedRoute<{ savedSearchId: string }>(
     const saved = await savedSearchRepository.findOwned(actor.userId, id);
     if (!saved) throw new NotFoundError();
 
-    void savedSearchRepository.markRun(actor.userId, id).catch(() => undefined);
+    detach(savedSearchRepository.markRun(actor.userId, id), 'savedSearch.markRun');
     return ok(toSavedSearchDto(saved));
   },
 );

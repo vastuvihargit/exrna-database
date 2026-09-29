@@ -1,6 +1,6 @@
 import type { NextRequest } from 'next/server';
 
-import { withAuthenticatedRoute } from '@/server/http/authenticated-route';
+import { NODE_ONLY_FEATURES, withNodeOnlyRoute } from '@/server/http/node-only';
 import { ok } from '@/server/http/api-response';
 import { toMigrationItemDto } from '@/server/http/dto';
 import { migrationService } from '@/server/services/migration.service';
@@ -17,7 +17,7 @@ export const dynamic = 'force-dynamic';
  * skipped or failed — "every migration item has an audit history" is only true if the
  * skips are visible too.
  */
-export const GET = withAuthenticatedRoute<{ jobId: string }>(
+export const GET = withNodeOnlyRoute<{ jobId: string }>(NODE_ONLY_FEATURES.driveImport,
   async (request: NextRequest, { actor, params }) => {
     const jobId = objectIdSchema.parse(params.jobId);
     const query = listMigrationItemsSchema.parse(

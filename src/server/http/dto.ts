@@ -18,6 +18,7 @@ import type { ActivityRecord } from '@/server/repositories/activity.repository';
 import type { FileView, RelatedFile } from '@/server/services/file.service';
 import type { ExperimentView } from '@/server/services/experiment.service';
 import type { InventoryItemView } from '@/server/services/inventory.service';
+import type { StockTransactionRecord } from '@/server/repositories/inventory-item.repository';
 import type {
   MigrationItemRecord,
   MigrationJobRecord,
@@ -457,6 +458,44 @@ export function toInventoryItemDto(item: InventoryItemView) {
     capabilities: item.capabilities,
     createdAt: item.createdAt,
     updatedAt: item.updatedAt,
+  };
+}
+
+/**
+ * One row of the stock ledger.
+ *
+ * `previousQuantity` and `newQuantity` are exposed deliberately: they are what makes a single
+ * row self-explanatory, and a reader who can see them can check the running total themselves
+ * rather than trusting the current figure on the item.
+ *
+ * There is no `capabilities` block, because there is nothing to offer. A ledger row cannot be
+ * edited or deleted by anybody — the model rejects it, the D1 triggers reject it, and no route
+ * exists. A correction is a new compensating row.
+ */
+export function toStockTransactionDto(transaction: StockTransactionRecord) {
+  return {
+    id: transaction.id,
+    itemId: transaction.itemId,
+    itemCode: transaction.itemCode,
+    itemName: transaction.itemName,
+    action: transaction.action,
+    quantity: transaction.quantity,
+    quantityDelta: transaction.quantityDelta,
+    previousQuantity: transaction.previousQuantity,
+    newQuantity: transaction.newQuantity,
+    unit: transaction.unit,
+    batchNumber: transaction.batchNumber,
+    expiryDate: transaction.expiryDate,
+    supplier: transaction.supplier,
+    storageLocation: transaction.storageLocation,
+    issuedToType: transaction.issuedToType,
+    issuedToLabel: transaction.issuedToLabel,
+    projectId: transaction.projectId,
+    experimentId: transaction.experimentId,
+    purpose: transaction.purpose,
+    notes: transaction.notes,
+    performedByName: transaction.performedByName,
+    performedAt: transaction.performedAt,
   };
 }
 

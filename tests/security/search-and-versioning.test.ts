@@ -14,6 +14,7 @@ import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { startTestDb, stopTestDb, type TestDb } from '../helpers/test-db';
 import { actorFor, seedFixture, TEST_META, type Fixture } from '../helpers/fixtures';
 import type { Actor } from '@/server/permissions/actor';
+import type { VersionPatch } from '@/server/repositories/file-version.repository.contract';
 
 let db: TestDb;
 let fixture: Fixture;
@@ -86,7 +87,7 @@ async function upload(
     { folderId, filename, size: content.byteLength, ...extra },
     TEST_META,
   );
-  await uploadService.receiveStream(actor, ticket.sessionId, Readable.from(content));
+  await uploadService.receiveStream(actor, ticket.sessionId, Readable.from(content), TEST_META);
   return uploadService.finalize(actor, ticket.sessionId, TEST_META);
 }
 
@@ -397,10 +398,12 @@ describe('version restore appends rather than rewinds', () => {
 
     // Simulate the state Phase 8 produces: the current version is signed off.
     await fileRepository.updateById(uploaded.fileId, {
-      $set: { approvalStatus: 'approved', reviewStatus: 'approved' },
+      approvalStatus: 'approved',
+      reviewStatus: 'approved',
     });
     await versionRepository.updateFlags(versions[0]!.id, {
-      $set: { isApproved: true, label: 'approved' },
+      isApproved: true,
+      label: 'approved',
     });
 
     await versionService.restoreVersion(alice, uploaded.fileId, { versionId: first.id }, TEST_META);
@@ -448,15 +451,20 @@ describe('stored versions stay immutable', () => {
     const uploaded = await upload(alice, folderId, 'frozen.pdf', pdfOfSize('frozen'));
     const current = await versionRepository.findCurrent(uploaded.fileId);
 
-    // The model's pre-hook is the last line of defence: even a direct repository call
-    // cannot repoint a version at different bytes.
-    await expect(
-      versionRepository.updateFlags(current!.id, { $set: { storageKey: 'somewhere/else' } }),
-    ).rejects.toThrow(/immutable/i);
+    /**
+     * Two layers now stop a version being repointed at different bytes.
+     *
+     * `VersionPatch` has no `storageKey` and no `checksumSha256`, so the ordinary way to
+     * attempt this stopped compiling when the patch became typed — which is the better place
+     * to catch it. The cast here defeats that deliberately, to prove the model's pre-hook is
+     * still underneath it: the type is the fence, the hook is the last line of defence, and a
+     * future caller reaching for `as unknown` must still be refused at runtime.
+     */
+    const bypassTyping = (fields: Record<string, unknown>) =>
+      versionRepository.updateFlags(current!.id, fields as VersionPatch);
 
-    await expect(
-      versionRepository.updateFlags(current!.id, { $set: { checksumSha256: 'f'.repeat(64) } }),
-    ).rejects.toThrow(/immutable/i);
+    await expect(bypassTyping({ storageKey: 'somewhere/else' })).rejects.toThrow(/immutable/i);
+    await expect(bypassTyping({ checksumSha256: 'f'.repeat(64) })).rejects.toThrow(/immutable/i);
   });
 
   it('allows a version note to be corrected', async () => {
@@ -477,5 +485,334 @@ describe('stored versions stay immutable', () => {
     );
 
     expect(updated.versionNote).toContain('Corrected');
+  });
+});
+
+/**
+ * A version id is not a capability.
+ *
+ * The version repository takes no `Actor` — on either engine — and says so in its contract:
+ * `findById` "carries no authorization of its own". Nothing about migrating it to D1 changes
+ * that, so the boundary has to hold one level up, and it is always the same two lines:
+ *
+ *     const context = await requireFile(actor, fileId, <permission>);
+ *     if (!version || version.fileId !== fileId) throw new NotFoundError();
+ *
+ * The first line decides whether this actor may touch this *file*. The second refuses to let a
+ * version id smuggle in a different one. Drop either and a guessed id becomes read access to
+ * somebody else's research — permission checked on one object, bytes taken from another.
+ *
+ * Every service that accepts a caller-supplied version id is exercised below: `download` (which
+ * serves the bytes), `restoreVersion` and `updateVersionNote` (which write), and
+ * `listVersions` (which discloses the history). The four ways an actor can lose access to a
+ * file — another organization, an explicit deny, a broken inheritance chain, an expired share —
+ * are each pushed through them, because a version read that outlived any one of those would be
+ * the disclosure the ACL exists to prevent.
+ */
+describe('a version id is not a capability', () => {
+  async function boundaryServices() {
+    return {
+      ...(await services()),
+      downloadService: (await import('@/server/services/download.service')).downloadService,
+      sharingService: (await import('@/server/services/sharing.service')).sharingService,
+      folderService: (await import('@/server/services/folder.service')).folderService,
+      driveService: (await import('@/server/services/drive.service')).driveService,
+    };
+  }
+
+  async function drain(body: NodeJS.ReadableStream): Promise<Buffer> {
+    const chunks: Buffer[] = [];
+    for await (const chunk of body as unknown as AsyncIterable<Buffer>) {
+      chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
+    }
+    return Buffer.concat(chunks);
+  }
+
+  /** Two files owned by Alice, each with its own version, in one personal folder. */
+  async function twoFiles(alice: Actor, label: string) {
+    const { versionRepository } = await boundaryServices();
+    const folderId = await personalFolder(alice, label);
+    const mine = await upload(alice, folderId, 'mine.pdf', pdfOfSize(`${label}-mine`));
+    const other = await upload(alice, folderId, 'other.pdf', pdfOfSize(`${label}-other`));
+    return {
+      folderId,
+      mine,
+      other,
+      otherVersion: (await versionRepository.findCurrent(other.fileId))!,
+    };
+  }
+
+  it('serves a version that belongs to the authorized file', async () => {
+    if (skipUnlessDb()) return;
+    const { downloadService } = await boundaryServices();
+    const alice = await actorFor(fixture.users.scientistA);
+    const { mine } = await twoFiles(alice, 'Boundary allowed');
+
+    const stream = await downloadService.download(
+      alice,
+      mine.fileId,
+      { versionId: mine.versionId },
+      TEST_META,
+    );
+
+    expect(stream.versionId).toBe(mine.versionId);
+    expect((await drain(stream.body)).byteLength).toBeGreaterThan(0);
+  });
+
+  /**
+   * The critical case: the *file* is authorized and the *version* is not part of it.
+   *
+   * `requireFile` passes — Alice owns both files — so the only thing standing between the
+   * caller and bytes from a different record is `version.fileId !== fileId`.
+   */
+  it('refuses a version id belonging to another file, on every service that takes one', async () => {
+    if (skipUnlessDb()) return;
+    const { downloadService, versionService } = await boundaryServices();
+    const alice = await actorFor(fixture.users.scientistA);
+    const { mine, otherVersion } = await twoFiles(alice, 'Boundary cross file');
+
+    await expect(
+      downloadService.download(alice, mine.fileId, { versionId: otherVersion.id }, TEST_META),
+    ).rejects.toMatchObject({ status: 404 });
+
+    await expect(
+      versionService.updateVersionNote(alice, mine.fileId, otherVersion.id, 'mine now', TEST_META),
+    ).rejects.toMatchObject({ status: 404 });
+
+    await expect(
+      versionService.restoreVersion(alice, mine.fileId, { versionId: otherVersion.id }, TEST_META),
+    ).rejects.toMatchObject({ status: 404 });
+
+    // Refused, not partially applied: the other file's version is exactly as it was.
+    const { versionRepository } = await boundaryServices();
+    const untouched = await versionRepository.findById(otherVersion.id);
+    expect(untouched).toMatchObject({
+      versionNote: otherVersion.versionNote,
+      fileId: otherVersion.fileId,
+      isCurrent: true,
+    });
+  });
+
+  /**
+   * An actor carrying every permission Alice has, in a different organization.
+   *
+   * Built by overriding the organization on a real actor rather than by seeding a second
+   * company: what is being tested is that the *permission set* is not what grants access, so
+   * the strongest version of the test keeps the permissions and changes only the tenant.
+   */
+  it('refuses a fully-privileged actor from another organization', async () => {
+    if (skipUnlessDb()) return;
+    const { fileService, downloadService, versionService } = await boundaryServices();
+    const alice = await actorFor(fixture.users.scientistA);
+    const { mine } = await twoFiles(alice, 'Boundary other org');
+
+    const { Types } = await import('mongoose');
+    const foreigner: Actor = {
+      ...alice,
+      userId: String(new Types.ObjectId()),
+      organizationId: String(new Types.ObjectId()),
+      email: 'chief@rival.com',
+      name: 'Rival Chief',
+    };
+
+    await expect(fileService.listVersions(foreigner, mine.fileId)).rejects.toMatchObject({
+      status: 404,
+    });
+    await expect(
+      downloadService.download(foreigner, mine.fileId, { versionId: mine.versionId }, TEST_META),
+    ).rejects.toMatchObject({ status: 404 });
+    await expect(
+      versionService.updateVersionNote(foreigner, mine.fileId, mine.versionId, 'ours', TEST_META),
+    ).rejects.toMatchObject({ status: 404 });
+  });
+
+  it('refuses somebody the file explicitly denies, even though they were shared it', async () => {
+    if (skipUnlessDb()) return;
+    const { fileService, downloadService, sharingService } = await boundaryServices();
+    const alice = await actorFor(fixture.users.scientistA);
+    const bob = await actorFor(fixture.users.scientistB);
+    const { mine } = await twoFiles(alice, 'Boundary deny');
+
+    await sharingService.share(
+      alice,
+      'file',
+      mine.fileId,
+      { principalType: 'user', principalId: bob.userId, accessLevel: 'viewer' },
+      TEST_META,
+    );
+    // The share works, so the denial below is what removes the access rather than its absence.
+    expect(await fileService.listVersions(bob, mine.fileId)).toHaveLength(1);
+
+    await sharingService.share(
+      alice,
+      'file',
+      mine.fileId,
+      { principalType: 'user', principalId: bob.userId, accessLevel: 'viewer', deny: true },
+      TEST_META,
+    );
+
+    await expect(fileService.listVersions(bob, mine.fileId)).rejects.toMatchObject({ status: 404 });
+    await expect(
+      downloadService.download(bob, mine.fileId, { versionId: mine.versionId }, TEST_META),
+    ).rejects.toMatchObject({ status: 404 });
+  });
+
+  /**
+   * Access to the folder is not access to the file once inheritance is broken.
+   *
+   * Bob keeps his grant on the parent folder throughout — so if the version read consulted the
+   * folder chain alone, or cached the decision from the containing folder, this would still
+   * succeed. It has to be the file's own ACL that decides, and after the break it says nothing
+   * about Bob.
+   */
+  it('refuses across a broken inheritance boundary, while the parent folder stays shared', async () => {
+    if (skipUnlessDb()) return;
+    const { fileService, downloadService, sharingService, folderService, driveService } =
+      await boundaryServices();
+    const alice = await actorFor(fixture.users.scientistA);
+    const bob = await actorFor(fixture.users.scientistB);
+
+    const root = await driveService.getMyDriveRoot(alice);
+    const parent = await folderService.createFolder(
+      alice,
+      { name: 'Boundary inheritance', parentFolderId: root.id },
+      TEST_META,
+    );
+    const uploaded = await upload(alice, parent.id, 'inherited.pdf', pdfOfSize('inherited'));
+
+    await sharingService.share(
+      alice,
+      'folder',
+      parent.id,
+      { principalType: 'user', principalId: bob.userId, accessLevel: 'viewer' },
+      TEST_META,
+    );
+    expect(await fileService.listVersions(bob, uploaded.fileId)).toHaveLength(1);
+
+    // Breaking inheritance copies Bob's grant down; revoking the copy is what cuts him off.
+    await sharingService.setInheritance(alice, 'file', uploaded.fileId, false, TEST_META);
+    await sharingService.revokeShare(alice, 'file', uploaded.fileId, 'user', bob.userId, TEST_META);
+
+    await expect(fileService.listVersions(bob, uploaded.fileId)).rejects.toMatchObject({
+      status: 404,
+    });
+    await expect(
+      downloadService.download(bob, uploaded.fileId, { versionId: uploaded.versionId }, TEST_META),
+    ).rejects.toMatchObject({ status: 404 });
+
+    // The folder itself is still his, which is what makes the refusal above meaningful.
+    expect((await folderService.getFolder(bob, parent.id)).folder.id).toBe(parent.id);
+  });
+
+  /**
+   * An expired share grants nothing — including the version history it once covered.
+   *
+   * Written straight onto the ACL because `sharingService.share` refuses a past expiry, which
+   * is correct for the API and useless for reproducing a grant that has simply run out. This is
+   * the state a legitimate time-boxed share reaches on its own the moment the clock passes it.
+   */
+  it('refuses a share that has expired', async () => {
+    if (skipUnlessDb()) return;
+    const { fileService, downloadService, fileRepository, versionService } =
+      await boundaryServices();
+    const alice = await actorFor(fixture.users.scientistA);
+    const bob = await actorFor(fixture.users.scientistB);
+    const { mine } = await twoFiles(alice, 'Boundary expiry');
+
+    const grant = (expiresAt: Date) =>
+      fileRepository.updateById(mine.fileId, {
+        permissions: [
+          {
+            principalType: 'user' as const,
+            principalId: bob.userId,
+            accessLevel: 'editor' as const,
+            deny: false,
+            expiresAt,
+            grantedBy: alice.userId,
+          },
+        ],
+      });
+
+    await grant(new Date(Date.now() + 3_600_000));
+    expect(await fileService.listVersions(bob, mine.fileId)).toHaveLength(1);
+
+    await grant(new Date(Date.now() - 1_000));
+
+    await expect(fileService.listVersions(bob, mine.fileId)).rejects.toMatchObject({ status: 404 });
+    await expect(
+      downloadService.download(bob, mine.fileId, { versionId: mine.versionId }, TEST_META),
+    ).rejects.toMatchObject({ status: 404 });
+    await expect(
+      versionService.updateVersionNote(bob, mine.fileId, mine.versionId, 'still mine', TEST_META),
+    ).rejects.toMatchObject({ status: 404 });
+  });
+});
+
+/**
+ * Facet counts describe the same population the results do.
+ *
+ * `searchFacets` is built from MongoDB aggregates, and Mongoose does not route `aggregate`
+ * through the query middleware that applies the soft-delete filter — so the chips counted
+ * trashed files while the result list beside them did not. A user reading "qpcr (2)" and
+ * seeing one row is being told, accurately, that a second file exists.
+ *
+ * That is a disclosure as well as an inconsistency: the trashed file may have been trashed
+ * *because* it should not have been there. The D1 implementation excluded them from the start;
+ * this pins the corrected Mongo behaviour so the two engines cannot drift apart again.
+ */
+describe('facet counts agree with the results beside them', () => {
+  it('stops counting a file once it is in the trash', async () => {
+    if (skipUnlessDb()) return;
+    const { searchService, fileService } = await services();
+    const alice = await actorFor(fixture.users.scientistA);
+
+    const folderId = await personalFolder(alice, 'Facet trash');
+    const keep = await upload(alice, folderId, 'facet-keep.pdf', pdfOfSize('facet-keep'));
+    const drop = await upload(alice, folderId, 'facet-drop.pdf', pdfOfSize('facet-drop'));
+
+    const TAG = 'facet-consistency-probe';
+    for (const file of [keep, drop]) {
+      await fileService.updateFile(alice, file.fileId, { tags: [TAG] }, TEST_META);
+    }
+
+    const countFor = async (tag: string) =>
+      (await searchService.facets(alice)).tags.find((entry) => entry.value === tag)?.count ?? 0;
+
+    expect(await countFor(TAG)).toBe(2);
+
+    await fileService.trashFile(alice, drop.fileId, TEST_META);
+
+    // The chip and the result list now describe the same one file.
+    expect(await countFor(TAG)).toBe(1);
+    const results = await searchService.search(alice, query({ tags: [TAG] }));
+    expect(results.files).toHaveLength(1);
+    expect(results.totals.files).toBe(1);
+  });
+
+  /**
+   * The category facet is a second aggregate with the same defect, and it is the one a user
+   * sees without searching for anything — so it is worth its own assertion rather than
+   * trusting that one fix covered both.
+   */
+  it('stops counting a trashed file in the category chips too', async () => {
+    if (skipUnlessDb()) return;
+    const { searchService, fileService } = await services();
+    const bob = await actorFor(fixture.users.scientistB);
+
+    const folderId = await personalFolder(bob, 'Facet category');
+    const before = await searchService.facets(bob);
+    const baseline =
+      before.categories.find((entry) => entry.value === 'document')?.count ?? 0;
+
+    const uploaded = await upload(bob, folderId, 'category-probe.pdf', pdfOfSize('category'));
+    const withFile = await searchService.facets(bob);
+    expect(withFile.categories.find((entry) => entry.value === 'document')?.count ?? 0).toBe(
+      baseline + 1,
+    );
+
+    await fileService.trashFile(bob, uploaded.fileId, TEST_META);
+
+    const after = await searchService.facets(bob);
+    expect(after.categories.find((entry) => entry.value === 'document')?.count ?? 0).toBe(baseline);
   });
 });

@@ -1,9 +1,9 @@
 import 'server-only';
 
-import { cookies } from 'next/headers';
+import { cookies, headers } from 'next/headers';
 import { redirect } from 'next/navigation';
 
-import { resolveSession } from '@/server/auth/session.service';
+import { resolveRequestSession, signInPath } from '@/server/auth/access-session';
 import type { Actor } from '@/server/permissions/actor';
 import { SESSION_COOKIE } from './cookies';
 
@@ -16,11 +16,18 @@ import { SESSION_COOKIE } from './cookies';
  */
 export async function requireActor(nextPath?: string): Promise<Actor> {
   const store = await cookies();
-  const resolved = await resolveSession(store.get(SESSION_COOKIE)?.value);
+  const token = store.get(SESSION_COOKIE)?.value;
+  const resolved = await resolveRequestSession(token, await headers());
 
   if (!resolved) {
-    const target = nextPath ? `/login?next=${encodeURIComponent(nextPath)}` : '/login';
-    redirect(target);
+    // A cookie that no longer resolves has to be cleared before sign-in, or the middleware —
+    // which sees only that a cookie exists — sends /login straight back here, in a loop.
+    if (token) {
+      const safeNext = nextPath && nextPath.startsWith('/') && !nextPath.startsWith('//') ? nextPath : null;
+      redirect(`/api/auth/session-expired${safeNext ? `?next=${encodeURIComponent(safeNext)}` : ''}`);
+    }
+    // With Cloudflare Access in front this is the Access sign-in bridge, not the password page.
+    redirect(signInPath(nextPath));
   }
 
   return resolved.actor;
@@ -29,7 +36,7 @@ export async function requireActor(nextPath?: string): Promise<Actor> {
 /** For pages that render differently when signed in but do not require it. */
 export async function getOptionalActor(): Promise<Actor | null> {
   const store = await cookies();
-  const resolved = await resolveSession(store.get(SESSION_COOKIE)?.value);
+  const resolved = await resolveRequestSession(store.get(SESSION_COOKIE)?.value, await headers());
   return resolved?.actor ?? null;
 }
 

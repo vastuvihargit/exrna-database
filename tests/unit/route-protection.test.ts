@@ -23,6 +23,15 @@ const PUBLIC_ROUTES = new Set([
   'auth/reset-password/route.ts',
   'auth/google/route.ts',
   'auth/callback/google/route.ts',
+  // The Cloudflare Access sign-in bridge: how a session is obtained, so it cannot require one.
+  // It verifies the signed Access assertion itself and is 404 when Access is not configured.
+  'auth/access/route.ts',
+  // Clears a session cookie that no longer resolves, then redirects to sign-in. Must work
+  // without a valid session by definition; clears nothing while the session is valid.
+  'auth/session-expired/route.ts',
+  // Queue delivery from the Worker entrypoint. Not a public route in any useful sense: it
+  // demands an in-process token that never leaves the isolate, and is 404 otherwise.
+  'internal/queues/route.ts',
   // Development-only. Unauthenticated because the switcher has to work while signed
   // out, which is the moment it is most useful. They are not protected by a session —
   // they are protected by not existing outside development, which the tests below
@@ -31,6 +40,13 @@ const PUBLIC_ROUTES = new Set([
   'dev/users/route.dev.ts',
   'dev/switch-user/route.dev.ts',
 ]);
+
+/**
+ * Wrappers that authenticate. `withNodeOnlyRoute` (the Node-only admin tools) is
+ * `withAuthenticatedRoute(nodeOnly(…))`; the test below pins that, so adding a name here cannot
+ * quietly admit a wrapper that skips authentication.
+ */
+const AUTHENTICATING_WRAPPERS = ['withAuthenticatedRoute', 'withNodeOnlyRoute'];
 
 /** `route.ts` and `route.dev.ts` — the second is a route only in a development build. */
 const ROUTE_FILENAMES = new Set(['route.ts', 'route.dev.ts']);
@@ -57,7 +73,7 @@ describe('API route protection', () => {
     for (const file of files) {
       const relative = path.relative(API_ROOT, file).split(path.sep).join('/');
       const source = await fsp.readFile(file, 'utf8');
-      const authenticated = source.includes('withAuthenticatedRoute');
+      const authenticated = AUTHENTICATING_WRAPPERS.some((wrapper) => source.includes(wrapper));
 
       if (!authenticated && !PUBLIC_ROUTES.has(relative)) unprotected.push(relative);
     }
@@ -66,6 +82,11 @@ describe('API route protection', () => {
       unprotected,
       `These routes neither authenticate nor appear on the public allow-list: ${unprotected.join(', ')}`,
     ).toEqual([]);
+  });
+
+  it('withNodeOnlyRoute authenticates before anything else', async () => {
+    const source = await fsp.readFile(path.resolve(process.cwd(), 'src/server/http/node-only.ts'), 'utf8');
+    expect(source).toMatch(/return withAuthenticatedRoute<TParams>\(nodeOnly\(feature, handler\)\);/);
   });
 
   it('every public route is a real file', async () => {
@@ -179,5 +200,21 @@ describe('API route protection', () => {
     }
 
     expect(leaks, `Routes referencing internal fields: ${leaks.join(', ')}`).toEqual([]);
+  });
+
+  it('the internal queue route refuses anything without the in-process token', async () => {
+    const source = await fsp.readFile(path.join(API_ROOT, 'internal/queues/route.ts'), 'utf8');
+    // Constant-time comparison against the isolate's token, before the body is even parsed.
+    expect(source).toContain('internalQueueToken()');
+    expect(source).toContain('safeCompare(');
+    expect(source.indexOf('safeCompare(')).toBeLessThan(source.indexOf('request.json()'));
+    expect(source).toContain("throw new NotFoundError('Not found')");
+  });
+
+  it('the Access bridge exists only when Access is configured and trusts only the signed assertion', async () => {
+    const source = await fsp.readFile(path.join(API_ROOT, 'auth/access/route.ts'), 'utf8');
+    expect(source).toContain('if (!config) throw new NotFoundError');
+    expect(source).toContain('readAccessToken(request.headers)');
+    expect(source.toLowerCase()).not.toContain('cf-access-authenticated-user-email');
   });
 });

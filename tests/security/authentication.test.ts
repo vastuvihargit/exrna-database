@@ -169,7 +169,7 @@ describe('session lifecycle', () => {
     );
 
     const stored = await SessionModel.findById(session.sessionId).select('+tokenHash').lean();
-    expect(stored?.tokenHash).toBe(hashToken(session.token));
+    expect(stored?.tokenHash).toBe(await hashToken(session.token));
     expect(JSON.stringify(stored)).not.toContain(session.token);
   }, 60_000);
 

@@ -158,6 +158,13 @@ export interface DriveUpdateInput {
   trashed?: boolean;
 }
 
+/** How much of a resumable session Drive says it holds, or the finished file. */
+export interface DriveResumableStatus {
+  /** Non-null once the whole body has been received and the object created. */
+  file: DriveFileResource | null;
+  receivedBytes: number;
+}
+
 export interface DriveClient {
   getFile(fileId: string): Promise<DriveFileResource>;
   /** The current revision of a file, native or binary. See `DriveRevisionResource`. */
@@ -173,6 +180,31 @@ export interface DriveClient {
     appProperties?: Record<string, string>;
   }): Promise<DriveFileResource>;
   uploadFile(input: DriveUploadInput): Promise<DriveFileResource>;
+
+  /**
+   * The three halves of `uploadFile`, exposed separately.
+   *
+   * `uploadFile` drives a resumable session from start to finish inside one call, which is
+   * right when one process holds the whole body. A **chunked browser upload cannot do that**:
+   * each chunk arrives in its own HTTP request, possibly on a different Worker isolate, so the
+   * session URI has to be persisted between them (`upload_sessions.external_upload_uri`) and
+   * the loop lives in the upload service rather than here.
+   *
+   * They are on the interface rather than private because the alternative was a second
+   * resumable implementation in the staging layer — the offset re-query in `putResumableChunk`
+   * is the part that makes a retry safe rather than merely likely to work, and there must be
+   * exactly one of it.
+   */
+  beginResumableUpload(input: Omit<DriveUploadInput, 'body'>): Promise<string>;
+  /** Null means "accepted, more expected"; a resource means the object is complete. */
+  putResumableChunk(input: {
+    sessionUri: string;
+    chunk: Buffer;
+    offset: number;
+    totalBytes?: number;
+  }): Promise<DriveFileResource | null>;
+  queryResumableUpload(sessionUri: string, totalBytes?: number): Promise<DriveResumableStatus>;
+
   downloadFile(fileId: string, range?: { start: number; end?: number }): Promise<NodeJS.ReadableStream>;
   exportFile(fileId: string, mimeType: string): Promise<NodeJS.ReadableStream>;
   updateFile(fileId: string, changes: DriveUpdateInput): Promise<DriveFileResource>;
@@ -529,7 +561,7 @@ export class GoogleDriveHttpClient implements DriveClient {
    * the buffer is released as soon as Drive acknowledges it.
    */
   async uploadFile(input: DriveUploadInput): Promise<DriveFileResource> {
-    const sessionUri = await this.createUploadSession(input);
+    const sessionUri = await this.beginResumableUpload(input);
     const reader = new ChunkReader(input.body, this.config.uploadChunkBytes);
 
     let offset = 0;
@@ -553,7 +585,12 @@ export class GoogleDriveHttpClient implements DriveClient {
       // state the total.
       const total = input.size !== undefined ? input.size : isFinal ? offset + chunk.length : undefined;
 
-      const outcome = await this.putChunk(sessionUri, chunk, offset, total);
+      const outcome = await this.putResumableChunk({
+        sessionUri,
+        chunk,
+        offset,
+        totalBytes: total,
+      });
       offset += chunk.length;
 
       if (outcome) {
@@ -580,7 +617,7 @@ export class GoogleDriveHttpClient implements DriveClient {
     return result;
   }
 
-  private async createUploadSession(input: DriveUploadInput): Promise<string> {
+  async beginResumableUpload(input: Omit<DriveUploadInput, 'body'>): Promise<string> {
     const headers: Record<string, string> = { 'X-Upload-Content-Type': input.mimeType };
     if (input.size !== undefined) headers['X-Upload-Content-Length'] = String(input.size);
 
@@ -616,12 +653,14 @@ export class GoogleDriveHttpClient implements DriveClient {
    * failure *after* Drive committed the chunk but before the response reached us would
    * otherwise re-send bytes at the wrong offset and corrupt the object.
    */
-  private async putChunk(
-    sessionUri: string,
-    chunk: Buffer,
-    offset: number,
-    total: number | undefined,
-  ): Promise<DriveFileResource | null> {
+  async putResumableChunk(input: {
+    sessionUri: string;
+    chunk: Buffer;
+    offset: number;
+    totalBytes?: number;
+  }): Promise<DriveFileResource | null> {
+    const { sessionUri, chunk, offset } = input;
+    const total = input.totalBytes;
     const attempts = this.retryOptions.attempts ?? 5;
     const sleep = this.retryOptions.sleep ?? ((ms: number) => new Promise<void>((r) => setTimeout(r, ms)));
     let lastError: unknown;
@@ -633,7 +672,7 @@ export class GoogleDriveHttpClient implements DriveClient {
         // one where nothing arrived — and blindly replaying would write these bytes at an
         // offset Drive has already filled. This is the check that makes a retry safe rather
         // than merely likely to work.
-        const status = await this.queryUploadStatus(sessionUri, total);
+        const status = await this.queryResumableUpload(sessionUri, total);
         if (status.file) return status.file;
         if (status.receivedBytes >= offset + chunk.length) return null;
         if (status.receivedBytes !== offset) {
@@ -686,10 +725,10 @@ export class GoogleDriveHttpClient implements DriveClient {
    * to the final chunk was lost in transit. Returning the resource rather than re-sending
    * is what stops a network blip at 99% from producing a duplicate file.
    */
-  private async queryUploadStatus(
+  async queryResumableUpload(
     sessionUri: string,
-    total: number | undefined,
-  ): Promise<{ file: DriveFileResource | null; receivedBytes: number }> {
+    total?: number,
+  ): Promise<DriveResumableStatus> {
     const response = await this.send({
       method: 'PUT',
       url: sessionUri,
@@ -717,7 +756,7 @@ export class GoogleDriveHttpClient implements DriveClient {
    * 308 response here means Drive disagrees about how much it received.
    */
   private async finalizeUpload(sessionUri: string, totalBytes: number): Promise<DriveFileResource> {
-    const status = await withDriveRetry(() => this.queryUploadStatus(sessionUri, totalBytes), {
+    const status = await withDriveRetry(() => this.queryResumableUpload(sessionUri, totalBytes), {
       ...this.retryOptions,
       onRetry: (error) => {
         if (error.status === 401) this.tokens.invalidate();

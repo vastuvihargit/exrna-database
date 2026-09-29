@@ -21,6 +21,15 @@ trusted, including things the browser was told a moment ago.
 | Login rate limiting, per IP and per email | `server/auth/rate-limit.ts` |
 | Login history and device records | `LoginHistory` |
 
+**On the Cloudflare deployment, identity belongs to Cloudflare Access** (Google Workspace as the
+identity provider), verified server-side on every request
+(`docs/cloudflare-migration/22-cloudflare-access.md`). Password sign-in and the application's
+own password reset are refused there — `403` with a message pointing to the identity provider's
+account recovery, and the `/forgot-password` and `/reset-password` pages say the same — because
+the application does not own the password (`isPasswordRecoveryAvailable`,
+`server/auth/access-session.ts`). The reset-token store is MongoDB-only on purpose: there is no
+D1 counterpart to build, since a production Worker always runs behind Access.
+
 Owning a company email address does not grant access. `ALLOW_AUTO_PROVISIONING=false`
 means an administrator creates the account first; the domain check decides who *may* sign
 in, and role records decide what they may then do.
@@ -128,10 +137,34 @@ about accounts and endpoints:
 
 Counters are per-actor, so one person's bulk import cannot lock their department out.
 
-**Known limitation:** the store is in-process, which is correct for the single-node
-deployment this is designed for (assumption A9) and wrong the moment a second app
-container is added. The interface is async and string-keyed specifically so a Redis
-implementation can replace it without touching a call site.
+**Where the counters live depends on the runtime** (`server/auth/rate-limit.ts`):
+
+| Runtime | Store | Why |
+| --- | --- | --- |
+| Node (legacy deployment, tests, `next dev`) | in-process `Map` | one application process, so the process's count is the whole count (assumption A9) |
+| Cloudflare Worker | the `RATE_LIMITER` Durable Object, one object per key | a Worker is many isolates; a `Map` there would count one isolate's share, and "5 sign-ins per 15 min" would silently become "5 per isolate". One Durable Object per key sees every request, exactly |
+
+Both stores run the same fixed-window arithmetic (`rate-limit-window.ts`). The Workers Rate
+Limiting binding was not used: it only supports 10- or 60-second periods and counts
+approximately per location, and every rule above runs over 5–60 minutes.
+
+The Worker refuses to start without the `RATE_LIMITER` binding (`assertBindings`). If a call to
+the object fails at runtime, the attempt is still counted in the isolate's own `Map` and an
+error is logged: a weaker limit for the length of a platform outage, never none, and never a
+lock-out of every user. Tests: `tests/unit/rate-limit.test.ts` (including a cross-isolate
+simulation) and `tests/unit/rate-limiter-durable-object.test.ts`.
+
+A second Node app container would still need a shared store; the Node deployment remains
+single-node until it is retired.
+
+**Which address "per IP" means** (`buildRequestContext` in `server/http/route-handler.ts`):
+`CF-Connecting-IP`, then `X-Real-IP`, then the first `X-Forwarded-For` entry. Cloudflare sets
+`CF-Connecting-IP` and nginx sets `X-Real-IP` to `$remote_addr`, both overwriting whatever the
+client sent; both *append* to `X-Forwarded-For` (`$proxy_add_x_forwarded_for`), so its first
+entry is whatever the client wrote and a limit keyed on it could be reset with a header per
+attempt. It was keyed on exactly that until 2026-09-29. `X-Forwarded-For` is now only the last
+resort for a server with no proxy in front (`next dev`, the E2E suite). Test:
+`tests/unit/client-ip.test.ts`.
 
 ---
 

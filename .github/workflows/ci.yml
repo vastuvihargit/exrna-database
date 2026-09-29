@@ -4,7 +4,7 @@ name: CI
 # branch cannot be green as a push and red as a PR.
 on:
   push:
-    branches: [main, develop]
+    branches: [main, develop, cloudflare-migration]
   pull_request:
   workflow_dispatch:
 
@@ -65,11 +65,38 @@ jobs:
       - name: Lint
         run: npm run lint
 
-      - name: Test
-        run: npm test
+      # Migration metadata gate. The Drizzle journal and snapshot must describe every SQL
+      # migration, or the next `db:generate` re-emits schema that already exists (it did, for
+      # 0004 and 0005, before the journal was repaired). Generating against a clean checkout
+      # must therefore produce nothing.
+      - name: Drizzle schema drift check
+        run: |
+          npx drizzle-kit generate --name ci-drift-check
+          if [ -n "$(git status --porcelain drizzle/)" ]; then
+            git status --porcelain drizzle/
+            echo "::error::drizzle-kit generated a migration: the schema and drizzle/migrations/meta disagree."
+            exit 1
+          fi
 
+      # The D1 schema-contract suite asserts against a real local D1, so the database has to
+      # exist before the tests run. It deliberately fails rather than skips when it cannot
+      # reach one — a green run that silently checked nothing is worse than a red one.
+      - name: Create the local D1 database and apply migrations
+        run: npm run db:migrate:local
+
+      # Two steps rather than `npm test`, so a failure names which suite broke. They run in
+      # separate processes for the contention reason documented in vitest.config.ts.
+      - name: Test (MongoDB suites)
+        run: npm run test:mongo
+
+      - name: Test (D1 schema contract)
+        run: npm run test:d1
+
+  # The legacy Node + MongoDB deployment (Docker). It remains production until the Cloudflare
+  # cutover and is the rollback target afterwards, so it keeps building. The Cloudflare path is
+  # the `worker-build` job below. No CI job deploys anything.
   build:
-    name: Production build
+    name: Production build (legacy Node + Docker)
     runs-on: ubuntu-latest
     timeout-minutes: 20
     needs: quality
@@ -107,6 +134,77 @@ jobs:
           docker build --target runner -t biotech-drive:ci .
           docker build --target maintenance -t biotech-drive-scheduler:ci .
 
+  worker-build:
+    name: Cloudflare Worker build
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    needs: quality
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      # The OpenNext build plus wrangler's bundle of `cloudflare-worker.ts`. This is the gate
+      # that proves nothing Node-only (Mongoose, fs, a native addon) reached the Worker's
+      # module graph. It needs no Cloudflare account and no secret.
+      - name: Build the Worker
+        env:
+          NODE_ENV: production
+          APP_URL: https://build.invalid
+          MONGODB_URI: mongodb://placeholder:27017/build
+          AUTH_SECRET: build-time-placeholder-value-not-a-secret-32
+          SESSION_SECRET: build-time-placeholder-value-not-a-secret-33
+          COMPANY_EMAIL_DOMAINS: example.com
+        run: npm run cf:build
+
+      - name: Bundle the Worker entrypoint (dry run, nothing uploaded)
+        run: npx wrangler deploy --dry-run --env staging --outdir .wrangler/ci-dry-run
+
+  e2e:
+    name: Browser end-to-end (D1 backend)
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    needs: quality
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      # The suite seeds a real MongoDB, loads it into a local D1 with the real migration tool
+      # (`migrate:d1` + `migrate:verify`, so every run is also a migration dry run on seeded
+      # data) and drives the UI in Chrome. Transactions need a replica set; ubuntu-latest
+      # ships Google Chrome, which the Playwright config asks for by channel.
+      - name: Start MongoDB (replica set rs0)
+        uses: supercharge/mongodb-github-action@1.12.0
+        with:
+          mongodb-version: '7.0'
+          mongodb-replica-set: rs0
+
+      - name: End-to-end suite
+        run: npm run test:e2e
+
+      - name: Upload failure artefacts
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: e2e-test-results
+          path: test-results/
+          retention-days: 7
+
   audit:
     name: Dependency audit
     runs-on: ubuntu-latest
@@ -134,8 +232,8 @@ jobs:
         # may exist in the tree; anything else is a leaked credential.
         continue-on-error: false
         run: |
-          if git ls-files | grep -E '^\.env' | grep -v '^\.env\.example$'; then
-            echo "::error::An environment file other than .env.example is committed."
+          if git ls-files | grep -E '^\.env|^\.dev\.vars' | grep -vE '^\.env\.example$|^\.dev\.vars\.example$'; then
+            echo "::error::An environment file other than .env.example / .dev.vars.example is committed."
             exit 1
           fi
           echo "No environment files committed."

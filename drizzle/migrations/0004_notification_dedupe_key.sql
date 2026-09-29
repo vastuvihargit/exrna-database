@@ -1,0 +1,48 @@
+-- ---------------------------------------------------------------------------------------
+-- Phase 6 — make notification delivery idempotent under Queue retries.
+--
+-- ── Why a column rather than application-side checking ──────────────────────────────────
+--
+-- Cloudflare Queues deliver at least once. A consumer that is interrupted after writing a
+-- notification but before acknowledging the message will see that message again, and the
+-- naive result is two identical rows in somebody's bell menu — twice for every transient
+-- error, with no upper bound on how often that happens.
+--
+-- The application cannot fix this by reading first. `SELECT … WHERE dedupe_key = ?` followed
+-- by `INSERT` is the same read-then-write race the rest of this migration has been careful to
+-- avoid: two concurrent redeliveries both see nothing and both insert. Only the database can
+-- decide, so the rule is a unique index and the write is `INSERT … ON CONFLICT DO NOTHING`.
+--
+-- ── Why this index is NOT partial, when the MongoDB one is ──────────────────────────────
+--
+-- Most notifications are written inline from a request, which is already exactly-once, and
+-- those rows carry NULL. The two engines need different index shapes to allow that, and the
+-- difference is not stylistic:
+--
+--   • **SQLite treats every NULL as distinct** in a unique index, so a plain
+--     `UNIQUE(dedupe_key)` already permits unlimited NULL rows. It is exactly the constraint
+--     wanted.
+--
+--   • **MongoDB treats NULLs as equal**, so the same shape there would reject the second
+--     notification anybody ever received. `notification.model.ts` therefore uses
+--     `partialFilterExpression: { dedupeKey: { $type: 'string' } }`. Note that `sparse: true`
+--     is *not* sufficient: sparse excludes documents where the field is absent, and every row
+--     here stores an explicit null from the schema default.
+--
+-- A partial index was the first attempt on this side too, and it does not work with the
+-- upsert. SQLite matches `ON CONFLICT (col)` to an index by comparing the columns *and* the
+-- WHERE clause, so a partial index requires `ON CONFLICT (dedupe_key) WHERE dedupe_key IS NOT
+-- NULL` — and drizzle's SQLite builder emits its `where` after `DO NOTHING`, which is the
+-- DO UPDATE position and a syntax error here. Rather than hand-write the statement to keep an
+-- index whose only benefit is size, the index is plain and the upsert is the ordinary one.
+--
+-- ── Backfill ────────────────────────────────────────────────────────────────────────────
+--
+-- None. Existing rows keep NULL, which means "written by a path that cannot retry". Inventing
+-- keys for historic rows would risk colliding with a key a future consumer computes, and the
+-- consequence of that collision is a notification silently never delivered.
+-- ---------------------------------------------------------------------------------------
+
+ALTER TABLE notifications ADD COLUMN dedupe_key TEXT;
+--> statement-breakpoint
+CREATE UNIQUE INDEX ux_notifications_dedupe_key ON notifications (dedupe_key);

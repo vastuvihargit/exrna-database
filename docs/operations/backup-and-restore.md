@@ -1,5 +1,9 @@
 # Backup and restore
 
+> **Scope.** This document covers the **legacy Node + MongoDB deployment**, which is production
+> until the Cloudflare cutover and the rollback target afterwards. The Cloudflare deployment's
+> backup model is in [§ After the Cloudflare cutover](#after-the-cloudflare-cutover) at the end.
+
 The system keeps research files on one server's disk. That is a deliberate architectural
 choice (see `docs/phase-0/04-storage.md`) and it has one consequence that shapes
 everything in this document: **a single disk failure would otherwise destroy the
@@ -187,3 +191,26 @@ remote operator never holds readable research data.
 
 Measure both during a drill and write down what you actually got. An RTO nobody has
 timed is an aspiration.
+
+---
+
+## After the Cloudflare cutover
+
+Once `CUTOVER-RUNBOOK.md` has run, the data lives in two managed services and this document's
+Docker backup jobs protect only the (frozen) rollback copy.
+
+| Data | Where | Protection | Restore |
+|---|---|---|---|
+| Metadata, ACLs, audit trail | Cloudflare D1 `biotech-drive-production` | D1 Time Travel (point-in-time, within the plan's retention window) plus scheduled exports | `npx wrangler d1 time-travel info biotech-drive-production --env production`, then `… time-travel restore --timestamp <ISO>`; or import an export into a fresh database |
+| File bytes | Google Shared Drive | Drive trash and Workspace retention / Vault as configured by the Workspace administrator | Drive UI or the Workspace admin console. Every `file_versions` row names its Drive file id, so a restored object is found again by id |
+| MongoDB at the freeze | the legacy volume | the final `mongodump` from cutover step 1 and the last backup set; kept 90 days after the rollback window closes | as above |
+
+A D1 export for off-platform retention:
+
+```bash
+npx wrangler d1 export biotech-drive-production --env production --remote --output d1-$(date -u +%Y%m%dT%H%M%SZ).sql
+```
+
+Scheduling that export and choosing where it is kept is an operational decision still to be made
+(`docs/cloudflare-migration/EXTERNAL-SETUP.md`). Verify Time Travel availability on the account
+before cutover.

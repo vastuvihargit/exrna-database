@@ -1,0 +1,138 @@
+# Local secrets for `wrangler dev` / `npm run cf:preview`.
+#
+# Copy to `.dev.vars` and fill in. `.dev.vars` is git-ignored and must stay that way —
+# it holds the same secrets as the production secret store.
+#
+# Remote environments do NOT read this file. Set each value with:
+#   npx wrangler secret put <NAME> --env development|staging|production
+#
+# Plain, non-secret values (NODE_ENV, APP_NAME, LOG_LEVEL, and the three storage settings
+# GOOGLE_DRIVE_STORAGE_ENABLED / DEFAULT_STORAGE_PROVIDER / UPLOAD_STAGING) live in
+# wrangler.jsonc under "vars" and are not repeated here. All three are pinned to
+# google_drive there: a Worker has no filesystem, and env.worker.ts refuses any other value
+# at boot rather than letting every upload fail individually.
+
+# ── Application secrets ───────────────────────────────────────────────────────────────
+# Both at least 32 characters, and different from each other in production.
+# Generate with:  node -e "console.log(crypto.randomBytes(32).toString('base64url'))"
+AUTH_SECRET=replace-me-with-at-least-32-characters
+SESSION_SECRET=replace-me-with-a-different-32-plus-characters
+
+# `npm run cf:preview` runs with NODE_ENV=production, and the environment schema requires https
+# there — so this http value makes *every* route return 500 with "APP_URL must use https://
+# in production", `/api/health` included. Switch to https://localhost:8788 before previewing.
+APP_URL=http://localhost:8787
+
+# ── Company access ────────────────────────────────────────────────────────────────────
+# Comma-separated. Only these email domains may hold an account.
+COMPANY_EMAIL_DOMAINS=company.com
+
+# ── Google Shared Drive ───────────────────────────────────────────────────────────────
+# The Worker has no filesystem, so Drive is not optional here: without these the
+# application cannot read a single file. See docs/cloudflare-migration/00-phase-0-analysis.md
+# §0 Finding 1 for why the Drive storage cutover (Phase 1a) has to happen first.
+GOOGLE_SHARED_DRIVE_ID=
+GOOGLE_DRIVE_ROOT_FOLDER_ID=
+GOOGLE_WORKSPACE_DOMAIN=company.com
+
+GOOGLE_SERVICE_ACCOUNT_EMAIL=biotech-drive@your-project.iam.gserviceaccount.com
+
+# The full PEM, newlines escaped as \n, on one line. Take the "private_key" value straight
+# from the service account JSON, including the BEGIN/END lines.
+#
+# There is no file-based alternative in a Worker: `GOOGLE_DRIVE_SERVICE_ACCOUNT_PRIVATE_KEY_FILE`
+# reads from disk and the Worker has none. This is a secret, never a var.
+GOOGLE_SERVICE_ACCOUNT_PRIVATE_KEY="-----BEGIN PRIVATE KEY-----\n...\n-----END PRIVATE KEY-----\n"
+
+# ── Google sign-in (Node deployment only; removed at Phase 8) ─────────────────────────
+GOOGLE_CLIENT_ID=
+GOOGLE_CLIENT_SECRET=
+
+# ── Which database backs which module ─────────────────────────────────────────────
+# Not secrets. Unset (or anything but the exact string "d1") means MongoDB. Only "d1" moves a
+# module; the flag is read per call, so reverting is deleting the variable.
+#
+# Every module below has a D1 implementation. A Worker cannot reach MongoDB at all, so a
+# Worker needs ALL of them set to d1 — loadWorkerEnv() refuses to boot a production Worker
+# otherwise, and warns elsewhere. The full matrix, with the safe and unsafe combinations, is
+# docs/cloudflare-migration/DATA-SOURCE-FLAGS.md.
+#
+# DATA_SOURCE_ORGANIZATIONS=d1
+# DATA_SOURCE_USERS=d1
+# DATA_SOURCE_DEPARTMENTS=d1
+# DATA_SOURCE_ROLES=d1
+# DATA_SOURCE_PROJECTS=d1
+# DATA_SOURCE_EXPERIMENTS=d1
+# DATA_SOURCE_FOLDERS=d1
+# DATA_SOURCE_FILES=d1
+# DATA_SOURCE_FILE_VERSIONS=d1
+# DATA_SOURCE_SEARCH=d1
+# DATA_SOURCE_REVIEWS=d1
+# DATA_SOURCE_AUDIT_LOGS=d1
+# DATA_SOURCE_INVENTORY=d1
+# DATA_SOURCE_NOTIFICATIONS=d1
+# DATA_SOURCE_SESSIONS=d1
+# DATA_SOURCE_LOGIN_HISTORY=d1
+# DATA_SOURCE_STORAGE_USAGE=d1
+# DATA_SOURCE_ACTIVITIES=d1
+# DATA_SOURCE_COMMENTS=d1
+# DATA_SOURCE_DRIVE_SYNC=d1
+# DATA_SOURCE_UPLOAD_SESSIONS=d1
+# DATA_SOURCE_APP_SETTINGS=d1
+#
+# ── The matrix is enforced, not advisory ──────────────────────────────────────────────
+#
+# assertDataSourceMatrix() runs inside loadEnv() and loadWorkerEnv() and REFUSES TO BOOT on a
+# combination that would put a foreign key across two databases — for example
+# DATA_SOURCE_SESSIONS=d1 with DATA_SOURCE_USERS unset. Every such pair is listed in
+# DATA_SOURCE_DEPENDENCIES in src/server/repositories/data-source.ts. The error names the exact
+# pair. This is at startup rather than on somebody's upload, because a split degrades only for
+# writes and only in one module, which is a support ticket rather than an outage.
+#
+# ── Flags that are not independently movable ──────────────────────────────────────────
+#
+# DATA_SOURCE_SESSIONS      — flipping it logs everybody out, because the new engine holds none
+#                             of the existing sessions. A cutover step, inside the write freeze.
+# DATA_SOURCE_NOTIFICATIONS — notifications written before the flip live in the other database
+#                             and stop appearing until the migration copies them.
+#
+# ── A Worker needs all of them ────────────────────────────────────────────────────────
+#
+# A Worker cannot open the TCP socket Mongoose needs, so a module left on MongoDB there is not a
+# slower path: it throws the first time anything touches it. loadWorkerEnv() therefore *errors*
+# in production on any module still unset, and warns otherwise so `cf:preview` can boot with a
+# partial set.
+
+# ── Cloudflare Access (Phase 8) ───────────────────────────────────────────────────────
+# CF_ACCESS_AUD is the Application Audience tag from the Access application;
+# CF_ACCESS_TEAM_DOMAIN is e.g. yourteam.cloudflareaccess.com.
+#
+# REQUIRED IN PRODUCTION. Not a convenience: passwordHash is Argon2id from @node-rs/argon2, a
+# native addon workerd cannot load, so those hashes are unverifiable in a Worker by any means.
+# next.config.ts swaps in a shim that refuses rather than falling back to a different algorithm
+# — falling back would reject every correct password. Access is therefore the only identity
+# source a Worker has, and loadWorkerEnv() refuses to boot a production Worker without it.
+#
+# Both values are required together. A team domain with no audience is the DANGEROUS
+# half-configuration: signatures would verify and any Access application's token on the same
+# team would be accepted, including one an attacker enrolled themselves in. accessConfigFrom()
+# returns null rather than a partial config for exactly this reason.
+#
+# The Worker verifies the Access JWT's signature, issuer, audience, exp and nbf. It never trusts
+# the Cf-Access-Authenticated-User-Email header — that is plaintext and forgeable by anything
+# that can reach the Worker directly, and a Worker URL is public.
+#
+# Configuring these turns Access ON as the sign-in method, in any environment: every request
+# must carry a valid assertion for the same person as its session, and password sign-in is
+# switched off. Leave both EMPTY for local preview without Access — sign-in then behaves as in
+# development (but note a production-mode preview refuses to boot without them).
+# Setup steps: docs/cloudflare-migration/22-cloudflare-access.md.
+CF_ACCESS_TEAM_DOMAIN=
+CF_ACCESS_AUD=
+
+# ── Malware scanning ──────────────────────────────────────────────────────────────────
+# MALWARE_SCAN_MODE is a var in wrangler.jsonc ("disabled" for development only; staging and
+# production deliberately unset, so they refuse to boot until a scanner is chosen). When it is
+# "http", the endpoint is a var and the shared secret is this secret (16+ characters).
+# Contract and trade-offs: docs/cloudflare-migration/24-malware-scanning.md.
+MALWARE_SCAN_SECRET=

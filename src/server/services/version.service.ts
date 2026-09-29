@@ -12,6 +12,7 @@
  * because the file's current content would then have no version of its own.
  */
 import { withTransaction } from '@/server/db/connection';
+import { createVersionWithFile, versionMutationEngine } from '@/server/db/d1-unit-of-work';
 import { ConflictError, NotFoundError } from '@/server/errors/app-error';
 import type { Actor } from '@/server/permissions/actor';
 import { auditService } from '@/server/audit/audit.service';
@@ -25,6 +26,7 @@ import { getObjectStore } from '@/server/storage';
 import { buildOriginalKey, newStorageId } from '@/server/storage/keys';
 import type { RequestMeta } from '@/server/http/request-meta';
 import { requireFile } from './file-access';
+import { detach } from '@/server/runtime/detach';
 
 export interface RestoreVersionInput {
   versionId: string;
@@ -85,30 +87,84 @@ export async function restoreVersion(
     contentType: source.mimeType,
   });
 
+  /** Everything the new version records, shared by both engines. */
+  const versionFields = {
+    organizationId: context.file.organizationId,
+    fileId,
+    storageKey: destination.key,
+    storageArea: destination.area,
+    relativeStoragePath: `${destination.area}/${destination.key}`,
+    storedFilename: physicalName,
+    originalFilename: source.originalFilename,
+    fileSize: source.fileSize,
+    mimeType: source.mimeType,
+    extension: source.extension,
+    // The restored copy is byte-identical to what was read, so it carries the same checksum.
+    // Recomputing it would be the same number at the cost of reading the object again; taking
+    // the source's is also what makes a corrupted copy detectable by the integrity sweep.
+    checksumSha256: source.checksumSha256,
+    uploadedBy: actor.userId,
+    versionNote: input.note?.trim() || `Restored from version ${source.versionNumber}`,
+    restoredFromVersionId: source.id,
+  };
+
+  /** How the file changes to point at it. Identical on both engines. */
+  const fileFields = {
+    sizeBytes: source.fileSize,
+    mimeType: source.mimeType,
+    checksumSha256: source.checksumSha256,
+    originalFilename: source.originalFilename,
+    updatedBy: actor.userId,
+    // Same rule as a fresh upload: the file's content changed, so the review cycle restarts.
+    // The previously approved *version* keeps its own flags — this clears the file's pointer,
+    // not the signature, so "which version did they sign?" stays answerable.
+    reviewStatus: 'draft' as const,
+    approvalStatus: 'none' as const,
+    approvedVersionId: null,
+    versionCountDelta: 1,
+  };
+
   try {
     const created = await withTransaction(async (dbSession) => {
+      /**
+       * On D1 the version row and the file that points at it commit together.
+       *
+       * `withTransaction` is a MongoDB session and governs no D1 statement, so the composed
+       * batch in the unit-of-work is what makes this atomic. The version number is assigned
+       * there too, against the unique index, rather than read here and hoped for.
+       *
+       * What is still outside that batch: cancelling open reviews and the storage-usage
+       * delta, because those modules are on MongoDB. Both are corrections rather than the
+       * record of what happened — a stale open review is closed by the next reviewer action,
+       * and usage is recomputed by the nightly sweep — whereas a version that exists without
+       * its file pointing at it is not self-correcting. They move inside when their modules do.
+       */
+      if (versionMutationEngine() === 'd1') {
+        const { versionId } = await createVersionWithFile({
+          version: versionFields,
+          file: fileFields,
+        });
+
+        await reviewRepository.cancelOpenForFile(fileId, undefined, dbSession);
+        await usageRepository.applyDelta(
+          {
+            userId: actor.userId,
+            departmentId: context.file.departmentId,
+            projectId: context.file.projectId,
+            bytes: source.fileSize,
+          },
+          dbSession,
+        );
+
+        const stored = await versionRepository.findById(versionId);
+        if (!stored) throw new NotFoundError();
+        return stored;
+      }
+
       const versionNumber = await versionRepository.nextVersionNumber(fileId);
 
       const version = await versionRepository.create(
-        {
-          organizationId: context.file.organizationId,
-          fileId,
-          versionNumber,
-          storageKey: destination.key,
-          storageArea: destination.area,
-          relativeStoragePath: `${destination.area}/${destination.key}`,
-          storedFilename: physicalName,
-          originalFilename: source.originalFilename,
-          fileSize: source.fileSize,
-          mimeType: source.mimeType,
-          extension: source.extension,
-          checksumSha256: source.checksumSha256,
-          uploadedBy: actor.userId,
-          versionNote:
-            input.note?.trim() ||
-            `Restored from version ${source.versionNumber}`,
-          restoredFromVersionId: source.id,
-        },
+        { ...versionFields, versionNumber },
         dbSession,
       );
 
@@ -120,22 +176,7 @@ export async function restoreVersion(
 
       await fileRepository.updateById(
         fileId,
-        {
-          $set: {
-            currentVersionId: version.id,
-            sizeBytes: source.fileSize,
-            mimeType: source.mimeType,
-            checksumSha256: source.checksumSha256,
-            originalFilename: source.originalFilename,
-            updatedBy: actor.userId,
-            // Same rule as a fresh upload: the file's content changed, so the review
-            // cycle restarts. The previously approved version keeps its own flags.
-            reviewStatus: 'draft',
-            approvalStatus: 'none',
-            approvedVersionId: null,
-          },
-          $inc: { versionCount: 1 },
-        },
+        { ...fileFields, currentVersionId: version.id },
         dbSession,
       );
 
@@ -166,21 +207,23 @@ export async function restoreVersion(
       severity: 'notice',
     });
 
-    void activityRepository
-      .append({
-        organizationId: actor.organizationId,
-        actorUserId: actor.userId,
-        actorName: actor.name,
-        action: 'file.version_restore',
-        entityType: 'file',
-        entityId: fileId,
-        entityLabel: context.file.displayName,
-        detail: `restored version ${source.versionNumber} as version ${created.versionNumber}`,
-        contextFolderIds: context.file.folderPathAncestors,
-        departmentId: context.file.departmentId,
-        projectId: context.file.projectId,
-      })
-      .catch(() => undefined);
+    detach(
+      activityRepository
+        .append({
+          organizationId: actor.organizationId,
+          actorUserId: actor.userId,
+          actorName: actor.name,
+          action: 'file.version_restore',
+          entityType: 'file',
+          entityId: fileId,
+          entityLabel: context.file.displayName,
+          detail: `restored version ${source.versionNumber} as version ${created.versionNumber}`,
+          contextFolderIds: context.file.folderPathAncestors,
+          departmentId: context.file.departmentId,
+          projectId: context.file.projectId,
+        }),
+      'activity.append',
+    );
 
     return created;
   } catch (error) {
@@ -215,7 +258,7 @@ export async function updateVersionNote(
   const version = await versionRepository.findById(versionId);
   if (!version || version.fileId !== fileId) throw new NotFoundError();
 
-  await versionRepository.updateFlags(versionId, { $set: { versionNote: note.trim() } });
+  await versionRepository.updateFlags(versionId, { versionNote: note.trim() });
 
   const updated = await versionRepository.findById(versionId);
   if (!updated) throw new NotFoundError();

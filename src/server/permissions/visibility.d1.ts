@@ -1,0 +1,541 @@
+/**
+ * Visibility predicates for D1, built from the same `Actor` as the MongoDB filters.
+ *
+ * Companion to `visibility.ts`, not a translation of it. The two are kept in step by
+ * `06-phase-3-module-4-acl-design.md` and by tests that run the same scenarios against both
+ * engines; where they differ, the test fails.
+ *
+ * ── Rules this file exists to enforce ───────────────────────────────────────────────────
+ *
+ *   • a live explicit denial naming the actor removes the row, ahead of everything else —
+ *     ownership, direct grant, inheritance, department, project, role, super admin;
+ *   • an expired entry grants nothing and denies nothing (`aclGrants()` skips it entirely);
+ *   • the predicate is applied **inside** the query, to rows *and* to counts, so `total` and
+ *     pagination cannot disclose a row the actor may not see;
+ *   • the predicate can never degenerate into "match all".
+ *
+ * ── Parameterisation ────────────────────────────────────────────────────────────────────
+ *
+ * Every id reaches SQL as a bound parameter. `sql` template interpolation of a value produces
+ * a placeholder in Drizzle — the only place `sql.raw` appears in this module is for the
+ * literal table name of the ACL sub-select, which is a constant in this file and never
+ * caller-supplied.
+ */
+import { and, eq, isNotNull, isNull, or, sql, type SQL } from 'drizzle-orm';
+import { inList } from '@/server/db/d1-bindings';
+import type { SQLiteColumn } from 'drizzle-orm/sqlite-core';
+import { resourcePermissions } from '@/server/db/schema/access';
+import { folders, files } from '@/server/db/schema/drive';
+import { AppError } from '@/server/errors/app-error';
+import { actorClearance, actorHasCompanyWideRead, type Actor } from './actor';
+import { CLEARANCE_BY_MAX_LEVEL, type ConfidentialityLevel } from '@/server/domain/permissions';
+import { getLogger } from '@/server/logging/logger';
+
+/* ------------------------------------------------------------------ principals */
+
+/**
+ * How many principals one actor may carry into a visibility query.
+ *
+ * A principal is the actor, their department, each project they belong to, and **each role
+ * they hold** — so the list grows with role grants and has no natural ceiling.
+ *
+ * ── This is no longer a binding limit, and the correction matters ───────────────────────
+ *
+ * The comment this replaces said "SQLite's default `SQLITE_MAX_VARIABLE_NUMBER` is 999 and D1
+ * rejects statements with too many bindings", and chose 200 to stay inside that. **D1's actual
+ * ceiling is 100**, measured and pinned by `tests/d1/bound-parameter-limit.test.ts` — so 200
+ * was never inside the budget. An actor with ninety-odd principals broke *every* listing at
+ * once, because this list is bound inside the visibility predicate of every permission-aware
+ * read rather than in one query.
+ *
+ * The principal list now goes through `inList`, which binds it as a single JSON parameter, so
+ * its length no longer interacts with the parameter budget at all. 200 remains as what it
+ * should always have been: a sanity ceiling on absurd data — the seeded role set is single
+ * digits, and an employee on 200 projects is a data problem rather than a person.
+ */
+export const MAX_ACTOR_PRINCIPALS = 200;
+
+/**
+ * Raised when an actor carries more principals than the query can safely bind.
+ *
+ * **Fails closed.** The alternative — truncating the list — would silently drop roles or
+ * project memberships and produce a *narrower* result set that looks like a working page,
+ * so a user would quietly stop seeing files they are entitled to and nobody would know why.
+ * A visible error is recoverable; a silent permission change is not.
+ */
+export class TooManyPrincipalsError extends AppError {
+  constructor(count: number) {
+    super(
+      'INTERNAL_ERROR',
+      // Deliberately says nothing about roles or projects to the browser: this is a server
+      // condition, and the operator detail goes to the log line above, not to the user.
+      'This account could not be checked for access. Please contact an administrator.',
+      500,
+      { details: { principalCount: count, limit: MAX_ACTOR_PRINCIPALS } },
+    );
+  }
+}
+
+/**
+ * The ids an ACL entry may name to reach this actor: themselves, their department, their
+ * projects, and every role they hold.
+ *
+ * Role ids are included deliberately — a share targeted at a role is invisible without them,
+ * and omitting them would silently revoke every role-targeted share in the system.
+ */
+export function actorPrincipalIds(actor: Actor): string[] {
+  const ids = [
+    actor.userId,
+    actor.departmentId,
+    ...actor.projectIds,
+    ...actor.grants.map((grant) => grant.roleId),
+  ].filter((id): id is string => typeof id === 'string' && id.length > 0);
+
+  const unique = [...new Set(ids)];
+
+  if (unique.length > MAX_ACTOR_PRINCIPALS) {
+    getLogger().error(
+      { userId: actor.userId, principalCount: unique.length, limit: MAX_ACTOR_PRINCIPALS },
+      'Actor principal set exceeds the safe query limit; refusing rather than truncating',
+    );
+    throw new TooManyPrincipalsError(unique.length);
+  }
+
+  return unique;
+}
+
+/* ------------------------------------------------------------------ shared shapes */
+
+export type ResourceKind = 'folder' | 'file';
+
+/** The columns both `folders` and `files` carry, so one predicate builder serves both. */
+interface ResourceColumns {
+  id: SQLiteColumn;
+  organizationId: SQLiteColumn;
+  ownerId: SQLiteColumn;
+  departmentId: SQLiteColumn;
+  projectId: SQLiteColumn;
+  confidentiality: SQLiteColumn;
+  inheritPermissions: SQLiteColumn;
+  deletedAt: SQLiteColumn;
+  status: SQLiteColumn;
+}
+
+export function columnsFor(kind: ResourceKind): ResourceColumns {
+  return kind === 'folder'
+    ? {
+        id: folders.id,
+        organizationId: folders.organizationId,
+        ownerId: folders.ownerId,
+        departmentId: folders.departmentId,
+        projectId: folders.projectId,
+        confidentiality: folders.confidentiality,
+        inheritPermissions: folders.inheritPermissions,
+        deletedAt: folders.deletedAt,
+        status: folders.status,
+      }
+    : {
+        id: files.id,
+        organizationId: files.organizationId,
+        ownerId: files.ownerId,
+        departmentId: files.departmentId,
+        projectId: files.projectId,
+        confidentiality: files.confidentiality,
+        inheritPermissions: files.inheritPermissions,
+        deletedAt: files.deletedAt,
+        status: files.status,
+      };
+}
+
+/**
+ * "This entry is live" — not expired.
+ *
+ * ISO-8601 text compares chronologically as it compares lexicographically, which is why
+ * Phase 2 stored timestamps this way: no conversion is needed on either side.
+ */
+function liveEntry(nowIso: string): SQL {
+  return or(
+    isNull(resourcePermissions.expiresAt),
+    sql`${resourcePermissions.expiresAt} > ${nowIso}`,
+  )!;
+}
+
+/**
+ * A correlated sub-select over `resource_permissions` for one resource row.
+ *
+ * `EXISTS`/`NOT EXISTS` rather than a join: a join against an ACL table multiplies rows, and
+ * the `DISTINCT` needed to undo that is a sort the query does not otherwise need — and, worse,
+ * a `LEFT JOIN ... IS NULL` formulation of the deny check silently stops working the moment
+ * another predicate turns the outer join back into an inner one.
+ */
+function aclExists(
+  kind: ResourceKind,
+  resourceId: SQLiteColumn,
+  principalIds: string[],
+  extra: SQL,
+  nowIso: string,
+): SQL {
+  return sql`EXISTS (SELECT 1 FROM ${resourcePermissions}
+    WHERE ${resourcePermissions.resourceType} = ${kind}
+      AND ${resourcePermissions.resourceId} = ${resourceId}
+      AND ${inList(resourcePermissions.principalId, principalIds)}
+      AND ${liveEntry(nowIso)}
+      AND ${extra})`;
+}
+
+/** No **live** denial naming this actor. Applies to super admins too — see the design doc §3. */
+export function denyGuard(
+  kind: ResourceKind,
+  principalIds: string[],
+  nowIso: string,
+): SQL | undefined {
+  if (principalIds.length === 0) return undefined;
+  const columns = columnsFor(kind);
+  return sql`NOT ${aclExists(kind, columns.id, principalIds, sql`${resourcePermissions.deny} = 1`, nowIso)}`;
+}
+
+/** A live, non-deny entry naming this actor. */
+export function directGrant(
+  kind: ResourceKind,
+  principalIds: string[],
+  nowIso: string,
+): SQL | undefined {
+  if (principalIds.length === 0) return undefined;
+  const columns = columnsFor(kind);
+  return aclExists(kind, columns.id, principalIds, sql`${resourcePermissions.deny} = 0`, nowIso);
+}
+
+function ancestorScope(kind: ResourceKind) {
+  return kind === 'folder'
+    ? { table: sql.raw('folder_ancestors'), child: sql.raw('folder_id') }
+    : { table: sql.raw('file_folder_ancestors'), child: sql.raw('file_id') };
+}
+
+/**
+ * The depth of the nearest ancestor that switches inheritance off, or `-1` if none does.
+ *
+ * ── Why this exists ─────────────────────────────────────────────────────────────────────
+ *
+ * `canAccess` walks leaf → root and **stops after** the first ancestor with
+ * `inheritPermissions = false`. That ancestor's own ACL still applies; nothing above it does.
+ * An earlier version of this module ignored the boundary in listings and left `canAccess` to
+ * refuse the row afterwards — which is exactly the leak the brief forbids, because by then the
+ * row has already been counted, paginated and had its name rendered.
+ *
+ * ── The design, and why this one ────────────────────────────────────────────────────────
+ *
+ * `folder_ancestors.depth` is documented as *"0 = the drive root, increasing towards the
+ * parent"*, so the nearest inheritance-breaking ancestor is simply the one with the **largest
+ * depth** among ancestors whose folder has `inherit_permissions = 0`. Ancestors at or below
+ * that depth are in scope; anything shallower is not.
+ *
+ * That turns the boundary into one scalar sub-select and a `depth >=` comparison — no
+ * recursive CTE, and no precomputed column that hierarchy mutations would have to maintain
+ * (and could leave stale, which would be a leak that no test on the mutation path would see).
+ * It is option 2 of the three the brief listed, chosen because it is the only one that is both
+ * correct and stateless.
+ *
+ * `COALESCE(..., -1)` is what makes "no boundary" mean "every ancestor", since depths start
+ * at 0.
+ *
+ * ── Cost ────────────────────────────────────────────────────────────────────────────────
+ *
+ * Two lookups per candidate row on `ix_folder_ancestors_ordered (folder_id, depth)`, over a
+ * chain whose length is the folder depth — single digits in this application. For files the
+ * equivalent index is `ux_file_folder_ancestors (file_id, ancestor_id)`, which covers the
+ * `file_id` lookup but not the `depth` ordering; a `(file_id, depth)` index would help if file
+ * listings ever became hot, and is recorded rather than added, since the chain is short.
+ */
+function boundaryDepth(kind: ResourceKind): SQL {
+  const columns = columnsFor(kind);
+  const { table, child } = ancestorScope(kind);
+  return sql`COALESCE((SELECT MAX(boundary.depth)
+                         FROM ${table} boundary
+                         JOIN folders boundary_folder ON boundary_folder.id = boundary.ancestor_id
+                        WHERE boundary.${child} = ${columns.id}
+                          AND boundary_folder.inherit_permissions = 0), -1)`;
+}
+
+/**
+ * A live ancestor entry of the requested polarity, considered only down to the inheritance
+ * boundary.
+ *
+ * `deny = 0` builds the inherited-allow branch, `deny = 1` the inherited-deny guard. Both must
+ * respect the same boundary: an ancestor above a broken boundary can neither grant nor deny.
+ */
+function boundedAncestorExists(
+  kind: ResourceKind,
+  principalIds: string[],
+  nowIso: string,
+  deny: 0 | 1,
+): SQL {
+  const columns = columnsFor(kind);
+  const { table, child } = ancestorScope(kind);
+
+  return sql`EXISTS (
+    SELECT 1 FROM ${table} anc
+      JOIN ${resourcePermissions} ON ${resourcePermissions.resourceType} = 'folder'
+                                 AND ${resourcePermissions.resourceId} = anc.ancestor_id
+     WHERE anc.${child} = ${columns.id}
+       AND ${inList(resourcePermissions.principalId, principalIds)}
+       AND ${liveEntry(nowIso)}
+       AND ${resourcePermissions.deny} = ${deny}
+       AND anc.depth >= ${boundaryDepth(kind)})`;
+}
+
+/**
+ * A live, non-deny entry on an ancestor the resource still inherits from.
+ *
+ * `inherit_permissions = 0` on the resource itself cuts the walk off entirely (matching
+ * `canAccess`), and `boundaryDepth` cuts it off at the nearest ancestor that does the same.
+ */
+export function inheritedGrant(
+  kind: ResourceKind,
+  principalIds: string[],
+  nowIso: string,
+): SQL | undefined {
+  if (principalIds.length === 0) return undefined;
+  const columns = columnsFor(kind);
+  return sql`(${columns.inheritPermissions} = 1 AND ${boundedAncestorExists(kind, principalIds, nowIso, 0)})`;
+}
+
+/** A live denial on an in-scope ancestor removes the row, exactly as a direct one does. */
+export function inheritedDenyGuard(
+  kind: ResourceKind,
+  principalIds: string[],
+  nowIso: string,
+): SQL | undefined {
+  if (principalIds.length === 0) return undefined;
+  const columns = columnsFor(kind);
+  return sql`NOT (${columns.inheritPermissions} = 1 AND ${boundedAncestorExists(kind, principalIds, nowIso, 1)})`;
+}
+
+/**
+ * The department-, project- and folder-scoped **role grants** `roleScopeGrants()` honours.
+ *
+ * `resourceVisibility` deliberately does not include these — see `lookupVisibility` below for
+ * why a single-row lookup does.
+ */
+function roleScopeBranches(kind: ResourceKind, actor: Actor): SQL[] {
+  const columns = columnsFor(kind);
+  const branches: SQL[] = [];
+
+  const departmentScopes = scopeIds(actor, 'department');
+  if (departmentScopes.length) branches.push(inList(columns.departmentId, departmentScopes));
+
+  const projectScopes = scopeIds(actor, 'project');
+  if (projectScopes.length) branches.push(inList(columns.projectId, projectScopes));
+
+  // A folder-scoped grant covers the folder itself and everything beneath it, which is what
+  // `roleScopeGrants` expresses as "scopeId is the resource or one of its ancestors".
+  const folderScopes = scopeIds(actor, 'folder');
+  if (folderScopes.length) {
+    const { table, child } = ancestorScope(kind);
+    const underScope = sql`EXISTS (SELECT 1 FROM ${table} scope
+                                    WHERE scope.${child} = ${columns.id}
+                                      AND ${inList(sql`scope.ancestor_id`, folderScopes)})`;
+    branches.push(
+      kind === 'folder' ? or(inList(columns.id, folderScopes), underScope)! : underScope,
+    );
+  }
+
+  return branches;
+}
+
+/**
+ * "May this actor be shown this **one** row?" — the predicate behind a permission-aware
+ * `findById`.
+ *
+ * ── Why this is not `resourceVisibility` ────────────────────────────────────────────────
+ *
+ * A listing predicate is allowed to be narrower than `canAccess`: a row it omits is a row
+ * missing from a search page, which is a lesser evil than a leak. A **lookup** predicate is
+ * not, because the repository returning `null` becomes a 404 for a folder the actor can
+ * legitimately open — the department head opening their department's drive, the reviewer
+ * following a folder-scoped grant, the company-wide reader opening a restricted folder they
+ * own themselves. Each of those is allowed by `canAccess` and each is absent from
+ * `resourceVisibility`.
+ *
+ * So this predicate is deliberately built as a **superset of `canAccess`'s allow set**:
+ *
+ *   • every branch `resourceVisibility` has, plus
+ *   • the role-scope grants of `roleScopeGrants()` (step 9), gated by clearance exactly as
+ *     `passesConfidentialityGate` gates them, plus
+ *   • owner and direct/inherited grants **also** on the super-admin and company-wide path,
+ *     which `resourceVisibility` short-circuits past.
+ *
+ * What it is *not* laxer about is the part that matters: organization isolation and the live
+ * deny guards are AND-ed over everything, super admins included, so a denied or foreign-tenant
+ * folder is unreachable through this path however privileged the caller.
+ *
+ * `assertCan` still runs afterwards with the full ancestor chain and makes the actual decision.
+ * This is the SQL half — it stops an id-guessing lookup from ever loading the row.
+ */
+export function lookupVisibility(
+  kind: ResourceKind,
+  actor: Actor,
+  options: VisibilityOptions = {},
+): SQL {
+  const nowIso = options.nowIso ?? new Date().toISOString();
+  const columns = columnsFor(kind);
+  const principalIds = actorPrincipalIds(actor);
+
+  const guards: SQL[] = [eq(columns.organizationId, actor.organizationId)];
+  const deny = denyGuard(kind, principalIds, nowIso);
+  if (deny) guards.push(deny);
+  const inheritedDeny = inheritedDenyGuard(kind, principalIds, nowIso);
+  if (inheritedDeny) guards.push(inheritedDeny);
+
+  const clearance = clearancePredicate(kind, actor);
+  const branches: SQL[] = [];
+
+  if (actor.userId) branches.push(eq(columns.ownerId, actor.userId));
+  const direct = directGrant(kind, principalIds, nowIso);
+  if (direct) branches.push(direct);
+  const inherited = inheritedGrant(kind, principalIds, nowIso);
+  if (inherited) branches.push(inherited);
+
+  if (actor.isSuperAdmin || actorHasCompanyWideRead(actor)) {
+    // Everything in the tenant they are cleared for — *and* the branches above, because a
+    // company-wide reader whose clearance stops below `restricted` still owns their own files.
+    branches.push(clearance);
+  } else {
+    if (actor.departmentId) {
+      branches.push(and(eq(columns.departmentId, actor.departmentId), clearance)!);
+    }
+    if (actor.projectIds.length > 0) {
+      branches.push(and(inList(columns.projectId, actor.projectIds), clearance)!);
+    }
+  }
+
+  // Role scope is gated by clearance for everybody — `passesConfidentialityGate` applies to
+  // exactly this branch of `canAccess` and to no other.
+  const scopes = roleScopeBranches(kind, actor);
+  if (scopes.length) branches.push(and(clearance, or(...scopes)!)!);
+
+  if (branches.length === 0) return sql`1 = 0`;
+  return and(...guards, or(...branches)!)!;
+}
+
+export function clearancePredicate(kind: ResourceKind, actor: Actor): SQL {
+  const allowed = [...CLEARANCE_BY_MAX_LEVEL[actorClearance(actor)]] as ConfidentialityLevel[];
+  return inList(columnsFor(kind).confidentiality, allowed);
+}
+
+/** Soft delete. Both `folder.model.ts` and `file.model.ts` apply the Mongoose hook. */
+export function livePredicate(kind: ResourceKind): SQL {
+  return isNull(columnsFor(kind).deletedAt);
+}
+
+export function trashedPredicate(kind: ResourceKind): SQL {
+  return isNotNull(columnsFor(kind).deletedAt);
+}
+
+/* ------------------------------------------------------------------ the two filters */
+
+export interface VisibilityOptions {
+  /** Defaults to now. Injectable so expiry can be tested without waiting. */
+  nowIso?: string;
+}
+
+/**
+ * "Can this actor reach this resource from nothing" — search and cross-tree lookups.
+ *
+ * Returns a predicate that is **never** absent: an actor with no department, no projects and
+ * no shares gets `1 = 0`, not an omitted WHERE.
+ */
+export function resourceVisibility(
+  kind: ResourceKind,
+  actor: Actor,
+  options: VisibilityOptions = {},
+): SQL {
+  const nowIso = options.nowIso ?? new Date().toISOString();
+  const columns = columnsFor(kind);
+  const principalIds = actorPrincipalIds(actor);
+
+  const guards: SQL[] = [eq(columns.organizationId, actor.organizationId)];
+  const deny = denyGuard(kind, principalIds, nowIso);
+  if (deny) guards.push(deny);
+  const inheritedDeny = inheritedDenyGuard(kind, principalIds, nowIso);
+  if (inheritedDeny) guards.push(inheritedDeny);
+
+  if (actor.isSuperAdmin || actorHasCompanyWideRead(actor)) {
+    return and(...guards, clearancePredicate(kind, actor))!;
+  }
+
+  const branches: SQL[] = [];
+  if (actor.userId) branches.push(eq(columns.ownerId, actor.userId));
+
+  const direct = directGrant(kind, principalIds, nowIso);
+  if (direct) branches.push(direct);
+  const inherited = inheritedGrant(kind, principalIds, nowIso);
+  if (inherited) branches.push(inherited);
+
+  const clearance = clearancePredicate(kind, actor);
+  if (actor.departmentId) {
+    branches.push(and(eq(columns.departmentId, actor.departmentId), clearance)!);
+  }
+  if (actor.projectIds.length > 0) {
+    branches.push(and(inList(columns.projectId, actor.projectIds), clearance)!);
+  }
+
+  // Explicit, so the query can never degenerate into "match all".
+  if (branches.length === 0) return sql`1 = 0`;
+
+  return and(...guards, or(...branches)!)!;
+}
+
+/**
+ * Children of a folder the actor is *already* authorised to open.
+ *
+ * Inheritance is the normal case here, so the predicate expresses the exceptions: a live
+ * denial, a child that broke inheritance and grants nothing directly, and a child classified
+ * above clearance unless owned or directly granted.
+ */
+export function childVisibility(
+  kind: ResourceKind,
+  actor: Actor,
+  options: VisibilityOptions = {},
+): SQL {
+  const nowIso = options.nowIso ?? new Date().toISOString();
+  const columns = columnsFor(kind);
+  const principalIds = actorPrincipalIds(actor);
+
+  const guards: SQL[] = [];
+  const deny = denyGuard(kind, principalIds, nowIso);
+  if (deny) guards.push(deny);
+  const inheritedDeny = inheritedDenyGuard(kind, principalIds, nowIso);
+  if (inheritedDeny) guards.push(inheritedDeny);
+
+  const clearance = clearancePredicate(kind, actor);
+
+  if (actor.isSuperAdmin || actorHasCompanyWideRead(actor)) {
+    return guards.length ? and(...guards, clearance)! : clearance;
+  }
+
+  const departmentScopes = scopeIds(actor, 'department');
+  const projectScopes = scopeIds(actor, 'project');
+
+  const scopeBranches: SQL[] = [eq(columns.inheritPermissions, true)];
+  if (departmentScopes.length) scopeBranches.push(inList(columns.departmentId, departmentScopes));
+  if (projectScopes.length) scopeBranches.push(inList(columns.projectId, projectScopes));
+
+  const branches: SQL[] = [];
+  // Owner and direct grantee bypass the clearance gate — they were given the resource.
+  if (actor.userId) branches.push(eq(columns.ownerId, actor.userId));
+  const direct = directGrant(kind, principalIds, nowIso);
+  if (direct) branches.push(direct);
+  branches.push(and(clearance, or(...scopeBranches)!)!);
+
+  return guards.length ? and(...guards, or(...branches)!)! : or(...branches)!;
+}
+
+function scopeIds(actor: Actor, scopeType: 'department' | 'project' | 'folder'): string[] {
+  return [
+    ...new Set(
+      actor.grants
+        .filter((grant) => grant.scopeType === scopeType && grant.scopeId)
+        .map((grant) => grant.scopeId as string),
+    ),
+  ];
+}

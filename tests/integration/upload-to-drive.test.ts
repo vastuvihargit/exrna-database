@@ -104,7 +104,7 @@ async function uploadInto(
     { folderId, filename, size: content.byteLength },
     TEST_META,
   );
-  await uploadService.receiveStream(actor, ticket.sessionId, Readable.from(content));
+  await uploadService.receiveStream(actor, ticket.sessionId, Readable.from(content), TEST_META);
   const result = await uploadService.finalize(actor, ticket.sessionId, TEST_META);
   return { fileId: result.fileId, versionId: result.versionId };
 }
@@ -362,7 +362,7 @@ describe('when new uploads are configured to go to Drive', () => {
       { folderId: folder, filename: 'versioned.txt', size: v2.byteLength, targetFileId: first.fileId },
       TEST_META,
     );
-    await uploadService.receiveStream(actor, ticket.sessionId, Readable.from(v2));
+    await uploadService.receiveStream(actor, ticket.sessionId, Readable.from(v2), TEST_META);
     const second = await uploadService.finalize(actor, ticket.sessionId, TEST_META);
 
     for (const versionId of [first.versionId, second.versionId]) {

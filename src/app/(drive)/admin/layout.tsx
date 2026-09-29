@@ -3,6 +3,7 @@ import Link from 'next/link';
 import { redirect } from 'next/navigation';
 
 import { requireActor } from '@/server/http/page-guard';
+import { isWorkerRuntime } from '@/server/runtime';
 
 /**
  * Administration area.
@@ -23,8 +24,8 @@ const ADMIN_TABS = [
    * moves this platform's files *into* the company Shared Drive. An operator picking the
    * wrong one is not a cosmetic problem, so the labels say which is which.
    */
-  { href: '/admin/migrations', label: 'Import from Drive' },
-  { href: '/admin/storage-migration', label: 'Drive storage' },
+  { href: '/admin/migrations', label: 'Import from Drive', nodeOnly: true },
+  { href: '/admin/storage-migration', label: 'Drive storage', nodeOnly: true },
   { href: '/admin/audit-logs', label: 'Audit log' },
   { href: '/admin/system', label: 'System' },
 ];
@@ -52,7 +53,8 @@ export default async function AdminLayout({ children }: { children: ReactNode })
       </div>
 
       <nav aria-label="Administration sections" className="flex flex-wrap gap-1 border-b">
-        {ADMIN_TABS.map((tab) => (
+        {/* The two Node-only migration tools (server/http/node-only.ts) are not offered on a Worker. */}
+        {ADMIN_TABS.filter((tab) => !(tab.nodeOnly && isWorkerRuntime())).map((tab) => (
           <Link
             key={tab.href}
             href={tab.href}

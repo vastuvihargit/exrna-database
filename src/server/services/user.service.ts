@@ -25,6 +25,7 @@ import type { ScopeType } from '@/server/domain/permissions';
 import type { RequestMeta } from '@/server/http/request-meta';
 import { normalizeCompanyEmail } from '@/server/auth/email-domain';
 import { checkPasswordPolicy, hashPassword } from '@/server/auth/password';
+import { isPasswordAuthAvailable } from '@/server/auth/access-session';
 import { userDirectoryFilter } from '@/server/permissions/visibility';
 import type { UserStatus } from '@/server/db/models';
 
@@ -92,7 +93,7 @@ export async function listDirectory(
   options: { search?: string; departmentId?: string; page: number; pageSize: number },
 ): Promise<{ items: DirectoryEntry[]; total: number }> {
   const { items, total } = await userRepository.list({
-    filter: userDirectoryFilter(actor),
+    ...userDirectoryFilter(actor),
     ...(options.search ? { search: options.search } : {}),
     ...(options.departmentId ? { departmentId: options.departmentId } : {}),
     page: options.page,
@@ -134,7 +135,7 @@ export async function listForAdmin(
       : (actor.departmentId ?? undefined);
 
   const { items, total } = await userRepository.list({
-    filter: userDirectoryFilter(actor),
+    ...userDirectoryFilter(actor),
     ...(options.search ? { search: options.search } : {}),
     ...(options.status ? { status: options.status } : {}),
     ...(scopedDepartment ? { departmentId: scopedDepartment } : {}),
@@ -227,6 +228,13 @@ export async function createEmployee(
 
   let passwordHash: string | null = null;
   if (input.temporaryPassword) {
+    // Where nobody signs in with a password, one set here could never be used — and on a Worker
+    // it could not even be hashed.
+    if (!isPasswordAuthAvailable()) {
+      throw new ValidationError(
+        'Temporary passwords are not used on this deployment: employees sign in with their company account.',
+      );
+    }
     const policy = checkPasswordPolicy(input.temporaryPassword, { email, name: input.name });
     if (!policy.ok) throw new ValidationError('Temporary password does not meet the policy', policy.problems);
     passwordHash = await hashPassword(input.temporaryPassword);
@@ -298,7 +306,7 @@ export async function updateEmployee(
     assertCanManageTarget(actor, target.departmentId);
   }
 
-  const update: Record<string, unknown> = {};
+  const update: userRepository.UserPatch = {};
   if (input.name !== undefined) update.name = input.name.trim();
   if (input.jobTitle !== undefined) update.jobTitle = input.jobTitle;
 
@@ -320,7 +328,7 @@ export async function updateEmployee(
 
   if (Object.keys(update).length === 0) return decorate(target);
 
-  const updated = await userRepository.updateById(userId, { $set: update });
+  const updated = await userRepository.updateById(userId, update);
   if (!updated) throw new NotFoundError();
 
   if (target.departmentId !== updated.departmentId) {
@@ -375,12 +383,10 @@ export async function setStatus(
   }
 
   const updated = await userRepository.updateById(userId, {
-    $set: {
-      status,
-      ...(status === 'active'
-        ? { activatedAt: new Date(), deactivatedAt: null, deactivatedBy: null, deactivationReason: null, failedLoginCount: 0, lockedUntil: null }
-        : { deactivatedAt: new Date(), deactivatedBy: actor.userId, deactivationReason: reason }),
-    },
+    status,
+    ...(status === 'active'
+      ? { activatedAt: new Date(), deactivatedAt: null, deactivatedBy: null, deactivationReason: null, failedLoginCount: 0, lockedUntil: null }
+      : { deactivatedAt: new Date(), deactivatedBy: actor.userId, deactivationReason: reason }),
   });
   if (!updated) throw new NotFoundError();
 
@@ -409,7 +415,9 @@ export async function setStatus(
 
 async function countActiveSuperAdmins(organizationId: string): Promise<number> {
   const { total } = await userRepository.list({
-    filter: { organizationId, isSuperAdmin: true, status: 'active' },
+    organizationId,
+    isSuperAdmin: true,
+    status: 'active',
     page: 1,
     pageSize: 1,
   });

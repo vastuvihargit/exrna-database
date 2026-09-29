@@ -1,7 +1,7 @@
 import type { NextRequest } from 'next/server';
 import { z } from 'zod';
 
-import { withAuthenticatedRoute } from '@/server/http/authenticated-route';
+import { NODE_ONLY_FEATURES, withNodeOnlyRoute } from '@/server/http/node-only';
 import { ok } from '@/server/http/api-response';
 import { assertCompanyPermission } from '@/server/permissions/authorize';
 import { storageMigrationService } from '@/server/services/storage-migration.service';
@@ -28,7 +28,7 @@ const drainSchema = z.object({
  * Normally driven by the scheduler (`npm run drive:drain`); this endpoint exists so an
  * administrator can clear a backlog immediately after fixing a connection.
  */
-export const POST = withAuthenticatedRoute(async (request: NextRequest, { actor }) => {
+export const POST = withNodeOnlyRoute(NODE_ONLY_FEATURES.storageMigration, async (request: NextRequest, { actor }) => {
   assertCompanyPermission(actor, 'access.manage');
 
   const body: unknown = await request.json().catch(() => ({}));

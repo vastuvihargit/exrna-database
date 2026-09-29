@@ -21,7 +21,7 @@
  * mid-run picks up exactly where it stopped: the item status transition is an atomic
  * claim, and a re-scan updates rows rather than re-importing them.
  */
-import { randomUUID } from 'crypto';
+
 
 import { getEnv } from '@/server/config/env';
 import { withTransaction } from '@/server/db/connection';
@@ -67,6 +67,7 @@ import {
   type DriveReader,
 } from '@/server/migration/google-drive-client';
 import { requireFolder } from './folder-access';
+import { detach } from '@/server/runtime/detach';
 
 /** Bytes read back from staging to check the file is what its extension claims. */
 const SIGNATURE_SAMPLE_BYTES = 4096;
@@ -269,7 +270,7 @@ export async function beginConnect(actor: Actor, jobId: string): Promise<Connect
     );
   }
 
-  const nonce = randomUUID();
+  const nonce = crypto.randomUUID();
   const state = `${job.id}:${nonce}`;
   return { authorizationUrl: buildConsentUrl({ state }), state };
 }
@@ -286,7 +287,7 @@ export async function completeConnect(
   const updated = await migrationRepository.updateJob(job.id, {
     $set: {
       // Encrypted, not hashed: a resumed migration has to present this value to Google.
-      'connection.refreshTokenCipher': sealSecret(grant.refreshToken),
+      'connection.refreshTokenCipher': await sealSecret(grant.refreshToken),
       'connection.accountEmail': grant.accountEmail,
       'connection.scope': grant.scope,
       'connection.connectedAt': new Date(),
@@ -313,7 +314,7 @@ export async function completeConnect(
 /** Builds the live reader for a job, or explains why it cannot. */
 async function readerFor(jobId: string): Promise<DriveReader> {
   const cipher = await migrationRepository.getRefreshTokenCipher(jobId);
-  const refreshToken = openSecret(cipher);
+  const refreshToken = await openSecret(cipher);
   if (!refreshToken) {
     throw new ConflictError('This migration is not connected to a Google account');
   }
@@ -482,7 +483,9 @@ async function ensureLocalFolder(
   const existing = await folderRepository.findChildByName(parentFolderId, name.toLowerCase());
   if (existing) return existing.id;
 
-  const parent = await folderRepository.findById(parentFolderId);
+  // Internal: the import job authorized its target folder when it was created, and this walks
+  // down from there building the mirrored tree.
+  const parent = await folderRepository.findByIdInternal(parentFolderId);
   if (!parent) throw new NotFoundError();
 
   const folder = await folderRepository.create({
@@ -704,7 +707,9 @@ async function importItem(
   }
 
   const targetFolderId = item.targetFolderId ?? job.targetFolderId;
-  const folder = await folderRepository.findById(targetFolderId);
+  // Internal: `file.upload` on the job's target folder was asserted when the job was created,
+  // and this runs on the worker rather than inside the requesting user's session.
+  const folder = await folderRepository.findByIdInternal(targetFolderId);
   if (!folder) throw new NotFoundError();
 
   // Stage first. The bytes land in migration-staging, outside the served tree and outside
@@ -766,7 +771,10 @@ async function importItem(
 
     // Deduplication on *our* checksum, measured while streaming — never Drive's MD5.
     if (job.options.skipDuplicates) {
-      const existing = await fileRepository.findByChecksum(job.organizationId, stored.checksumSha256);
+      const existing = await fileRepository.findByChecksumInternal(
+        job.organizationId,
+        stored.checksumSha256,
+      );
       if (existing) {
         await storage.deleteFile(staging.key, staging.area).catch(() => undefined);
         await migrationRepository.updateItem(item.id, {
@@ -866,11 +874,11 @@ async function importItem(
         await versionRepository.setCurrent(file.id, version.id, session);
         await fileRepository.updateById(
           file.id,
-          { $set: { currentVersionId: version.id }, $inc: { versionCount: 1 } },
+          { currentVersionId: version.id, versionCountDelta: 1 },
           session,
         );
 
-        await folderRepository.updateById(folder.id, { $inc: { fileCount: 1 } }, session);
+        await folderRepository.updateById(folder.id, { fileCountDelta: 1 }, session);
         await usageRepository.applyDelta(
           {
             userId: actor.userId,
@@ -918,21 +926,23 @@ async function importItem(
         severity: 'notice',
       });
 
-      void activityRepository
-        .append({
-          organizationId: job.organizationId,
-          actorUserId: actor.userId,
-          actorName: actor.name,
-          action: 'file.upload',
-          entityType: 'file',
-          entityId: created.fileId,
-          entityLabel: displayName,
-          contextFolderIds: [...folder.pathAncestors, folder.id],
-          departmentId: folder.departmentId,
-          projectId: folder.projectId,
-          detail: { importedFrom: 'google_drive' },
-        })
-        .catch(() => undefined);
+      detach(
+        activityRepository
+          .append({
+            organizationId: job.organizationId,
+            actorUserId: actor.userId,
+            actorName: actor.name,
+            action: 'file.upload',
+            entityType: 'file',
+            entityId: created.fileId,
+            entityLabel: displayName,
+            contextFolderIds: [...folder.pathAncestors, folder.id],
+            departmentId: folder.departmentId,
+            projectId: folder.projectId,
+            detail: { importedFrom: 'google_drive' },
+          }),
+        'activity.append',
+      );
 
       return 'imported';
     } catch (error) {

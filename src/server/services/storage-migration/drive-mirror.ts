@@ -27,11 +27,8 @@
  * `POST /api/folders` wait on a remote call would turn a fast transactional write into a
  * distributed one, and would fill the Shared Drive's item budget with empty folders.
  */
-import { Types } from 'mongoose';
-
-import { connectToDatabase } from '@/server/db/connection';
-import { FileVersionModel } from '@/server/db/models/file-version.model';
-import { FolderModel } from '@/server/db/models/folder.model';
+import * as versionRepository from '@/server/repositories/file-version.repository';
+import * as folderRepository from '@/server/repositories/folder.repository';
 import { getEnv } from '@/server/config/env';
 import { ServiceUnavailableError } from '@/server/errors/app-error';
 import { getLogger } from '@/server/logging/logger';
@@ -57,56 +54,23 @@ export function driveHierarchy(): HierarchicalStorageProvider | null {
   }
 }
 
-/** Every Drive object belonging to a file — one per migrated version. */
+/**
+ * Every Drive object belonging to a file — one per migrated version.
+ *
+ * Read through the version repository, not a Mongoose model. These run inside file and folder
+ * moves, trash and restore — request paths a Worker serves — and a direct model query there
+ * would have failed after cutover with every module correctly on D1 (no TCP socket for
+ * Mongoose). The repository façade routes to whichever engine `DATA_SOURCE_FILE_VERSIONS` names.
+ */
 export async function driveObjectsForFile(fileId: string): Promise<string[]> {
-  await connectToDatabase();
-  const versions = await FileVersionModel.find({
-    fileId: new Types.ObjectId(fileId),
-    googleDriveFileId: { $type: 'string' },
-  })
-    .select({ googleDriveFileId: 1 })
-    .lean<Array<{ googleDriveFileId: string }>>()
-    .exec();
-
-  return versions.map((version) => version.googleDriveFileId);
+  const locations = await versionRepository.getStorageLocationsForFiles([fileId]);
+  return locations.flatMap((location) => (location.externalId ? [location.externalId] : []));
 }
 
-/** Every Drive object under a folder subtree. Used only where Drive cannot cascade. */
-export async function driveObjectsUnderFolder(folderId: string, limit = 500): Promise<string[]> {
-  await connectToDatabase();
-  const { FileModel } = await import('@/server/db/models/file.model');
-
-  const files = await FileModel.find({
-    $or: [{ folderId: new Types.ObjectId(folderId) }, { folderPathAncestors: new Types.ObjectId(folderId) }],
-  })
-    .select({ _id: 1 })
-    .setOptions({ withDeleted: true })
-    .limit(limit)
-    .lean<Array<{ _id: Types.ObjectId }>>()
-    .exec();
-
-  if (files.length === 0) return [];
-
-  const versions = await FileVersionModel.find({
-    fileId: { $in: files.map((file) => file._id) },
-    googleDriveFileId: { $type: 'string' },
-  })
-    .select({ googleDriveFileId: 1 })
-    .lean<Array<{ googleDriveFileId: string }>>()
-    .exec();
-
-  return versions.map((version) => version.googleDriveFileId);
-}
-
+/** The Drive folder an application folder is mirrored to, trashed folders included. */
 export async function driveFolderFor(folderId: string): Promise<string | null> {
-  await connectToDatabase();
-  const folder = await FolderModel.findById(new Types.ObjectId(folderId))
-    .select({ googleDriveFolderId: 1 })
-    .setOptions({ withDeleted: true })
-    .lean<{ googleDriveFolderId?: string | null }>()
-    .exec();
-
-  return folder?.googleDriveFolderId ?? null;
+  const [mapping] = await folderRepository.findDriveMappingsInternal([folderId]);
+  return mapping?.googleDriveFolderId ?? null;
 }
 
 /**

@@ -1,11 +1,16 @@
-import { redirect } from 'next/navigation';
+import type { Metadata } from 'next';
+
+import { InventoryDashboard } from '@/components/inventory/dashboard';
+
+export const metadata: Metadata = { title: 'Inventory' };
 
 /**
  * The inventory landing page.
  *
- * Phase 1 has one section, so `/inventory` goes straight to it rather than showing a page
- * with a single link on it. Phase 3 replaces this with the dashboard.
+ * Was a redirect to the item list while stock movement did not exist and there was nothing to
+ * summarize. Now that receipts, issues and adjustments are recorded, the four counts a store
+ * manager checks first are worth their own page.
  */
 export default function InventoryPage() {
-  redirect('/inventory/items');
+  return <InventoryDashboard />;
 }

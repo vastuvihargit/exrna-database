@@ -1,226 +1,83 @@
-import { Types, type ClientSession } from 'mongoose';
-import { connectToDatabase } from '@/server/db/connection';
-import { UploadSessionModel, type UploadSessionDocument, type UploadStatus } from '@/server/db/models';
+/**
+ * Upload sessions — a façade over the MongoDB and D1 implementations.
+ *
+ * Routed by `DATA_SOURCE_UPLOAD_SESSIONS`.
+ *
+ * Note what having a D1 implementation does *not* achieve on its own: the upload **pipeline**
+ * still writes bytes to a local quarantine directory before Google Drive sees them, so a Worker
+ * cannot upload regardless of this flag. See `docs/cloudflare-migration/16-phase-7-storage-audit.md`.
+ * This repository is the metadata half of that work, finished ahead of the byte half.
+ */
+import { isD1 } from './data-source';
+import { mongoUploadSessionRepository } from './upload-session.repository.mongo';
+import { d1UploadSessionRepository } from './upload-session.repository.d1';
+import type {
+  CreateUploadSessionInput,
+  UploadSessionPatch,
+  UploadSessionRecord,
+  UploadSessionRepository,
+  UploadSessionTx,
+  UploadStatus,
+} from './upload-session.repository.contract';
 
-export interface UploadSessionRecord {
-  id: string;
-  organizationId: string;
-  userId: string;
-  folderId: string;
-  targetFileId: string | null;
-  declaredFilename: string;
-  displayName: string;
-  extension: string;
-  declaredSize: number;
-  declaredMimeType: string | null;
-  resolvedMimeType: string;
-  versionNote: string;
-  status: UploadStatus;
-  receivedBytes: number;
-  chunkSize: number;
-  totalChunks: number;
-  receivedChunks: number[];
-  quarantineKey: string | null;
-  checksumSha256: string | null;
-  resultFileId: string | null;
-  resultVersionId: string | null;
-  failureReason: string | null;
-  finalizationKey: string | null;
-  expiresAt: Date;
-  createdAt: Date;
-}
-
-type LeanSession = UploadSessionDocument & {
-  _id: Types.ObjectId;
-  createdAt: Date;
-  updatedAt: Date;
+export type {
+  CreateUploadSessionInput,
+  UploadSessionPatch,
+  UploadSessionRecord,
+  UploadSessionRepository,
+  UploadSessionTx,
+  UploadStatus,
 };
 
-function oid(value: string): Types.ObjectId {
-  return new Types.ObjectId(value);
+export { mongoUploadSessionRepository, d1UploadSessionRepository };
+
+function active(): UploadSessionRepository {
+  return isD1('uploadSessions') ? d1UploadSessionRepository : mongoUploadSessionRepository;
 }
 
-function isValidId(value: string): boolean {
-  return Types.ObjectId.isValid(value) && /^[a-f0-9]{24}$/i.test(value);
+export function findById(id: string): Promise<UploadSessionRecord | null> {
+  return active().findById(id);
 }
 
-function toRecord(doc: LeanSession): UploadSessionRecord {
-  return {
-    id: String(doc._id),
-    organizationId: String(doc.organizationId),
-    userId: String(doc.userId),
-    folderId: String(doc.folderId),
-    targetFileId: doc.targetFileId ? String(doc.targetFileId) : null,
-    declaredFilename: doc.declaredFilename,
-    displayName: doc.displayName,
-    extension: doc.extension,
-    declaredSize: doc.declaredSize,
-    declaredMimeType: doc.declaredMimeType ?? null,
-    resolvedMimeType: doc.resolvedMimeType,
-    versionNote: doc.versionNote ?? '',
-    status: doc.status as UploadStatus,
-    receivedBytes: doc.receivedBytes ?? 0,
-    chunkSize: doc.chunkSize ?? 0,
-    totalChunks: doc.totalChunks ?? 0,
-    receivedChunks: doc.receivedChunks ?? [],
-    quarantineKey: doc.quarantineKey ?? null,
-    checksumSha256: doc.checksumSha256 ?? null,
-    resultFileId: doc.resultFileId ? String(doc.resultFileId) : null,
-    resultVersionId: doc.resultVersionId ? String(doc.resultVersionId) : null,
-    failureReason: doc.failureReason ?? null,
-    finalizationKey: doc.finalizationKey ?? null,
-    expiresAt: doc.expiresAt,
-    createdAt: doc.createdAt,
-  };
+export function create(input: CreateUploadSessionInput): Promise<UploadSessionRecord> {
+  return active().create(input);
 }
 
-export async function findById(id: string): Promise<UploadSessionRecord | null> {
-  if (!isValidId(id)) return null;
-  await connectToDatabase();
-  const doc = await UploadSessionModel.findOne({ _id: oid(id) }).lean<LeanSession>().exec();
-  return doc ? toRecord(doc) : null;
-}
-
-export interface CreateUploadSessionInput {
-  organizationId: string;
-  userId: string;
-  folderId: string;
-  targetFileId?: string | null;
-  declaredFilename: string;
-  displayName: string;
-  extension: string;
-  declaredSize: number;
-  declaredMimeType?: string | null;
-  resolvedMimeType: string;
-  versionNote?: string;
-  chunkSize?: number;
-  totalChunks?: number;
-  expiresAt: Date;
-}
-
-export async function create(input: CreateUploadSessionInput): Promise<UploadSessionRecord> {
-  await connectToDatabase();
-  const doc = await UploadSessionModel.create({
-    organizationId: oid(input.organizationId),
-    userId: oid(input.userId),
-    folderId: oid(input.folderId),
-    targetFileId: input.targetFileId ? oid(input.targetFileId) : null,
-    declaredFilename: input.declaredFilename,
-    displayName: input.displayName,
-    extension: input.extension,
-    declaredSize: input.declaredSize,
-    declaredMimeType: input.declaredMimeType ?? null,
-    resolvedMimeType: input.resolvedMimeType,
-    versionNote: input.versionNote ?? '',
-    chunkSize: input.chunkSize ?? 0,
-    totalChunks: input.totalChunks ?? 0,
-    expiresAt: input.expiresAt,
-  });
-  return toRecord(doc.toObject() as LeanSession);
-}
-
-export async function update(
+export function update(
   id: string,
-  changes: Record<string, unknown>,
-  session?: ClientSession,
+  patch: UploadSessionPatch,
+  tx?: UploadSessionTx,
 ): Promise<UploadSessionRecord | null> {
-  if (!isValidId(id)) return null;
-  await connectToDatabase();
-  const query = UploadSessionModel.findOneAndUpdate({ _id: oid(id) }, changes, { new: true });
-  if (session) query.session(session);
-  const doc = await query.lean<LeanSession>().exec();
-  return doc ? toRecord(doc) : null;
+  return active().update(id, patch, tx);
 }
 
-/**
- * Marks a session failed unless it already reached a terminal state.
- *
- * `rejected` and `ready` are decisions, not accidents: a file refused for its content is
- * a different thing from an upload that broke, and the admin review of quarantined files
- * needs to tell them apart. Filtered rather than read-then-write so a concurrent
- * rejection cannot be overwritten in the gap.
- */
-export async function markFailed(id: string, reason: string): Promise<void> {
-  if (!isValidId(id)) return;
-  await connectToDatabase();
-  await UploadSessionModel.updateOne(
-    { _id: oid(id), status: { $nin: ['ready', 'rejected', 'aborted'] } },
-    { $set: { status: 'failed', failureReason: reason.slice(0, 500) } },
-  ).exec();
+export function markFailed(id: string, reason: string): Promise<void> {
+  return active().markFailed(id, reason);
 }
 
-/**
- * Claims a session for finalization, atomically.
- *
- * The status transition is the lock: only the request that moves a session out of
- * `uploading` gets to build the file. A concurrent retry finds nothing to claim and
- * reads the already-stored result instead — which is what makes finalization idempotent
- * under a client that retries on timeout.
- */
-export async function claimForFinalization(
+export function claimForFinalization(
   id: string,
   finalizationKey: string,
 ): Promise<UploadSessionRecord | null> {
-  if (!isValidId(id)) return null;
-  await connectToDatabase();
-  const doc = await UploadSessionModel.findOneAndUpdate(
-    { _id: oid(id), status: { $in: ['uploading', 'pending'] }, finalizationKey: null },
-    { $set: { status: 'processing', finalizationKey } },
-    { new: true },
-  )
-    .lean<LeanSession>()
-    .exec();
-  return doc ? toRecord(doc) : null;
+  return active().claimForFinalization(id, finalizationKey);
 }
 
-export async function recordChunk(
+export function recordChunk(
   id: string,
   chunkIndex: number,
   bytes: number,
 ): Promise<UploadSessionRecord | null> {
-  await connectToDatabase();
-  const doc = await UploadSessionModel.findOneAndUpdate(
-    { _id: oid(id) },
-    {
-      $addToSet: { receivedChunks: chunkIndex },
-      $inc: { receivedBytes: bytes },
-      $set: { status: 'uploading' },
-    },
-    { new: true },
-  )
-    .lean<LeanSession>()
-    .exec();
-  return doc ? toRecord(doc) : null;
+  return active().recordChunk(id, chunkIndex, bytes);
 }
 
-export async function listExpired(before: Date, limit = 200): Promise<UploadSessionRecord[]> {
-  await connectToDatabase();
-  const docs = await UploadSessionModel.find({
-    expiresAt: { $lte: before },
-    status: { $nin: ['ready'] },
-  })
-    .limit(limit)
-    .lean<LeanSession[]>()
-    .exec();
-  return docs.map(toRecord);
+export function listExpired(before: Date, limit = 200): Promise<UploadSessionRecord[]> {
+  return active().listExpired(before, limit);
 }
 
-/** Upload sessions grouped by status, for the admin system page. */
-export async function countByStatus(): Promise<Record<string, number>> {
-  await connectToDatabase();
-  const rows = await UploadSessionModel.aggregate<{ _id: string; count: number }>([
-    { $group: { _id: '$status', count: { $sum: 1 } } },
-  ]).exec();
-
-  const out: Record<string, number> = {};
-  for (const row of rows) out[row._id] = row.count;
-  return out;
+export function countByStatus(): Promise<Record<string, number>> {
+  return active().countByStatus();
 }
 
-export async function remove(ids: string[]): Promise<number> {
-  const valid = ids.filter(isValidId).map(oid);
-  if (valid.length === 0) return 0;
-  await connectToDatabase();
-  const result = await UploadSessionModel.deleteMany({ _id: { $in: valid } }).exec();
-  return result.deletedCount ?? 0;
+export function remove(ids: string[]): Promise<number> {
+  return active().remove(ids);
 }

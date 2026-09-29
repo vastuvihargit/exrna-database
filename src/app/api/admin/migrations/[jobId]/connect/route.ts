@@ -1,6 +1,6 @@
 import type { NextRequest } from 'next/server';
 
-import { withAuthenticatedRoute } from '@/server/http/authenticated-route';
+import { NODE_ONLY_FEATURES, withNodeOnlyRoute } from '@/server/http/node-only';
 import { ok } from '@/server/http/api-response';
 import { ConflictError } from '@/server/errors/app-error';
 import { toMigrationJobDto } from '@/server/http/dto';
@@ -18,7 +18,7 @@ export const dynamic = 'force-dynamic';
  * happen — connecting an account that can read an entire Google Drive is not something to
  * do behind a silent 302.
  */
-export const GET = withAuthenticatedRoute<{ jobId: string }>(
+export const GET = withNodeOnlyRoute<{ jobId: string }>(NODE_ONLY_FEATURES.driveImport,
   async (_request, { actor, params }) => {
     const jobId = objectIdSchema.parse(params.jobId);
     return ok(await migrationService.beginConnect(actor, jobId));
@@ -31,7 +31,7 @@ export const GET = withAuthenticatedRoute<{ jobId: string }>(
  * `state` is echoed by the client and must name this job. It is a binding check, not the
  * authorization: the service re-derives the actor's permission on the job regardless.
  */
-export const POST = withAuthenticatedRoute<{ jobId: string }>(
+export const POST = withNodeOnlyRoute<{ jobId: string }>(NODE_ONLY_FEATURES.driveImport,
   async (request: NextRequest, { actor, params, meta }) => {
     const jobId = objectIdSchema.parse(params.jobId);
     const body: unknown = await request.json().catch(() => ({}));

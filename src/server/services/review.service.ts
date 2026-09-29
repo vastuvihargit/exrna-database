@@ -29,6 +29,12 @@
  *     is what notices when that revision stops being the current one.
  */
 import { withTransaction } from '@/server/db/connection';
+import {
+  cancelReviewAtomically,
+  decideReviewAtomically,
+  reviewMutationEngine,
+  submitReviewAtomically,
+} from '@/server/db/d1-review-unit-of-work';
 import { ConflictError, ForbiddenError, NotFoundError, ValidationError } from '@/server/errors/app-error';
 import type { Actor } from '@/server/permissions/actor';
 import { auditService } from '@/server/audit/audit.service';
@@ -36,7 +42,6 @@ import * as activityRepository from '@/server/repositories/activity.repository';
 import * as commentRepository from '@/server/repositories/comment.repository';
 import * as fileRepository from '@/server/repositories/file.repository';
 import * as versionRepository from '@/server/repositories/file-version.repository';
-import * as notificationRepository from '@/server/repositories/notification.repository';
 import * as reviewRepository from '@/server/repositories/review.repository';
 import type { ReviewRecord } from '@/server/repositories/review.repository';
 import * as userRepository from '@/server/repositories/user.repository';
@@ -47,6 +52,8 @@ import {
   fingerprintForReview,
 } from './approval-integrity.service';
 import { fileCan, requireFile, type FileContext } from './file-access';
+import { detach } from '@/server/runtime/detach';
+import { dispatchNotifications, newEventKey } from '@/server/queues/notification-dispatch';
 
 export interface ReviewView extends ReviewRecord {
   /** What the *viewer* may do with this request. */
@@ -97,43 +104,54 @@ export async function submitForReview(
   // before the transaction: a Drive hiccup must not stop somebody submitting their work.
   const submitted = await fingerprintForReview(versionId);
 
-  const review = await withTransaction(async (session) => {
-    // A pending review of superseded bytes would let someone approve content that is no
-    // longer current. Only one version of a file can be under review at a time.
-    await reviewRepository.cancelOpenForFile(fileId, versionId, session);
+  const reviewInput = {
+    organizationId: actor.organizationId,
+    fileId,
+    versionId,
+    versionNumber: version.versionNumber,
+    fileName: context.file.displayName,
+    versionChecksum: version.checksumSha256,
+    versionRevisionId: submitted.revisionId,
+    versionContentModifiedAt: submitted.contentModifiedAt,
+    requestedBy: actor.userId,
+    requestedByName: actor.name,
+    ...(input.note ? { requestNote: input.note } : {}),
+    reviewerUserIds: reviewers.map((reviewer) => reviewer.id),
+    requiredApprovals,
+    dueAt: input.dueAt ?? null,
+    departmentId: context.file.departmentId,
+    projectId: context.file.projectId,
+  };
+  const filePatch = {
+    reviewStatus: 'submitted' as const,
+    approvalStatus: 'pending' as const,
+    updatedBy: actor.userId,
+  };
+  const versionPatch = { label: 'under_review' as const };
 
-    const created = await reviewRepository.create(
-      {
-        organizationId: actor.organizationId,
-        fileId,
-        versionId,
-        versionNumber: version.versionNumber,
-        fileName: context.file.displayName,
-        versionChecksum: version.checksumSha256,
-        versionRevisionId: submitted.revisionId,
-        versionContentModifiedAt: submitted.contentModifiedAt,
-        requestedBy: actor.userId,
-        requestedByName: actor.name,
-        ...(input.note ? { requestNote: input.note } : {}),
-        reviewerUserIds: reviewers.map((reviewer) => reviewer.id),
-        requiredApprovals,
-        dueAt: input.dueAt ?? null,
-        departmentId: context.file.departmentId,
-        projectId: context.file.projectId,
-      },
-      session,
-    );
-
-    await fileRepository.updateById(
-      fileId,
-      { $set: { reviewStatus: 'submitted', approvalStatus: 'pending', updatedBy: actor.userId } },
-      session,
-    );
-
-    await versionRepository.updateFlags(versionId, { $set: { label: 'under_review' } }, session);
-
-    return created;
-  });
+  /**
+   * The same three writes on either engine, committed the way that engine can.
+   *
+   * `reviewMutationEngine()` throws rather than choosing when reviews, files and versions are
+   * not all on the same database — a review decision writes rows in all three, and no
+   * transaction spans two databases.
+   */
+  const review =
+    reviewMutationEngine() === 'd1'
+      ? await submitReviewAtomically({
+          review: reviewInput,
+          file: filePatch,
+          version: versionPatch,
+        })
+      : await withTransaction(async (session) => {
+          // A pending review of superseded bytes would let someone approve content that is no
+          // longer current. Only one version of a file can be under review at a time.
+          await reviewRepository.cancelOpenForFile(fileId, versionId, session);
+          const created = await reviewRepository.create(reviewInput, session);
+          await fileRepository.updateById(fileId, filePatch, session);
+          await versionRepository.updateFlags(versionId, versionPatch, session);
+          return created;
+        });
 
   await auditService.recordForActor(actor, meta, {
     action: 'file.review_requested',
@@ -151,24 +169,26 @@ export async function submitForReview(
     severity: 'notice',
   });
 
-  void activityRepository
-    .append({
-      organizationId: actor.organizationId,
-      actorUserId: actor.userId,
-      actorName: actor.name,
-      action: 'file.review_requested',
-      entityType: 'file',
-      entityId: fileId,
-      entityLabel: context.file.displayName,
-      detail: `submitted version ${version.versionNumber} for review`,
-      contextFolderIds: context.file.folderPathAncestors,
-      departmentId: context.file.departmentId,
-      projectId: context.file.projectId,
-    })
-    .catch(() => undefined);
+  detach(
+    activityRepository
+      .append({
+        organizationId: actor.organizationId,
+        actorUserId: actor.userId,
+        actorName: actor.name,
+        action: 'file.review_requested',
+        entityType: 'file',
+        entityId: fileId,
+        entityLabel: context.file.displayName,
+        detail: `submitted version ${version.versionNumber} for review`,
+        contextFolderIds: context.file.folderPathAncestors,
+        departmentId: context.file.departmentId,
+        projectId: context.file.projectId,
+      }),
+    'activity.append',
+  );
 
-  void notificationRepository
-    .createMany(
+  detach(
+    dispatchNotifications(
       reviewers.map((reviewer) => ({
         organizationId: actor.organizationId,
         userId: reviewer.id,
@@ -180,8 +200,10 @@ export async function submitForReview(
         entityLabel: context.file.displayName,
         message: `${actor.name} asked you to review "${context.file.displayName}" (version ${version.versionNumber})`,
       })),
-    )
-    .catch(() => undefined);
+      `review-requested:${review.id}`,
+    ),
+    'notifications.review-requested',
+  );
 
   return toView(actor, review, context);
 }
@@ -288,19 +310,18 @@ export async function decide(
           ? ({ status: 'approved' } as const)
           : null;
 
-  const updated = await withTransaction(async (session) => {
-    const result = await reviewRepository.appendDecision(reviewId, decisionRecord, close, session);
-    // The repository filters on `status: 'pending'`, so a null here means another
-    // reviewer closed the request between our read and our write.
-    if (!result) {
-      throw new ConflictError('Another reviewer closed this request first');
-    }
-
-    if (close?.status === 'approved') {
-      await versionRepository.updateFlags(
-        review.versionId,
-        {
-          $set: {
+  /**
+   * What the decision writes besides the decision itself.
+   *
+   * Computed once, up front, and used by both engines — the branch below decides only *how*
+   * the writes commit, never *what* they are. Keeping the two paths reading from one pair of
+   * patches is what stops "approved on Mongo" and "approved on D1" quietly meaning different
+   * things after the flag moves.
+   */
+  const outcome: { file: Parameters<typeof fileRepository.updateById>[1]; version: Parameters<typeof versionRepository.updateFlags>[1] } =
+    close?.status === 'approved'
+      ? {
+          version: {
             label: 'approved',
             isApproved: true,
             approvedBy: actor.userId,
@@ -309,53 +330,69 @@ export async function decide(
             // is detectable rather than invisible. All nulls for a local version.
             ...approvalBindingUpdate(current),
           },
-        },
-        session,
-      );
-      await fileRepository.updateById(
-        review.fileId,
-        {
-          $set: {
+          file: {
             reviewStatus: 'approved',
             approvalStatus: 'approved',
             approvedVersionId: review.versionId,
             updatedBy: actor.userId,
           },
-        },
-        session,
-      );
-    } else if (close?.status === 'rejected') {
-      await versionRepository.updateFlags(review.versionId, { $set: { label: 'draft' } }, session);
-      await fileRepository.updateById(
-        review.fileId,
-        {
-          $set: { reviewStatus: 'rejected', approvalStatus: 'rejected', updatedBy: actor.userId },
-        },
-        session,
-      );
-    } else if (close?.status === 'changes_requested') {
-      await versionRepository.updateFlags(
-        review.versionId,
-        { $set: { label: 'changes_requested' } },
-        session,
-      );
-      await fileRepository.updateById(
-        review.fileId,
-        {
-          $set: { reviewStatus: 'changes_requested', approvalStatus: 'none', updatedBy: actor.userId },
-        },
-        session,
-      );
-    } else {
-      await fileRepository.updateById(
-        review.fileId,
-        { $set: { reviewStatus: 'in_review', updatedBy: actor.userId } },
-        session,
-      );
-    }
+        }
+      : close?.status === 'rejected'
+        ? {
+            version: { label: 'draft' },
+            file: {
+              reviewStatus: 'rejected',
+              approvalStatus: 'rejected',
+              updatedBy: actor.userId,
+            },
+          }
+        : close?.status === 'changes_requested'
+          ? {
+              version: { label: 'changes_requested' },
+              file: {
+                reviewStatus: 'changes_requested',
+                approvalStatus: 'none',
+                updatedBy: actor.userId,
+              },
+            }
+          : {
+              // Still open: the file moves to `in_review` and the version is untouched.
+              version: {},
+              file: { reviewStatus: 'in_review', updatedBy: actor.userId },
+            };
 
-    return result;
-  });
+  const updated =
+    reviewMutationEngine() === 'd1'
+      ? await decideReviewAtomically({
+          reviewId,
+          fileId: review.fileId,
+          versionId: review.versionId,
+          decision: decisionRecord,
+          close,
+          file: outcome.file,
+          version: outcome.version,
+        })
+      : await withTransaction(async (session) => {
+          const result = await reviewRepository.appendDecision(
+            reviewId,
+            decisionRecord,
+            close,
+            session,
+          );
+          // The repository filters on `status: 'pending'`, so a null here means another
+          // reviewer closed the request between our read and our write.
+          if (!result) return null;
+
+          await versionRepository.updateFlags(review.versionId, outcome.version, session);
+          await fileRepository.updateById(review.fileId, outcome.file, session);
+          return result;
+        });
+
+  // Both engines report the lost race the same way: the guarded write matched nothing, and
+  // nothing else in the batch or the session committed either.
+  if (!updated) {
+    throw new ConflictError('Another reviewer closed this request first');
+  }
 
   // The reviewer's remarks become a comment on the file so they sit alongside the rest of
   // the discussion rather than only inside a review record nobody thinks to open.
@@ -391,42 +428,50 @@ export async function decide(
     severity: 'notice',
   });
 
-  void activityRepository
-    .append({
-      organizationId: actor.organizationId,
-      actorUserId: actor.userId,
-      actorName: actor.name,
-      action: input.decision === 'approve' ? 'file.approve' : 'file.reject',
-      entityType: 'file',
-      entityId: review.fileId,
-      entityLabel: review.fileName,
-      detail: `${input.decision.replace('_', ' ')} on version ${review.versionNumber}`,
-      contextFolderIds: context.file.folderPathAncestors,
-      departmentId: context.file.departmentId,
-      projectId: context.file.projectId,
-    })
-    .catch(() => undefined);
+  detach(
+    activityRepository
+      .append({
+        organizationId: actor.organizationId,
+        actorUserId: actor.userId,
+        actorName: actor.name,
+        action: input.decision === 'approve' ? 'file.approve' : 'file.reject',
+        entityType: 'file',
+        entityId: review.fileId,
+        entityLabel: review.fileName,
+        detail: `${input.decision.replace('_', ' ')} on version ${review.versionNumber}`,
+        contextFolderIds: context.file.folderPathAncestors,
+        departmentId: context.file.departmentId,
+        projectId: context.file.projectId,
+      }),
+    'activity.append',
+  );
 
-  void notificationRepository
-    .create({
-      organizationId: actor.organizationId,
-      userId: review.requestedBy,
-      type: 'review.decided',
-      actorUserId: actor.userId,
-      actorName: actor.name,
-      entityType: 'file',
-      entityId: review.fileId,
-      entityLabel: review.fileName,
-      message:
-        close?.status === 'approved'
-          ? `${actor.name} approved "${review.fileName}" version ${review.versionNumber}`
-          : close?.status === 'rejected'
-            ? `${actor.name} rejected "${review.fileName}" version ${review.versionNumber}`
-            : close?.status === 'changes_requested'
-              ? `${actor.name} requested changes to "${review.fileName}" version ${review.versionNumber}`
-              : `${actor.name} recorded a decision on "${review.fileName}"`,
-    })
-    .catch(() => undefined);
+  detach(
+    dispatchNotifications(
+      [
+        {
+          organizationId: actor.organizationId,
+          userId: review.requestedBy,
+          type: 'review.decided',
+          actorUserId: actor.userId,
+          actorName: actor.name,
+          entityType: 'file',
+          entityId: review.fileId,
+          entityLabel: review.fileName,
+          message:
+            close?.status === 'approved'
+              ? `${actor.name} approved "${review.fileName}" version ${review.versionNumber}`
+              : close?.status === 'rejected'
+                ? `${actor.name} rejected "${review.fileName}" version ${review.versionNumber}`
+                : close?.status === 'changes_requested'
+                  ? `${actor.name} requested changes to "${review.fileName}" version ${review.versionNumber}`
+                  : `${actor.name} recorded a decision on "${review.fileName}"`,
+        },
+      ],
+      newEventKey(`review-decided:${review.id}`),
+    ),
+    'notifications.review-decided',
+  );
 
   return toView(actor, updated, context);
 }
@@ -451,15 +496,28 @@ export async function cancelReview(
     throw new ConflictError(`This review is already ${review.status}`);
   }
 
-  await withTransaction(async (session) => {
-    await reviewRepository.cancel(reviewId, session);
-    await versionRepository.updateFlags(review.versionId, { $set: { label: 'draft' } }, session);
-    await fileRepository.updateById(
-      review.fileId,
-      { $set: { reviewStatus: 'draft', approvalStatus: 'none', updatedBy: actor.userId } },
-      session,
-    );
-  });
+  const cancelFilePatch = {
+    reviewStatus: 'draft' as const,
+    approvalStatus: 'none' as const,
+    updatedBy: actor.userId,
+  };
+  const cancelVersionPatch = { label: 'draft' as const };
+
+  if (reviewMutationEngine() === 'd1') {
+    await cancelReviewAtomically({
+      reviewId,
+      fileId: review.fileId,
+      versionId: review.versionId,
+      file: cancelFilePatch,
+      version: cancelVersionPatch,
+    });
+  } else {
+    await withTransaction(async (session) => {
+      await reviewRepository.cancel(reviewId, session);
+      await versionRepository.updateFlags(review.versionId, cancelVersionPatch, session);
+      await fileRepository.updateById(review.fileId, cancelFilePatch, session);
+    });
+  }
 
   await auditService.recordForActor(actor, meta, {
     action: 'file.review_requested',

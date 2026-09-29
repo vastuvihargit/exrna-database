@@ -31,21 +31,20 @@ export function allowedConfidentialities(actor: Actor): ConfidentialityLevel[] {
 export function resourceVisibilityFilter(actor: Actor): VisibilityFilter {
   const organizationId = toObjectId(actor.organizationId);
   const base: VisibilityFilter = { organizationId };
+  const principalIds = actorPrincipalIds(actor);
+  const denyGuard = aclDenyGuard(principalIds);
 
   if (actor.isSuperAdmin || actorHasCompanyWideRead(actor)) {
     // Company-wide readers still cannot see beyond their clearance, and `restricted`
-    // is never covered by clearance alone.
-    return { ...base, confidentiality: { $in: allowedConfidentialities(actor) } };
+    // is never covered by clearance alone. The deny guard applies to them too — see below.
+    return {
+      $and: [base, denyGuard, { confidentiality: { $in: allowedConfidentialities(actor) } }],
+    };
   }
 
   const userId = toObjectId(actor.userId);
   const departmentId = actor.departmentId ? toObjectId(actor.departmentId) : null;
   const projectIds = actor.projectIds.map(toObjectId).filter((id): id is Types.ObjectId => id !== null);
-  const roleIds = actor.grants.map((grant) => toObjectId(grant.roleId)).filter((id): id is Types.ObjectId => id !== null);
-
-  const principalIds = [userId, departmentId, ...projectIds, ...roleIds].filter(
-    (id): id is Types.ObjectId => id !== null,
-  );
 
   const clearance = allowedConfidentialities(actor);
 
@@ -53,7 +52,7 @@ export function resourceVisibilityFilter(actor: Actor): VisibilityFilter {
     // Your own content, at any classification.
     ...(userId ? [{ ownerId: userId }] : []),
     // Anything explicitly shared with you, your department, a project, or one of your roles.
-    ...(principalIds.length ? [{ 'permissions.principalId': { $in: principalIds } }] : []),
+    ...(principalIds.length ? [aclAllowBranch(principalIds)] : []),
     // Your department's content, within clearance.
     ...(departmentId ? [{ departmentId, confidentiality: { $in: clearance } }] : []),
     // Your projects' content, within clearance.
@@ -64,7 +63,191 @@ export function resourceVisibilityFilter(actor: Actor): VisibilityFilter {
   // files — expressed explicitly so the query can never degenerate into "match all".
   if (branches.length === 0) return { ...base, _id: { $in: [] } };
 
-  return { ...base, $or: branches };
+  return { $and: [base, denyGuard, { $or: branches }] };
+}
+
+/**
+ * Role-scope branches — the department, project and folder grants `roleScopeGrants()` honours.
+ *
+ * The MongoDB half of `roleScopeBranches` in `visibility.d1.ts`; the two are kept in step by
+ * the folder repository suites, which run the same scenarios against both engines.
+ */
+function roleScopeBranches(actor: Actor): VisibilityFilter[] {
+  const branches: VisibilityFilter[] = [];
+
+  const departmentScopes = grantScopeObjectIds(actor, 'department');
+  if (departmentScopes.length) branches.push({ departmentId: { $in: departmentScopes } });
+
+  const projectScopes = grantScopeObjectIds(actor, 'project');
+  if (projectScopes.length) branches.push({ projectId: { $in: projectScopes } });
+
+  const folderScopes = grantScopeObjectIds(actor, 'folder');
+  if (folderScopes.length) {
+    // The folder itself, or anything beneath it.
+    branches.push({ $or: [{ _id: { $in: folderScopes } }, { pathAncestors: { $in: folderScopes } }] });
+  }
+
+  return branches;
+}
+
+/**
+ * "May this actor be shown this **one** resource?" — the filter behind a permission-aware
+ * `findById`.
+ *
+ * Deliberately a **superset of `canAccess`'s allow set**, and deliberately different from
+ * `resourceVisibilityFilter` for that reason: a listing may be narrower than the permission
+ * layer (the cost is a row missing from a search page), but a lookup may not, because a
+ * repository returning `null` becomes a 404 on a folder the actor is entitled to open. The
+ * three cases `resourceVisibilityFilter` would wrongly hide are a role-scoped grant on another
+ * department, a folder-scoped grant, and a company-wide reader's own content classified above
+ * their clearance.
+ *
+ * What it does **not** relax is organization isolation and the live deny guard, which are
+ * AND-ed over everything, super admins included. `assertCan` still makes the real decision
+ * afterwards with the full ancestor chain; this is the half that runs inside the query, so a
+ * guessed id never loads a row.
+ *
+ * The full reasoning lives on `lookupVisibility()` in `visibility.d1.ts`.
+ */
+export function resourceLookupFilter(actor: Actor): VisibilityFilter {
+  const organizationId = toObjectId(actor.organizationId);
+  const principalIds = actorPrincipalIds(actor);
+  const denyGuard = aclDenyGuard(principalIds);
+  const clearance = allowedConfidentialities(actor);
+
+  const userId = toObjectId(actor.userId);
+  const branches: VisibilityFilter[] = [
+    ...(userId ? [{ ownerId: userId }] : []),
+    ...(principalIds.length ? [aclAllowBranch(principalIds)] : []),
+  ];
+
+  if (actor.isSuperAdmin || actorHasCompanyWideRead(actor)) {
+    branches.push({ confidentiality: { $in: clearance } });
+  } else {
+    const departmentId = actor.departmentId ? toObjectId(actor.departmentId) : null;
+    const projectIds = actor.projectIds
+      .map(toObjectId)
+      .filter((id): id is Types.ObjectId => id !== null);
+    if (departmentId) branches.push({ departmentId, confidentiality: { $in: clearance } });
+    if (projectIds.length) {
+      branches.push({ projectId: { $in: projectIds }, confidentiality: { $in: clearance } });
+    }
+  }
+
+  const scopes = roleScopeBranches(actor);
+  if (scopes.length) {
+    branches.push({ confidentiality: { $in: clearance }, $or: scopes });
+  }
+
+  // Never "match all": an actor with nothing at all gets a filter that matches nothing.
+  if (branches.length === 0) return { organizationId, _id: { $in: [] } };
+
+  return { $and: [{ organizationId }, denyGuard, { $or: branches }] };
+}
+
+/**
+ * The part of a lookup predicate MongoDB can express **without** joining to ancestors.
+ *
+ * ── Why this exists, and why it is not `resourceLookupFilter` ───────────────────────────
+ *
+ * A lookup predicate has one hard requirement: it must be a **superset of `canAccess`'s allow
+ * set**. If it is narrower, the repository returns `null`, the service turns that into a 404,
+ * and a user is refused something they are entitled to open.
+ *
+ * `resourceLookupFilter` fails that requirement for any resource whose access is *inherited*.
+ * Its ACL branch matches `permissions` on the document itself, and an inherited grant is not
+ * there — it is on an ancestor folder. Sharing a folder and then opening a file inside it is
+ * the single most common way access is granted in this application, so applying that filter to
+ * a file lookup 404s the ordinary case.
+ *
+ * D1 has no such problem: `file_folder_ancestors` makes "does any in-scope ancestor grant this
+ * actor?" a correlated sub-query, which is exactly what `lookupVisibility()` in
+ * `visibility.d1.ts` does. MongoDB cannot express that in a `find` filter, and resolving it
+ * would mean a second query returning every folder id that grants the actor — unbounded, and
+ * on the hot path of every file open.
+ *
+ * So the MongoDB lookup applies the two guards that **are** implied by `canAccess` allowing the
+ * row, and leaves the rest to `assertCan`, which walks the full ancestor chain immediately
+ * afterwards and makes the actual decision:
+ *
+ *   • **organization isolation** — `canAccess` refuses a foreign tenant outright;
+ *   • **the live deny guard** — `canAccess` refuses on a live denial naming the actor.
+ *
+ * Both are strictly weaker than `canAccess`, so this cannot 404 anything legitimate; and both
+ * remove the cases that matter most for a guessed id — another tenant's file, and a file the
+ * actor was specifically blocked from. It is a real tightening over the old `findOne({_id})`,
+ * which applied neither, without claiming a guarantee this database can honour in one query.
+ */
+export function lookupGuardFilter(actor: Actor): VisibilityFilter {
+  const organizationId = toObjectId(actor.organizationId);
+  const principalIds = actorPrincipalIds(actor);
+  return { $and: [{ organizationId }, aclDenyGuard(principalIds)] };
+}
+
+/**
+ * Entries that are live *and* name this actor.
+ *
+ * `aclGrants()` in `authorize.ts` skips an expired entry before it looks at anything else
+ * (`if (entry.expiresAt && entry.expiresAt.getTime() <= now) continue`). These fragments
+ * reproduce that, so an expired grant confers no visibility and an expired **deny** blocks
+ * nothing — capability and visibility agree on when an entry stops existing.
+ */
+function livePredicate(): VisibilityFilter {
+  return { $or: [{ expiresAt: null }, { expiresAt: { $gt: new Date() } }] };
+}
+
+function aclAllowBranch(principalIds: Types.ObjectId[]): VisibilityFilter {
+  return {
+    permissions: {
+      $elemMatch: {
+        principalId: { $in: principalIds },
+        deny: { $ne: true },
+        ...livePredicate(),
+      },
+    },
+  };
+}
+
+/**
+ * "No live deny naming this actor."
+ *
+ * ── Security correction, Phase 3 module 4 ───────────────────────────────────────────────
+ *
+ * Until this change `resourceVisibilityFilter` had **no deny guard at all**, and its ACL
+ * branch matched `permissions.principalId` without looking at `deny` or `expiresAt`. Two
+ * consequences, both live in production:
+ *
+ *   • a resource carrying an explicit **denial** naming the actor was *more* visible to them
+ *     than to somebody with no entry at all — the deny matched the branch and granted
+ *     visibility;
+ *   • an **expired** share kept granting visibility indefinitely.
+ *
+ * `canAccess` still refused the action, so this never let anyone open a file. It did let a
+ * restricted filename, its folder path and its existence appear in a search listing and in the
+ * result count — which for research data is the disclosure that matters.
+ *
+ * The earlier plan was to reproduce this in D1 so the Phase 6 comparison would agree. That was
+ * the wrong call and has been reversed: a migration is not a reason to carry a confidentiality
+ * leak forward. Both engines now implement the corrected rule, Phase 6 compares against the
+ * corrected behaviour, and the Mongo tests were updated in the same commit.
+ *
+ * Applied to super admins and company-wide readers as well, because `canAccess` step 4 (deny)
+ * precedes step 5 (super admin): deny beats everything, and visibility must not be laxer than
+ * capability.
+ */
+function aclDenyGuard(principalIds: Types.ObjectId[]): VisibilityFilter {
+  if (principalIds.length === 0) return {};
+  return {
+    permissions: {
+      $not: {
+        $elemMatch: {
+          principalId: { $in: principalIds },
+          deny: true,
+          ...livePredicate(),
+        },
+      },
+    },
+  };
 }
 
 /**
@@ -84,10 +267,9 @@ export function resourceVisibilityFilter(actor: Actor): VisibilityFilter {
 export function childVisibilityFilter(actor: Actor): VisibilityFilter {
   const principalIds = actorPrincipalIds(actor);
 
-  const denyGuard: VisibilityFilter =
-    principalIds.length > 0
-      ? { permissions: { $not: { $elemMatch: { principalId: { $in: principalIds }, deny: true } } } }
-      : {};
+  // Shared with `resourceVisibilityFilter` so the two cannot drift. Now also expiry-aware:
+  // an expired deny blocks nothing, matching `aclGrants()`.
+  const denyGuard = aclDenyGuard(principalIds);
 
   const clearance = allowedConfidentialities(actor);
 
@@ -107,7 +289,8 @@ export function childVisibilityFilter(actor: Actor): VisibilityFilter {
     // Owner and direct grantee are not subject to the clearance gate — they were given
     // the resource explicitly (docs/phase-0/05, resolution steps 6–8).
     ...(userId ? [{ ownerId: userId }] : []),
-    ...(principalIds.length ? [{ 'permissions.principalId': { $in: principalIds } }] : []),
+    // Expiry-aware from Phase 3 module 4: an expired share used to keep granting visibility.
+    ...(principalIds.length ? [aclAllowBranch(principalIds)] : []),
     { confidentiality: { $in: clearance }, $or: scopeBranches },
   ];
 
@@ -124,7 +307,10 @@ function actorPrincipalIds(actor: Actor): Types.ObjectId[] {
   return ids.filter((id): id is Types.ObjectId => id !== null);
 }
 
-function grantScopeObjectIds(actor: Actor, scopeType: 'department' | 'project'): Types.ObjectId[] {
+function grantScopeObjectIds(
+  actor: Actor,
+  scopeType: 'department' | 'project' | 'folder',
+): Types.ObjectId[] {
   return actor.grants
     .filter((grant) => grant.scopeType === scopeType && grant.scopeId)
     .map((grant) => toObjectId(grant.scopeId as string))
@@ -135,13 +321,26 @@ function grantScopeObjectIds(actor: Actor, scopeType: 'department' | 'project'):
  * Directory visibility. Every active employee may see the internal directory (names,
  * emails, departments) — status and quota fields are stripped by the DTO unless the
  * viewer holds `user.manage`.
+ *
+ * ── Database-neutral, unlike the filters above ──────────────────────────────────────────
+ *
+ * These two return a plain tenant scope rather than a MongoDB filter fragment, because the
+ * user and department repositories moved to D1 in Phase 3 and a `Types.ObjectId` means nothing
+ * to a SQL query. The module's guarantee is unchanged and arguably stronger: `organizationId`
+ * is a *required, named* field on `ListUsersCriteria` and `ListDepartmentsCriteria`, so a
+ * listing that omits the tenant predicate no longer type-checks — where previously it would
+ * merely have been an empty filter object nobody noticed.
+ *
+ * `resourceVisibilityFilter` and the rest stay MongoDB-shaped until their own modules move
+ * (folders and files, Phase 3 module 4). Converting them now would change queries that nothing
+ * in this phase tests.
  */
-export function userDirectoryFilter(actor: Actor): VisibilityFilter {
-  return { organizationId: toObjectId(actor.organizationId) };
+export function userDirectoryFilter(actor: Actor): { organizationId: string } {
+  return { organizationId: actor.organizationId };
 }
 
-export function departmentVisibilityFilter(actor: Actor): VisibilityFilter {
-  return { organizationId: toObjectId(actor.organizationId) };
+export function departmentVisibilityFilter(actor: Actor): { organizationId: string } {
+  return { organizationId: actor.organizationId };
 }
 
 /**

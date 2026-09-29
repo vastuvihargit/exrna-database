@@ -1,5 +1,13 @@
-name: Deploy
+name: Deploy (legacy Node + MongoDB)
 
+# ── What this deploys ────────────────────────────────────────────────────────────────────
+#
+# The CURRENT production stack: the Docker/SSH Node deployment on MongoDB and local storage.
+# It stays the production path until the Cloudflare cutover (docs/cloudflare-migration/
+# CUTOVER-RUNBOOK.md), and after it the rollback target (ROLLBACK-RUNBOOK.md). It is NOT the
+# Cloudflare deployment path. That one is `deploy-cloudflare.yml` for staging, and a manual,
+# runbook-driven step for production.
+#
 # Manual, with the environment named explicitly. Deploying research infrastructure is a
 # decision somebody makes, not a side effect of merging — and staging and production
 # hold different databases and different storage volumes, so choosing one is the point.

@@ -21,7 +21,6 @@
 import { enforce, RATE_LIMITS } from '@/server/auth/rate-limit';
 import type { Actor } from '@/server/permissions/actor';
 import { can } from '@/server/permissions/authorize';
-import { resourceVisibilityFilter } from '@/server/permissions/visibility';
 import * as fileRepository from '@/server/repositories/file.repository';
 import * as folderRepository from '@/server/repositories/folder.repository';
 import * as starRepository from '@/server/repositories/star.repository';
@@ -46,9 +45,7 @@ export async function search(actor: Actor, query: SearchQuery): Promise<SearchRe
   // Text-index scans filtered by permission are the most expensive read in the system,
   // and a scripted search loop is also how somebody probes for filenames they cannot
   // open. The limit is well above any human search rate.
-  enforce(`search:${actor.userId}`, RATE_LIMITS.search);
-
-  const visibility = resourceVisibilityFilter(actor);
+  await enforce(`search:${actor.userId}`, RATE_LIMITS.search);
 
   const metadata: Record<string, string> = {};
   for (const key of METADATA_QUERY_KEYS) {
@@ -88,8 +85,7 @@ export async function search(actor: Actor, query: SearchQuery): Promise<SearchRe
   const [fileHits, folderHits] = await Promise.all([
     wantFiles
       ? fileRepository.search({
-          visibility,
-          organizationId: actor.organizationId,
+          actor,
           ...(query.q ? { text: query.q } : {}),
           ...(query.folderId ? { folderId: query.folderId } : {}),
           ...(query.underFolderId ? { underFolderId: query.underFolderId } : {}),
@@ -120,8 +116,7 @@ export async function search(actor: Actor, query: SearchQuery): Promise<SearchRe
     // by file-specific criteria — a folder has no extension or review status.
     wantFolders && !query.category && !query.extension && !query.reviewStatus && !query.approvalStatus
       ? folderRepository.search({
-          visibility,
-          organizationId: actor.organizationId,
+          actor,
           ...(query.q ? { text: query.q } : {}),
           ...(query.departmentId ? { departmentId: query.departmentId } : {}),
           ...(query.projectId ? { projectId: query.projectId } : {}),
@@ -173,7 +168,7 @@ export async function search(actor: Actor, query: SearchQuery): Promise<SearchRe
 
 /** Facet counts for the filter chips, computed over what this actor can see. */
 export async function facets(actor: Actor) {
-  return fileRepository.searchFacets(resourceVisibilityFilter(actor), actor.organizationId);
+  return fileRepository.searchFacets(actor);
 }
 
 export const searchService = { search, facets };

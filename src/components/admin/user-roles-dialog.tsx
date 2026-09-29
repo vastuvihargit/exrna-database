@@ -183,9 +183,16 @@ export function UserRolesDialog({
               </div>
             ) : null}
 
+            {/*
+              Says what the administrator can do about it, rather than naming an internal build
+              phase. The previous text ended "(Phase 3)", which meant something to the team and
+              nothing to the person reading the dialog — who wants to know whether they are
+              blocked or have misconfigured something.
+            */}
             {needsScopeId && scopeType !== 'department' ? (
               <p className="text-xs text-muted-foreground">
-                {scopeType} scopes become selectable once {scopeType}s exist (Phase 3).
+                No {scopeType}s have been created yet, so there is nothing to scope this role to.
+                Create one first, then grant the role.
               </p>
             ) : null}
 

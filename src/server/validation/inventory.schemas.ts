@@ -76,6 +76,108 @@ export const updateInventoryItemSchema = z
   .strict()
   .refine((value) => Object.keys(value).length > 0, 'Nothing to update');
 
+/* ------------------------------------------------------------------ stock movement */
+
+/**
+ * A date the client supplies for a movement.
+ *
+ * Accepts an ISO string and refuses anything unparseable, rather than letting `new Date()`
+ * produce an Invalid Date that would be stored as `null` and silently lose the backdating.
+ */
+const movementDateSchema = z
+  .string()
+  .datetime({ offset: true })
+  .or(z.string().date())
+  .transform((value) => new Date(value))
+  .refine((value) => !Number.isNaN(value.getTime()), 'Enter a valid date');
+
+const batchNumberSchema = z.string().trim().min(1).max(80);
+
+export const receiveStockSchema = z
+  .object({
+    quantity: positiveQuantitySchema,
+    batchNumber: batchNumberSchema,
+    expiryDate: movementDateSchema.nullish(),
+    supplier: shortText(200).optional(),
+    storageLocation: shortText(120).optional(),
+    purpose: shortText(500).optional(),
+    notes: shortText(2000).optional(),
+    performedAt: movementDateSchema.optional(),
+  })
+  .strict();
+
+/**
+ * `issuedToType` names which of the four links is the *reason* for the issue.
+ *
+ * All four may be present — stock issued to an employee for an experiment on a project is one
+ * movement, not three — but the declared type must be populated, which the service checks
+ * because only it can resolve the ids. Validating it here as well would mean two places that
+ * can disagree about what "issued to a project" means.
+ */
+export const issueStockSchema = z
+  .object({
+    quantity: positiveQuantitySchema,
+    issuedToType: z.enum(['employee', 'department', 'project', 'experiment']),
+    issuedToUserId: objectIdSchema.optional(),
+    issuedToDepartmentId: objectIdSchema.optional(),
+    projectId: objectIdSchema.optional(),
+    experimentId: objectIdSchema.optional(),
+    purpose: shortText(500).optional(),
+    notes: shortText(2000).optional(),
+    performedAt: movementDateSchema.optional(),
+  })
+  .strict();
+
+/**
+ * `delta` is signed and `reason` is mandatory.
+ *
+ * An adjustment is the only movement with no physical event behind it, so the reason is the
+ * only thing that makes the row auditable at all. `.min(3)` rather than `.min(1)`: a single
+ * character satisfies a required field and explains nothing.
+ */
+export const adjustStockSchema = z
+  .object({
+    batchNumber: batchNumberSchema,
+    delta: z
+      .number()
+      .finite()
+      .refine((value) => value !== 0, 'Enter an adjustment other than zero')
+      .refine((value) => Math.abs(value) <= 1_000_000_000, 'That adjustment is too large')
+      .refine(
+        (value) => Number.isInteger(Math.round(value * 1000)),
+        'Use at most three decimal places',
+      ),
+    reason: z.string().trim().min(3).max(500),
+    expiryDate: movementDateSchema.nullish(),
+    notes: shortText(2000).optional(),
+    performedAt: movementDateSchema.optional(),
+  })
+  .strict();
+
+/**
+ * The envelope the stock route parses first.
+ *
+ * `payload` is `unknown` here and re-parsed against the action's own schema in the route. The
+ * alternative — a `z.discriminatedUnion` over three fully-specified bodies — reports every
+ * failure as "no matching discriminator" when the action is right and one field inside is
+ * wrong, which is the case a user actually hits.
+ */
+export const stockMovementSchema = z.object({
+  action: z.enum(['add', 'issue', 'adjust']),
+  payload: z.unknown(),
+});
+
+export const listStockHistorySchema = paginationSchema.extend({
+  itemId: objectIdSchema.optional(),
+  action: z.enum(['added', 'issued', 'returned', 'adjusted', 'expired']).optional(),
+  projectId: objectIdSchema.optional(),
+  experimentId: objectIdSchema.optional(),
+  issuedToUserId: objectIdSchema.optional(),
+  performedBy: objectIdSchema.optional(),
+  from: movementDateSchema.optional(),
+  to: movementDateSchema.optional(),
+});
+
 export const listInventoryItemsSchema = paginationSchema.extend({
   q: z.string().trim().min(1).max(80).optional(),
   category: z.enum(INVENTORY_CATEGORIES).optional(),

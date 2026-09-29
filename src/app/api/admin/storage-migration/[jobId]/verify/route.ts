@@ -1,4 +1,4 @@
-import { withAuthenticatedRoute } from '@/server/http/authenticated-route';
+import { NODE_ONLY_FEATURES, withNodeOnlyRoute } from '@/server/http/node-only';
 import { ok } from '@/server/http/api-response';
 import { assertCompanyPermission } from '@/server/permissions/authorize';
 import { storageMigrationService } from '@/server/services/storage-migration.service';
@@ -15,7 +15,7 @@ export const maxDuration = 300;
  * authorising any local deletion, which is the point at which being wrong stops being
  * recoverable.
  */
-export const POST = withAuthenticatedRoute<{ jobId: string }>(
+export const POST = withNodeOnlyRoute<{ jobId: string }>(NODE_ONLY_FEATURES.storageMigration,
   async (_request, { actor, params, meta }) => {
     assertCompanyPermission(actor, 'access.manage');
     const jobId = objectIdSchema.parse(params.jobId);

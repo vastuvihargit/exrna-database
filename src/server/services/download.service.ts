@@ -31,6 +31,7 @@ import { contentDisposition } from '@/server/storage/path-safety';
 import type { RequestMeta } from '@/server/http/request-meta';
 import { requireFile } from './file-access';
 import { openStoredContent } from './stored-content';
+import { detach } from '@/server/runtime/detach';
 
 /** What the route needs to build a response, and nothing more. */
 export interface FileStream {
@@ -85,7 +86,7 @@ export async function download(
 
   // Counted once per request, including ranged ones: a resumed download is still one
   // download, and the audit trail is what makes "who took this data" answerable.
-  await fileRepository.updateById(fileId, { $inc: { downloadCount: 1 } });
+  await fileRepository.updateById(fileId, { downloadCountDelta: 1 });
 
   await auditService.recordForActor(actor, meta, {
     action: 'file.download',
@@ -136,20 +137,22 @@ export async function preview(
   });
 
   void touchRecent(actor, fileId, 'previewed');
-  void activityRepository
-    .append({
-      organizationId: actor.organizationId,
-      actorUserId: actor.userId,
-      actorName: actor.name,
-      action: 'file.preview',
-      entityType: 'file',
-      entityId: fileId,
-      entityLabel: context.file.displayName,
-      contextFolderIds: context.file.folderPathAncestors,
-      departmentId: context.file.departmentId,
-      projectId: context.file.projectId,
-    })
-    .catch(() => undefined);
+  detach(
+    activityRepository
+      .append({
+        organizationId: actor.organizationId,
+        actorUserId: actor.userId,
+        actorName: actor.name,
+        action: 'file.preview',
+        entityType: 'file',
+        entityId: fileId,
+        entityLabel: context.file.displayName,
+        contextFolderIds: context.file.folderPathAncestors,
+        departmentId: context.file.departmentId,
+        projectId: context.file.projectId,
+      }),
+    'activity.append',
+  );
 
   return stream;
 }
@@ -214,21 +217,23 @@ export async function openInGoogleEditor(
   });
 
   void touchRecent(actor, fileId, 'previewed');
-  void activityRepository
-    .append({
-      organizationId: actor.organizationId,
-      actorUserId: actor.userId,
-      actorName: actor.name,
-      action: 'file.preview',
-      entityType: 'file',
-      entityId: fileId,
-      entityLabel: context.file.displayName,
-      detail: 'opened in the Google editor',
-      contextFolderIds: context.file.folderPathAncestors,
-      departmentId: context.file.departmentId,
-      projectId: context.file.projectId,
-    })
-    .catch(() => undefined);
+  detach(
+    activityRepository
+      .append({
+        organizationId: actor.organizationId,
+        actorUserId: actor.userId,
+        actorName: actor.name,
+        action: 'file.preview',
+        entityType: 'file',
+        entityId: fileId,
+        entityLabel: context.file.displayName,
+        detail: 'opened in the Google editor',
+        contextFolderIds: context.file.folderPathAncestors,
+        departmentId: context.file.departmentId,
+        projectId: context.file.projectId,
+      }),
+    'activity.append',
+  );
 
   return { url: location.webViewLink, versionId: version.id, versionNumber: version.versionNumber };
 }

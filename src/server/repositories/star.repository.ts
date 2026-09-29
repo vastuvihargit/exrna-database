@@ -1,92 +1,59 @@
-import { Types } from 'mongoose';
-import { connectToDatabase } from '@/server/db/connection';
-import { StarModel, type StarrableType } from '@/server/db/models';
-
-function oid(value: string): Types.ObjectId {
-  return new Types.ObjectId(value);
-}
-
-export interface StarRef {
-  entityType: StarrableType;
-  entityId: string;
-  createdAt: Date;
-}
-
-/** Idempotent: starring an already-starred item is a no-op, not a duplicate row. */
-export async function add(input: {
-  userId: string;
-  organizationId: string;
-  entityType: StarrableType;
-  entityId: string;
-}): Promise<void> {
-  await connectToDatabase();
-  await StarModel.updateOne(
-    { userId: oid(input.userId), entityType: input.entityType, entityId: oid(input.entityId) },
-    { $setOnInsert: { organizationId: oid(input.organizationId), createdAt: new Date() } },
-    { upsert: true },
-  ).exec();
-}
-
-export async function remove(input: {
-  userId: string;
-  entityType: StarrableType;
-  entityId: string;
-}): Promise<void> {
-  await connectToDatabase();
-  await StarModel.deleteOne({
-    userId: oid(input.userId),
-    entityType: input.entityType,
-    entityId: oid(input.entityId),
-  }).exec();
-}
-
 /**
- * Which of these ids the viewer has starred.
+ * Star repository — a façade over the MongoDB and D1 implementations.
  *
- * Returned as a Set so a listing can annotate hundreds of rows without a query each.
+ * Routed by `DATA_SOURCE_SEARCH`, together with recent items and saved searches. The three are
+ * one module because they are the *lifecycle read paths* — Starred, Recent and the saved-search
+ * sidebar — and because splitting them buys nothing: none of them can be moved usefully on its
+ * own, and three flags would be three ways to end up half-migrated.
+ *
+ * Note what is deliberately *not* behind this flag: which files a Starred page actually shows.
+ * That comes from `DATA_SOURCE_FILES` and `DATA_SOURCE_FOLDERS`, because this repository only
+ * ever returns ids and the file and folder repositories decide what the actor may see. A star
+ * stored in D1 pointing at a file still on Mongo resolves correctly, which is what makes the
+ * flag safe to move on its own.
  */
-export async function starredIdsAmong(
+import { isD1 } from './data-source';
+import { mongoStarRepository } from './star.repository.mongo';
+import { d1StarRepository } from './star.repository.d1';
+import type {
+  AddStarInput,
+  RemoveStarInput,
+  StarRef,
+  StarRepository,
+  StarrableType,
+} from './star.repository.contract';
+
+export type { AddStarInput, RemoveStarInput, StarRef, StarRepository, StarrableType };
+
+export { mongoStarRepository, d1StarRepository };
+
+function active(): StarRepository {
+  return isD1('search') ? d1StarRepository : mongoStarRepository;
+}
+
+export function add(input: AddStarInput): Promise<void> {
+  return active().add(input);
+}
+
+export function remove(input: RemoveStarInput): Promise<void> {
+  return active().remove(input);
+}
+
+export function starredIdsAmong(
   userId: string,
   entityType: StarrableType,
   entityIds: string[],
 ): Promise<Set<string>> {
-  if (entityIds.length === 0) return new Set();
-  await connectToDatabase();
-  const docs = await StarModel.find({
-    userId: oid(userId),
-    entityType,
-    entityId: { $in: entityIds.map(oid) },
-  })
-    .select({ entityId: 1 })
-    .lean<Array<{ entityId: Types.ObjectId }>>()
-    .exec();
-  return new Set(docs.map((doc) => String(doc.entityId)));
+  return active().starredIdsAmong(userId, entityType, entityIds);
 }
 
-export async function listForUser(
+export function listForUser(
   userId: string,
   options: { entityType?: StarrableType; limit?: number } = {},
 ): Promise<StarRef[]> {
-  await connectToDatabase();
-  const filter: Record<string, unknown> = { userId: oid(userId) };
-  if (options.entityType) filter.entityType = options.entityType;
-
-  const docs = await StarModel.find(filter)
-    .sort({ createdAt: -1 })
-    .limit(options.limit ?? 200)
-    .lean<Array<{ entityType: StarrableType; entityId: Types.ObjectId; createdAt: Date }>>()
-    .exec();
-
-  return docs.map((doc) => ({
-    entityType: doc.entityType,
-    entityId: String(doc.entityId),
-    createdAt: doc.createdAt,
-  }));
+  return active().listForUser(userId, options);
 }
 
-/** Called when an item is purged, so stars do not point at nothing. */
-export async function removeAllFor(entityType: StarrableType, entityIds: string[]): Promise<void> {
-  if (entityIds.length === 0) return;
-  await connectToDatabase();
-  await StarModel.deleteMany({ entityType, entityId: { $in: entityIds.map(oid) } }).exec();
+export function removeAllFor(entityType: StarrableType, entityIds: string[]): Promise<void> {
+  return active().removeAllFor(entityType, entityIds);
 }

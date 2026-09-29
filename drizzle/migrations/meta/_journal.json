@@ -1,0 +1,48 @@
+{
+  "version": "7",
+  "dialect": "sqlite",
+  "entries": [
+    {
+      "idx": 0,
+      "version": "6",
+      "when": 1785925421845,
+      "tag": "0000_initial_schema",
+      "breakpoints": true
+    },
+    {
+      "idx": 1,
+      "version": "6",
+      "when": 1785925421846,
+      "tag": "0001_fts_triggers_and_seed",
+      "breakpoints": true
+    },
+    {
+      "idx": 2,
+      "version": "6",
+      "when": 1785996132007,
+      "tag": "0002_fix_user_roles_active_uniqueness",
+      "breakpoints": true
+    },
+    {
+      "idx": 3,
+      "version": "6",
+      "when": 1785996132008,
+      "tag": "0003_user_roles_scope_invariant",
+      "breakpoints": true
+    },
+    {
+      "idx": 4,
+      "version": "6",
+      "when": 1786000000000,
+      "tag": "0004_notification_dedupe_key",
+      "breakpoints": true
+    },
+    {
+      "idx": 5,
+      "version": "6",
+      "when": 1786534169000,
+      "tag": "0005_upload_session_external_staging",
+      "breakpoints": true
+    }
+  ]
+}

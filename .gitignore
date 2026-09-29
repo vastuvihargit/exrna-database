@@ -21,6 +21,17 @@ next-env.d.ts
 .env.*
 !.env.example
 
+# Cloudflare Worker secrets for local dev — same contents as the production secret store
+.dev.vars
+.dev.vars.*
+!.dev.vars.example
+
+# Cloudflare build output and local state (.wrangler holds the local D1 SQLite file,
+# which is application data and must never enter version control)
+/.open-next/
+/.wrangler/
+worker-configuration.d.ts
+
 # curl cookie jars — these hold live bd_session tokens from local smoke runs
 cookies.txt
 *-cookies.txt
@@ -49,3 +60,10 @@ Thumbs.db
 *.pem
 .tsbuildinfo
 *.tsbuildinfo
+
+# Mongo → D1 migration reports (source ids and failure payloads)
+/migration-reports/
+
+# Playwright
+/test-results/
+/playwright-report/

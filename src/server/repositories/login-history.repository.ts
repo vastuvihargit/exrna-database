@@ -1,96 +1,51 @@
-import { Types } from 'mongoose';
-import { connectToDatabase } from '@/server/db/connection';
-import { LoginHistoryModel, type LoginHistoryDocument, type LoginOutcome } from '@/server/db/models';
+/**
+ * Login history — a façade over the MongoDB and D1 implementations.
+ *
+ * Routed by `DATA_SOURCE_LOGIN_HISTORY`.
+ *
+ * On the login path in both directions: `auth.service.ts` writes a row for every attempt, and
+ * the admin security view reads them. `record()` never throws on either engine — see the
+ * contract for why that is correct here and nowhere else.
+ */
+import { isD1 } from './data-source';
+import { mongoLoginHistoryRepository } from './login-history.repository.mongo';
+import { d1LoginHistoryRepository } from './login-history.repository.d1';
+import type {
+  AdminLoginHistoryQuery,
+  LoginAttemptInput,
+  LoginHistoryRecord,
+  LoginHistoryRepository,
+  LoginOutcome,
+} from './login-history.repository.contract';
 
-export interface LoginAttemptInput {
-  userId?: string | null;
-  email: string;
-  outcome: LoginOutcome;
-  provider?: string;
-  ip?: string;
-  userAgent?: string;
-  sessionId?: string | null;
-  detail?: string | null;
+export type {
+  AdminLoginHistoryQuery,
+  LoginAttemptInput,
+  LoginHistoryRecord,
+  LoginHistoryRepository,
+  LoginOutcome,
+};
+
+export { mongoLoginHistoryRepository, d1LoginHistoryRepository };
+
+function active(): LoginHistoryRepository {
+  return isD1('loginHistory') ? d1LoginHistoryRepository : mongoLoginHistoryRepository;
 }
 
-export interface LoginHistoryRecord {
-  id: string;
-  userId: string | null;
-  email: string;
-  outcome: LoginOutcome;
-  provider: string;
-  ip: string;
-  userAgent: string;
-  detail: string | null;
-  createdAt: Date;
+export function record(input: LoginAttemptInput): Promise<void> {
+  return active().record(input);
 }
 
-type LeanLogin = LoginHistoryDocument & { _id: Types.ObjectId; createdAt: Date };
-
-function toRecord(doc: LeanLogin): LoginHistoryRecord {
-  return {
-    id: String(doc._id),
-    userId: doc.userId ? String(doc.userId) : null,
-    email: doc.email,
-    outcome: doc.outcome as LoginOutcome,
-    provider: doc.provider,
-    ip: doc.ip,
-    userAgent: doc.userAgent,
-    detail: doc.detail ?? null,
-    createdAt: doc.createdAt,
-  };
+export function listForUser(userId: string, limit = 50): Promise<LoginHistoryRecord[]> {
+  return active().listForUser(userId, limit);
 }
 
-export async function record(input: LoginAttemptInput): Promise<void> {
-  await connectToDatabase();
-  await LoginHistoryModel.create({
-    userId: input.userId && Types.ObjectId.isValid(input.userId) ? new Types.ObjectId(input.userId) : null,
-    email: input.email.toLowerCase(),
-    outcome: input.outcome,
-    provider: input.provider ?? 'password',
-    ip: input.ip ?? 'unknown',
-    userAgent: input.userAgent ?? 'unknown',
-    sessionId: input.sessionId && Types.ObjectId.isValid(input.sessionId) ? new Types.ObjectId(input.sessionId) : null,
-    detail: input.detail ?? null,
-  });
-}
-
-export async function listForUser(userId: string, limit = 50): Promise<LoginHistoryRecord[]> {
-  if (!Types.ObjectId.isValid(userId)) return [];
-  await connectToDatabase();
-  const docs = await LoginHistoryModel.find({ userId: new Types.ObjectId(userId) })
-    .sort({ createdAt: -1 })
-    .limit(Math.min(limit, 200))
-    .lean<LeanLogin[]>()
-    .exec();
-  return docs.map(toRecord);
-}
-
-export interface AdminLoginHistoryQuery {
-  email?: string;
-  outcome?: LoginOutcome;
-  page: number;
-  pageSize: number;
-}
-
-export async function query(
+export function query(
   options: AdminLoginHistoryQuery,
 ): Promise<{ items: LoginHistoryRecord[]; total: number }> {
-  await connectToDatabase();
+  return active().query(options);
+}
 
-  const filter: Record<string, unknown> = {};
-  if (options.email) filter.email = options.email.toLowerCase();
-  if (options.outcome) filter.outcome = options.outcome;
-
-  const [docs, total] = await Promise.all([
-    LoginHistoryModel.find(filter)
-      .sort({ createdAt: -1 })
-      .skip((options.page - 1) * options.pageSize)
-      .limit(options.pageSize)
-      .lean<LeanLogin[]>()
-      .exec(),
-    LoginHistoryModel.countDocuments(filter).exec(),
-  ]);
-
-  return { items: docs.map(toRecord), total };
+export function deleteOlderThan(cutoff: Date): Promise<number> {
+  return active().deleteOlderThan(cutoff);
 }

@@ -90,7 +90,7 @@ export async function update(
 
   if (input.headUserId) await assertMember(actor, input.headUserId);
 
-  const update: Record<string, unknown> = {};
+  const update: departmentRepository.DepartmentPatch = {};
   if (input.name !== undefined) update.name = input.name.trim();
   if (input.description !== undefined) update.description = input.description;
   if (input.headUserId !== undefined) update.headUserId = input.headUserId;
@@ -99,7 +99,7 @@ export async function update(
 
   if (Object.keys(update).length === 0) return department;
 
-  const updated = await departmentRepository.updateById(id, { $set: update });
+  const updated = await departmentRepository.updateById(id, update);
   if (!updated) throw new NotFoundError();
 
   await auditService.recordForActor(actor, meta, {
@@ -128,7 +128,8 @@ export async function remove(actor: Actor, id: string, reason: string, meta: Req
 
   // Deleting a department that still owns employees would orphan their access scope.
   const members = await userRepository.list({
-    filter: { organizationId: actor.organizationId, departmentId: id },
+    organizationId: actor.organizationId,
+    departmentId: id,
     page: 1,
     pageSize: 1,
   });

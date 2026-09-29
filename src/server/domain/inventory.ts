@@ -171,6 +171,96 @@ export function summarizeBatches(batches: readonly BatchLike[]): BatchSummary {
   };
 }
 
+/* ------------------------------------------------------------------ issuing */
+
+export interface IssuePlanEntry {
+  batchNumber: string;
+  quantity: number;
+  expiryDate: Date | null;
+}
+
+export interface IssuePlan {
+  entries: IssuePlanEntry[];
+  /** The total across issuable batches, which is what a shortfall message must quote. */
+  issuableQuantity: number;
+  /** True when `entries` covers the whole request. */
+  satisfied: boolean;
+}
+
+/**
+ * Decides which batches an issue draws from, and how much from each.
+ *
+ * Lives here rather than in either repository because **both engines must make exactly the same
+ * choice**. If MongoDB drew from the oldest batch and D1 from the largest, the same request
+ * would produce two different ledgers, and the migration comparison in Phase 9 would report a
+ * mismatch that was not a data error.
+ *
+ * ── First expiry first out ──────────────────────────────────────────────────────────────
+ *
+ * The order is the one a store manager would use by hand: consume what is closest to expiring,
+ * so the stock that was about to be wasted is the stock that gets used. Batches with no expiry
+ * date sort last — an undated batch keeps indefinitely, so there is never a reason to reach for
+ * it ahead of one with a deadline. `receivedAt` breaks ties, oldest first.
+ *
+ * ── Expired batches are skipped, and that is deliberate ─────────────────────────────────
+ *
+ * They are not silently consumed *and* not silently ignored. They contribute nothing to
+ * `issuableQuantity`, so an item holding 10 L of which 8 L expired reports 2 L available to
+ * issue and the caller is refused a 5 L request against a stock figure of 10. That refusal is
+ * the point: the alternative is somebody running an assay with reagent that expired last month.
+ *
+ * The expired material stays on the books until it is written off, so `availableQuantity` still
+ * reads 10 and the discrepancy is visible rather than quietly reconciled.
+ */
+export function planIssue(
+  batches: readonly (BatchLike & { receivedAt?: Date })[],
+  requested: number,
+  now: Date,
+): IssuePlan {
+  const issuable = batches
+    .filter((batch) => isBatchIssuable(batch, now))
+    .sort(compareForIssue);
+
+  const issuableQuantity = issuable.reduce((total, batch) => total + batch.quantity, 0);
+
+  const entries: IssuePlanEntry[] = [];
+  let remaining = requested;
+
+  for (const batch of issuable) {
+    if (remaining <= 0) break;
+    const take = Math.min(remaining, batch.quantity);
+    entries.push({
+      batchNumber: batch.batchNumber,
+      quantity: take,
+      expiryDate: batch.expiryDate,
+    });
+    remaining -= take;
+  }
+
+  return { entries, issuableQuantity, satisfied: remaining <= 0 };
+}
+
+function compareForIssue(
+  a: BatchLike & { receivedAt?: Date },
+  b: BatchLike & { receivedAt?: Date },
+): number {
+  // An undated batch sorts after every dated one, whichever side it appears on.
+  if (a.expiryDate && b.expiryDate) {
+    const difference = a.expiryDate.getTime() - b.expiryDate.getTime();
+    if (difference !== 0) return difference;
+  } else if (a.expiryDate) {
+    return -1;
+  } else if (b.expiryDate) {
+    return 1;
+  }
+
+  const received = (a.receivedAt?.getTime() ?? 0) - (b.receivedAt?.getTime() ?? 0);
+  if (received !== 0) return received;
+
+  // A total order, so the plan is reproducible across engines and across runs.
+  return a.batchNumber.localeCompare(b.batchNumber);
+}
+
 export const CATEGORY_LABELS: Record<InventoryCategory, string> = {
   chemical: 'Chemicals',
   reagent: 'Reagents',

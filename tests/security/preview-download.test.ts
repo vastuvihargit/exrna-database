@@ -66,7 +66,7 @@ async function uploadInto(
     { folderId, filename, size: content.byteLength },
     TEST_META,
   );
-  await uploadService.receiveStream(actor, ticket.sessionId, Readable.from(content));
+  await uploadService.receiveStream(actor, ticket.sessionId, Readable.from(content), TEST_META);
   const result = await uploadService.finalize(actor, ticket.sessionId, TEST_META);
   return { fileId: result.fileId, versionId: result.versionId };
 }
@@ -189,7 +189,7 @@ describe('download', () => {
       },
       TEST_META,
     );
-    await uploadService.receiveStream(alice, ticket.sessionId, Readable.from(secondBytes));
+    await uploadService.receiveStream(alice, ticket.sessionId, Readable.from(secondBytes), TEST_META);
     await uploadService.finalize(alice, ticket.sessionId, TEST_META);
 
     const old = await downloadService.download(
@@ -358,7 +358,7 @@ describe('deactivated employees', () => {
     const folderId = await personalFolder(alice, 'Deactivation');
     const { fileId } = await uploadInto(alice, folderId, 'leaving.csv', CSV);
 
-    await userRepository.updateById(alice.userId, { $set: { status: 'deactivated' } });
+    await userRepository.updateById(alice.userId, { status: 'deactivated' });
     try {
       // The Actor is rebuilt the way a request would build it, so the status is the one
       // the session lookup would see.
@@ -368,7 +368,7 @@ describe('deactivated employees', () => {
         downloadService.download(deactivated, fileId, {}, TEST_META),
       ).rejects.toMatchObject({ status: expect.any(Number) });
     } finally {
-      await userRepository.updateById(alice.userId, { $set: { status: 'active' } });
+      await userRepository.updateById(alice.userId, { status: 'active' });
     }
   });
 });

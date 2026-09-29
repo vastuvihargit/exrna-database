@@ -128,7 +128,8 @@ export async function syncDriveChanges(input: SyncInput): Promise<DriveSyncSumma
   });
 
   await driveSyncRepository.updateState(state.id, {
-    $set: { state: 'polling', lastPollAt: new Date() },
+    state: 'polling',
+    lastPollAt: new Date(),
   });
 
   try {
@@ -143,13 +144,13 @@ export async function syncDriveChanges(input: SyncInput): Promise<DriveSyncSumma
     if (!state.startPageToken) {
       const token = await client.getStartPageToken();
       await driveSyncRepository.updateState(state.id, {
-        $set: {
-          startPageToken: token,
-          state: 'idle',
-          lastSuccessfulPollAt: new Date(),
-          consecutiveFailures: 0,
-          lastError: null,
-        },
+        // The one unconditional `startPageToken` write outside a reconcile: there is no cursor
+        // yet, so there is nothing for `advanceCursor` to be conditional on.
+        startPageToken: token,
+        state: 'idle',
+        lastSuccessfulPollAt: new Date(),
+        consecutiveFailures: 0,
+        lastError: null,
       });
       summary.initialized = true;
       return summary;
@@ -158,12 +159,10 @@ export async function syncDriveChanges(input: SyncInput): Promise<DriveSyncSumma
     await pollPages({ client, state, input, summary });
 
     await driveSyncRepository.updateState(state.id, {
-      $set: {
-        state: 'idle',
-        lastSuccessfulPollAt: new Date(),
-        consecutiveFailures: 0,
-        lastError: null,
-      },
+      state: 'idle',
+      lastSuccessfulPollAt: new Date(),
+      consecutiveFailures: 0,
+      lastError: null,
     });
 
     await auditService.recordSystem({
@@ -182,8 +181,12 @@ export async function syncDriveChanges(input: SyncInput): Promise<DriveSyncSumma
     summary.error = message;
 
     await driveSyncRepository.updateState(state.id, {
-      $set: { state: 'failed', lastError: message.slice(0, 1000) },
-      $inc: { consecutiveFailures: 1 },
+      state: 'failed',
+      lastError: message.slice(0, 1000),
+      // An increment rather than a write: two workers failing on the same drive must not each
+      // read the old count and set it to 1, because that counter is what an operator watches to
+      // decide whether Drive sync is actually broken.
+      incrementFailures: 1,
     });
 
     getLogger().error({ err: error }, 'Google Drive synchronization failed');
@@ -290,7 +293,8 @@ async function handleExpiredToken(context: {
   );
 
   await driveSyncRepository.updateState(state.id, {
-    $set: { state: 'reconciling', tokenExpiredAt: new Date() },
+    state: 'reconciling',
+    tokenExpiredAt: new Date(),
   });
 
   await auditService.recordSystem({
@@ -311,15 +315,15 @@ async function handleExpiredToken(context: {
   await reconcileEverything({ client, input, summary });
 
   await driveSyncRepository.updateState(state.id, {
-    $set: {
-      startPageToken: token,
-      state: 'idle',
-      tokenExpiredAt: null,
-      lastFullReconcileAt: new Date(),
-      lastSuccessfulPollAt: new Date(),
-      consecutiveFailures: 0,
-      lastError: null,
-    },
+    // Unconditional, deliberately. The old cursor expired, so there is no `from` value to be
+    // conditional on — that is what a reconcile means.
+    startPageToken: token,
+    state: 'idle',
+    tokenExpiredAt: null,
+    lastFullReconcileAt: new Date(),
+    lastSuccessfulPollAt: new Date(),
+    consecutiveFailures: 0,
+    lastError: null,
   });
 }
 
@@ -437,7 +441,9 @@ async function markMissing(
   summary.missing += 1;
   summary.conflicts += 1;
 
-  const file = await fileRepository.findById(fileId, { includeDeleted: true });
+  // Internal: the Drive change feed runs as the sync worker, not as a user, and must see
+  // files that have since been trashed here.
+  const file = await fileRepository.findByIdInternal(fileId, { includeDeleted: true });
 
   await auditService.recordSystem({
     action: 'drive_storage.file_missing',
@@ -465,7 +471,9 @@ async function applyFileChange(
     return;
   }
 
-  const file = await fileRepository.findById(version.fileId, { includeDeleted: true });
+  // Internal: same reason - a Drive change names a version, and the owning file may be
+  // trashed here without the change ceasing to be ours.
+  const file = await fileRepository.findByIdInternal(version.fileId, { includeDeleted: true });
   if (!file) {
     getLogger().warn(
       { versionId: version.versionId, fileId: version.fileId },
@@ -551,7 +559,9 @@ async function applyRename(
   const updated = await fileRepository.updateByIdWhere(
     file.id,
     { displayName: previous },
-    { $set: { displayName: driveFile.name, displayNameLower: driveFile.name.toLowerCase() } },
+    // `displayNameLower` is written by the repository alongside `displayName`; the two must
+    // not be able to disagree, so callers no longer set it themselves.
+    { displayName: driveFile.name },
   );
   if (!updated) return;
 
@@ -643,12 +653,10 @@ async function applyContent(
   if (fingerprint.revisionId === version.googleDriveRevisionId) return; // nothing really moved
 
   await versionRepository.updateFlags(version.versionId, {
-    $set: {
-      googleDriveRevisionId: fingerprint.revisionId,
-      googleDriveModifiedTime: fingerprint.modifiedAt,
-      ...(fingerprint.md5 ? { googleDriveMd5: fingerprint.md5 } : {}),
-      lastSyncedAt: new Date(),
-    },
+    googleDriveRevisionId: fingerprint.revisionId,
+    googleDriveModifiedTime: fingerprint.modifiedAt,
+    ...(fingerprint.md5 ? { googleDriveMd5: fingerprint.md5 } : {}),
+    lastSyncedAt: new Date(),
   });
 
   summary.contentUpdated += 1;
@@ -709,7 +717,7 @@ async function applyFolderChange(
   organizationId: string,
   summary: DriveSyncSummary,
 ): Promise<void> {
-  const folder = await folderRepository.findByDriveFolderId(driveFile.id);
+  const folder = await folderRepository.findByDriveFolderIdInternal(driveFile.id);
   if (!folder) {
     summary.unmanaged += 1;
     return;
@@ -720,7 +728,7 @@ async function applyFolderChange(
   if (!renamed && !trashed) return;
 
   summary.conflicts += 1;
-  await folderRepository.updateById(folder.id, { $set: { syncStatus: 'conflict' } });
+  await folderRepository.updateById(folder.id, { syncStatus: 'conflict' });
 
   await auditService.recordSystem({
     action: 'drive_storage.sync_conflict',

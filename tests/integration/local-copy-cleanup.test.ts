@@ -100,7 +100,7 @@ async function migratedVersion(name: string, options: { eligible?: boolean } = {
     { folderId: folder, filename: `${name}.csv`, size: content.byteLength },
     TEST_META,
   );
-  await uploadService.receiveStream(alice, ticket.sessionId, Readable.from(content));
+  await uploadService.receiveStream(alice, ticket.sessionId, Readable.from(content), TEST_META);
   const uploaded = await uploadService.finalize(alice, ticket.sessionId, TEST_META);
 
   const version = await FileVersionModel.findById(uploaded.versionId).lean();

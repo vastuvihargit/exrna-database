@@ -1,192 +1,70 @@
-import { Types, type ClientSession } from 'mongoose';
-import { connectToDatabase } from '@/server/db/connection';
-import { CommentModel, type CommentDocument } from '@/server/db/models';
-
-function oid(value: string): Types.ObjectId {
-  return new Types.ObjectId(value);
-}
-
-export function isValidId(value: string): boolean {
-  return Types.ObjectId.isValid(value) && /^[a-f0-9]{24}$/i.test(value);
-}
-
-export interface CommentRecord {
-  id: string;
-  fileId: string;
-  versionId: string | null;
-  versionNumber: number | null;
-  parentCommentId: string | null;
-  authorUserId: string;
-  authorName: string;
-  body: string;
-  mentionedUserIds: string[];
-  isReviewComment: boolean;
-  resolvedAt: Date | null;
-  resolvedBy: string | null;
-  editedAt: Date | null;
-  createdAt: Date;
-  updatedAt: Date;
-}
-
-type LeanComment = CommentDocument & {
-  _id: Types.ObjectId;
-  createdAt: Date;
-  updatedAt: Date;
-};
-
-function toRecord(doc: LeanComment): CommentRecord {
-  return {
-    id: String(doc._id),
-    fileId: String(doc.fileId),
-    versionId: doc.versionId ? String(doc.versionId) : null,
-    versionNumber: doc.versionNumber ?? null,
-    parentCommentId: doc.parentCommentId ? String(doc.parentCommentId) : null,
-    authorUserId: String(doc.authorUserId),
-    authorName: doc.authorName,
-    body: doc.body,
-    mentionedUserIds: (doc.mentionedUserIds ?? []).map(String),
-    isReviewComment: Boolean(doc.isReviewComment),
-    resolvedAt: doc.resolvedAt ?? null,
-    resolvedBy: doc.resolvedBy ? String(doc.resolvedBy) : null,
-    editedAt: doc.editedAt ?? null,
-    createdAt: doc.createdAt,
-    updatedAt: doc.updatedAt,
-  };
-}
-
-export async function findById(id: string): Promise<CommentRecord | null> {
-  if (!isValidId(id)) return null;
-  await connectToDatabase();
-  const doc = await CommentModel.findOne({ _id: oid(id) }).lean<LeanComment>().exec();
-  return doc ? toRecord(doc) : null;
-}
-
 /**
- * Every comment on a file, oldest first.
+ * File comments — a façade over the MongoDB and D1 implementations.
  *
- * Returned flat rather than pre-nested: threading is one level deep, so the caller
- * groups by `parentCommentId` in a single pass — cheaper than an aggregation and it
- * keeps the ordering rule (chronological within a thread) in one obvious place.
+ * Routed by `DATA_SOURCE_COMMENTS`.
+ *
+ * `isValidId` is re-exported from the Mongo module because `comment.service.ts` uses it to reject
+ * a malformed id before touching the database. It is an ObjectId shape check, so it is only
+ * meaningful for rows written before the cutover — a D1 comment created afterwards carries a
+ * UUID and would not pass it. The service therefore uses it as a *fast reject for Mongo-era ids*
+ * and never as the authorization step; `requireFile` is what decides access.
  */
-export async function listForFile(
+import { isD1 } from './data-source';
+import { mongoCommentRepository, isValidId } from './comment.repository.mongo';
+import { d1CommentRepository } from './comment.repository.d1';
+import type {
+  CommentRecord,
+  CommentRepository,
+  CommentTx,
+  CreateCommentInput,
+} from './comment.repository.contract';
+
+export type { CommentRecord, CommentRepository, CommentTx, CreateCommentInput };
+export { mongoCommentRepository, d1CommentRepository, isValidId };
+
+function active(): CommentRepository {
+  return isD1('comments') ? d1CommentRepository : mongoCommentRepository;
+}
+
+export function findById(id: string): Promise<CommentRecord | null> {
+  return active().findById(id);
+}
+
+export function listForFile(
   fileId: string,
   options: { includeResolved?: boolean; limit?: number } = {},
 ): Promise<CommentRecord[]> {
-  if (!isValidId(fileId)) return [];
-  await connectToDatabase();
-
-  const filter: Record<string, unknown> = { fileId: oid(fileId) };
-  if (!options.includeResolved) filter.resolvedAt = null;
-
-  const docs = await CommentModel.find(filter)
-    .sort({ createdAt: 1 })
-    .limit(Math.min(options.limit ?? 500, 1000))
-    .lean<LeanComment[]>()
-    .exec();
-  return docs.map(toRecord);
+  return active().listForFile(fileId, options);
 }
 
-export async function countForFile(fileId: string): Promise<number> {
-  if (!isValidId(fileId)) return 0;
-  await connectToDatabase();
-  return CommentModel.countDocuments({ fileId: oid(fileId) }).exec();
+export function countForFile(fileId: string): Promise<number> {
+  return active().countForFile(fileId);
 }
 
-export interface CreateCommentInput {
-  organizationId: string;
-  fileId: string;
-  versionId?: string | null;
-  versionNumber?: number | null;
-  parentCommentId?: string | null;
-  authorUserId: string;
-  authorName: string;
-  body: string;
-  mentionedUserIds?: string[];
-  isReviewComment?: boolean;
+export function create(input: CreateCommentInput, tx?: CommentTx): Promise<CommentRecord> {
+  return active().create(input, tx);
 }
 
-export async function create(
-  input: CreateCommentInput,
-  session?: ClientSession,
-): Promise<CommentRecord> {
-  await connectToDatabase();
-  const [doc] = await CommentModel.create(
-    [
-      {
-        organizationId: oid(input.organizationId),
-        fileId: oid(input.fileId),
-        versionId: input.versionId ? oid(input.versionId) : null,
-        versionNumber: input.versionNumber ?? null,
-        parentCommentId: input.parentCommentId ? oid(input.parentCommentId) : null,
-        authorUserId: oid(input.authorUserId),
-        authorName: input.authorName,
-        body: input.body,
-        mentionedUserIds: (input.mentionedUserIds ?? []).map(oid),
-        isReviewComment: input.isReviewComment ?? false,
-      },
-    ],
-    session ? { session } : undefined,
-  );
-  return toRecord(doc!.toObject() as LeanComment);
+export function updateBody(id: string, body: string): Promise<CommentRecord | null> {
+  return active().updateBody(id, body);
 }
 
-export async function updateBody(id: string, body: string): Promise<CommentRecord | null> {
-  if (!isValidId(id)) return null;
-  await connectToDatabase();
-  const doc = await CommentModel.findOneAndUpdate(
-    { _id: oid(id) },
-    { $set: { body, editedAt: new Date() } },
-    { new: true },
-  )
-    .lean<LeanComment>()
-    .exec();
-  return doc ? toRecord(doc) : null;
-}
-
-export async function setResolved(
+export function setResolved(
   id: string,
   resolved: boolean,
   userId: string,
 ): Promise<CommentRecord | null> {
-  if (!isValidId(id)) return null;
-  await connectToDatabase();
-  const doc = await CommentModel.findOneAndUpdate(
-    { _id: oid(id) },
-    {
-      $set: resolved
-        ? { resolvedAt: new Date(), resolvedBy: oid(userId) }
-        : { resolvedAt: null, resolvedBy: null },
-    },
-    { new: true },
-  )
-    .lean<LeanComment>()
-    .exec();
-  return doc ? toRecord(doc) : null;
+  return active().setResolved(id, resolved, userId);
 }
 
-/** Soft delete — the thread keeps its shape and the audit trail keeps its subject. */
-export async function softDelete(id: string, userId: string): Promise<boolean> {
-  if (!isValidId(id)) return false;
-  await connectToDatabase();
-  const result = await CommentModel.updateOne(
-    { _id: oid(id), deletedAt: null },
-    { $set: { deletedAt: new Date(), deletedBy: oid(userId) } },
-  ).exec();
-  return result.matchedCount > 0;
+export function softDelete(id: string, userId: string): Promise<boolean> {
+  return active().softDelete(id, userId);
 }
 
-export async function countRepliesTo(commentId: string): Promise<number> {
-  if (!isValidId(commentId)) return 0;
-  await connectToDatabase();
-  return CommentModel.countDocuments({ parentCommentId: oid(commentId) }).exec();
+export function countRepliesTo(commentId: string): Promise<number> {
+  return active().countRepliesTo(commentId);
 }
 
-export async function purgeForFiles(fileIds: string[]): Promise<number> {
-  const valid = fileIds.filter(isValidId).map(oid);
-  if (valid.length === 0) return 0;
-  await connectToDatabase();
-  const result = await CommentModel.deleteMany({ fileId: { $in: valid } })
-    .setOptions({ withDeleted: true })
-    .exec();
-  return result.deletedCount ?? 0;
+export function purgeForFiles(fileIds: string[]): Promise<number> {
+  return active().purgeForFiles(fileIds);
 }

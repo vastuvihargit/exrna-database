@@ -1,0 +1,300 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "exrna-database",
+  // The entrypoint wraps OpenNext's generated `.open-next/worker.js` with the configuration
+  // gate, the queue consumers and the cron trigger. See cloudflare-worker.ts.
+  "main": "cloudflare-worker.ts",
+  "compatibility_date": "2026-07-01",
+
+  // `nodejs_compat` gives workerd the Node built-ins this codebase still leans on
+  // (`node:stream` in the Drive client, `node:buffer` in a few DTO paths). It does **not**
+  // give it a filesystem, a raw TCP socket or a native addon — see
+  // docs/cloudflare-migration/00-phase-0-analysis.md §4 for what remains genuinely absent.
+  //
+  // `nodejs_compat_populate_process_env` makes plain-text vars readable as `process.env.X`,
+  // which is what lets `src/server/config/env.ts` keep working unchanged in both runtimes.
+  "compatibility_flags": ["nodejs_compat", "nodejs_compat_populate_process_env"],
+
+  "assets": {
+    "directory": ".open-next/assets",
+    "binding": "ASSETS"
+  },
+
+  // Workers Logs. Without this, a Worker that throws in production tells you nothing, and
+  // the pino redaction list this application relies on would be protecting a log nobody reads.
+  "observability": {
+    "enabled": true,
+    "head_sampling_rate": 1
+  },
+
+  "vars": {
+    "NODE_ENV": "production",
+    "APP_NAME": "Biotech Research Drive",
+    "LOG_LEVEL": "info"
+,
+    // Storage. A Worker has no persistent filesystem, so these are the only values it can
+    // run with — env.worker.ts refuses anything else at boot rather than per upload.
+    "GOOGLE_DRIVE_STORAGE_ENABLED": "true",
+    "DEFAULT_STORAGE_PROVIDER": "google_drive",
+    "UPLOAD_STAGING": "google_drive"
+  },
+
+  // ── Bindings ────────────────────────────────────────────────────────────────────────
+  //
+  // Declared now so every environment is shaped identically from Phase 1 onward, even
+  // though nothing reads them until Phase 3 (DB) and Phase 4 (queues).
+  //
+  // !! PRODUCTION BLOCKER: every `database_id` below is the all-zero PLACEHOLDER, and a
+  // remote deploy or `--remote` migration with it fails. Create the real databases with
+  //   npx wrangler d1 create biotech-drive-dev
+  // and paste the returned id here. `wrangler dev` ignores the id and uses a local SQLite
+  // file, so development works before any remote database exists.
+
+  "d1_databases": [
+    {
+      "binding": "DB",
+      "database_name": "biotech-drive-dev",
+      "database_id": "00000000-0000-0000-0000-000000000000",
+      "migrations_dir": "drizzle/migrations"
+    }
+  ],
+
+  "queues": {
+    "producers": [
+      { "binding": "SYNC_QUEUE", "queue": "biotech-drive-sync-dev" },
+      { "binding": "NOTIFICATION_QUEUE", "queue": "biotech-drive-notifications-dev" }
+    ],
+    // Retries back off in the consumer; after max_retries a message lands in the
+    // dead-letter queue, which is where a failed delivery becomes visible. Nothing
+    // consumes the DLQs automatically: an operator reads and replays them.
+    "consumers": [
+      {
+        "queue": "biotech-drive-sync-dev",
+        "max_batch_size": 1,
+        "max_retries": 3,
+        "dead_letter_queue": "biotech-drive-sync-dlq-dev"
+      },
+      {
+        "queue": "biotech-drive-notifications-dev",
+        "max_batch_size": 10,
+        "max_batch_timeout": 5,
+        "max_retries": 5,
+        "dead_letter_queue": "biotech-drive-notifications-dlq-dev"
+      }
+    ]
+  },
+  // Two schedules, both of which only *enqueue* work on SYNC_QUEUE (cloudflare-worker.ts):
+  //   */15 * * * *  one Drive synchronization (DRIVE_SYNC_INTERVAL_MINUTES)
+  //   7 * * * *     hourly maintenance: expired uploads, the Drive approval check; and at
+  //                 03:07 UTC also the trash purge and the inventory expiry sweep
+  "triggers": { "crons": ["*/15 * * * *", "7 * * * *"] },
+
+  // Rate-limit counters (src/server/auth/rate-limiter.durable-object.ts). A Map in an isolate
+  // counts one isolate's requests; a Durable Object counts every request for a key, exactly.
+  "durable_objects": {
+    "bindings": [{ "name": "RATE_LIMITER", "class_name": "RateLimiter" }]
+  },
+  "migrations": [{ "tag": "v1-rate-limiter", "new_sqlite_classes": ["RateLimiter"] }],
+
+  // No `workflows` binding. The Mongo → D1 metadata migration runs from an operator's machine
+  // (`npm run migrate:d1`, docs/cloudflare-migration/21-phase-9-mongo-to-d1-migration.md), not
+  // as a Cloudflare Workflow, so there is no workflow class to export or bind.
+
+  "env": {
+    "development": {
+      "vars": {
+        "NODE_ENV": "development",
+        // Explicit, and logged at startup. Staging and production leave it unset on purpose,
+        // so they refuse to boot until somebody decides.
+        "MALWARE_SCAN_MODE": "disabled",
+        "APP_NAME": "Biotech Research Drive",
+        "LOG_LEVEL": "debug"
+,
+        // Storage. A Worker has no persistent filesystem, so these are the only values it can
+        // run with — env.worker.ts refuses anything else at boot rather than per upload.
+        "GOOGLE_DRIVE_STORAGE_ENABLED": "true",
+        "DEFAULT_STORAGE_PROVIDER": "google_drive",
+        "UPLOAD_STAGING": "google_drive"
+      },
+      "observability": { "enabled": true, "head_sampling_rate": 1 },
+      "d1_databases": [
+        {
+          "binding": "DB",
+          "database_name": "biotech-drive-dev",
+          "database_id": "00000000-0000-0000-0000-000000000000",
+          "migrations_dir": "drizzle/migrations"
+        }
+      ],
+      "queues": {
+        "producers": [
+          { "binding": "SYNC_QUEUE", "queue": "biotech-drive-sync-dev" },
+          { "binding": "NOTIFICATION_QUEUE", "queue": "biotech-drive-notifications-dev" }
+        ],
+        // Retries back off in the consumer; after max_retries a message lands in the
+        // dead-letter queue, which is where a failed delivery becomes visible. Nothing
+        // consumes the DLQs automatically: an operator reads and replays them.
+        "consumers": [
+          {
+            "queue": "biotech-drive-sync-dev",
+            "max_batch_size": 1,
+            "max_retries": 3,
+            "dead_letter_queue": "biotech-drive-sync-dlq-dev"
+          },
+          {
+            "queue": "biotech-drive-notifications-dev",
+            "max_batch_size": 10,
+            "max_batch_timeout": 5,
+            "max_retries": 5,
+            "dead_letter_queue": "biotech-drive-notifications-dlq-dev"
+          }
+        ]
+      },
+      // Drive sync every 15 minutes; hourly maintenance at :07 (see the top-level comment).
+      "triggers": { "crons": ["*/15 * * * *", "7 * * * *"] },
+      // Not inherited from  the top level: every environment declares its own bindings.
+      "durable_objects": {
+        "bindings": [{ "name": "RATE_LIMITER", "class_name": "RateLimiter" }]
+      }
+    },
+
+    "staging": {
+      "vars": {
+        "NODE_ENV": "staging",
+        "APP_NAME": "Biotech Research Drive (Staging)",
+        "LOG_LEVEL": "debug"
+,
+        // Storage. A Worker has no persistent filesystem, so these are the only values it can
+        // run with — env.worker.ts refuses anything else at boot rather than per upload.
+        "GOOGLE_DRIVE_STORAGE_ENABLED": "true",
+        "DEFAULT_STORAGE_PROVIDER": "google_drive",
+        "UPLOAD_STAGING": "google_drive"
+      },
+      "observability": { "enabled": true, "head_sampling_rate": 1 },
+      "d1_databases": [
+        {
+          "binding": "DB",
+          "database_name": "biotech-drive-staging",
+          "database_id": "00000000-0000-0000-0000-000000000000",
+          "migrations_dir": "drizzle/migrations"
+        }
+      ],
+      "queues": {
+        "producers": [
+          { "binding": "SYNC_QUEUE", "queue": "biotech-drive-sync-staging" },
+          { "binding": "NOTIFICATION_QUEUE", "queue": "biotech-drive-notifications-staging" }
+        ],
+        // Retries back off in the consumer; after max_retries a message lands in the
+        // dead-letter queue, which is where a failed delivery becomes visible. Nothing
+        // consumes the DLQs automatically: an operator reads and replays them.
+        "consumers": [
+          {
+            "queue": "biotech-drive-sync-staging",
+            "max_batch_size": 1,
+            "max_retries": 3,
+            "dead_letter_queue": "biotech-drive-sync-dlq-staging"
+          },
+          {
+            "queue": "biotech-drive-notifications-staging",
+            "max_batch_size": 10,
+            "max_batch_timeout": 5,
+            "max_retries": 5,
+            "dead_letter_queue": "biotech-drive-notifications-dlq-staging"
+          }
+        ]
+      },
+      // Drive sync every 15 minutes; hourly maintenance at :07 (see the top-level comment).
+      "triggers": { "crons": ["*/15 * * * *", "7 * * * *"] },
+      // Not inherited from the top level: every environment declares its own bindings.
+      "durable_objects": {
+        "bindings": [{ "name": "RATE_LIMITER", "class_name": "RateLimiter" }]
+      }
+    },
+
+    "production": {
+      // The only way in is the Access-protected custom domain. A *.workers.dev hostname would be a
+      // route around Access; the per-request assertion check refuses such requests anyway, and
+      // this removes the route entirely.
+      "workers_dev": false,
+      "vars": {
+        "NODE_ENV": "production",
+        "APP_NAME": "Biotech Research Drive",
+        "LOG_LEVEL": "info"
+,
+        // Storage. A Worker has no persistent filesystem, so these are the only values it can
+        // run with — env.worker.ts refuses anything else at boot rather than per upload.
+        "GOOGLE_DRIVE_STORAGE_ENABLED": "true",
+        "DEFAULT_STORAGE_PROVIDER": "google_drive",
+        "UPLOAD_STAGING": "google_drive"
+      },
+      // Sampled rather than 1.0: production traffic is higher and the interesting events
+      // (errors, denials) are logged explicitly by the application, not inferred from traces.
+      "observability": { "enabled": true, "head_sampling_rate": 0.2 },
+      "d1_databases": [
+        {
+          "binding": "DB",
+          "database_name": "biotech-drive-production",
+          "database_id": "00000000-0000-0000-0000-000000000000",
+          "migrations_dir": "drizzle/migrations"
+        }
+      ],
+      "queues": {
+        "producers": [
+          { "binding": "SYNC_QUEUE", "queue": "biotech-drive-sync-production" },
+          { "binding": "NOTIFICATION_QUEUE", "queue": "biotech-drive-notifications-production" }
+        ],
+        // Retries back off in the consumer; after max_retries a message lands in the
+        // dead-letter queue, which is where a failed delivery becomes visible. Nothing
+        // consumes the DLQs automatically: an operator reads and replays them.
+        "consumers": [
+          {
+            "queue": "biotech-drive-sync-production",
+            "max_batch_size": 1,
+            "max_retries": 3,
+            "dead_letter_queue": "biotech-drive-sync-dlq-production"
+          },
+          {
+            "queue": "biotech-drive-notifications-production",
+            "max_batch_size": 10,
+            "max_batch_timeout": 5,
+            "max_retries": 5,
+            "dead_letter_queue": "biotech-drive-notifications-dlq-production"
+          }
+        ]
+      },
+      // Drive sync every 15 minutes; hourly maintenance at :07 (see the top-level comment).
+      "triggers": { "crons": ["*/15 * * * *", "7 * * * *"] },
+      // Not inherited from the top level: every environment declares its own bindings.
+      "durable_objects": {
+        "bindings": [{ "name": "RATE_LIMITER", "class_name": "RateLimiter" }]
+      }
+    }
+  }
+
+  // ── Secrets ─────────────────────────────────────────────────────────────────────────
+  //
+  // Never in this file. Set with `npx wrangler secret put <NAME> --env <environment>`:
+  //
+  //   AUTH_SECRET
+  //   SESSION_SECRET
+  //   APP_URL                        https://<hostname> (may be a var instead)
+  //   COMPANY_EMAIL_DOMAINS          comma-separated (may be a var instead)
+  //   GOOGLE_DRIVE_ROOT_FOLDER_ID    recommended
+  //   GOOGLE_SERVICE_ACCOUNT_EMAIL
+  //   GOOGLE_SERVICE_ACCOUNT_PRIVATE_KEY
+  //   GOOGLE_SHARED_DRIVE_ID
+  //   GOOGLE_WORKSPACE_DOMAIN
+  //   CF_ACCESS_TEAM_DOMAIN          required in production (loadWorkerEnv refuses to boot)
+  //   CF_ACCESS_AUD                  required in production, together with the team domain
+  //   MALWARE_SCAN_SECRET            only when MALWARE_SCAN_MODE=http
+  //
+  // Non-secret, set per environment under "vars" once decided:
+  //
+  //   MALWARE_SCAN_MODE              "http" or "disabled". Deliberately NOT set for staging or
+  //                                  production: choosing a scanner is a business decision, and
+  //                                  a Worker with no value refuses to boot rather than
+  //                                  silently running without one.
+  //   MALWARE_SCAN_ENDPOINT          https URL of the scanning service, when mode is "http"
+  //
+  // Locally they come from `.dev.vars`, which is git-ignored. See `.dev.vars.example`.
+  // The full external checklist: docs/cloudflare-migration/EXTERNAL-SETUP.md.
+}

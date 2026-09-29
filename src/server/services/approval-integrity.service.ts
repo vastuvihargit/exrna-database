@@ -41,9 +41,11 @@ import { withTransaction } from '@/server/db/connection';
 import { getLogger } from '@/server/logging/logger';
 import { auditService } from '@/server/audit/audit.service';
 import * as fileRepository from '@/server/repositories/file.repository';
-import * as notificationRepository from '@/server/repositories/notification.repository';
 import * as versionRepository from '@/server/repositories/file-version.repository';
-import type { VersionApprovalBinding } from '@/server/repositories/file-version.repository';
+import type {
+  VersionApprovalBinding,
+  VersionPatch,
+} from '@/server/repositories/file-version.repository';
 import { getObjectStore } from '@/server/storage';
 import { isDriveStorageEnabled } from '@/server/storage/google';
 import type {
@@ -51,6 +53,7 @@ import type {
   GoogleDriveObjectStore,
 } from '@/server/storage/google/google-drive-object-store';
 import { isMissingObjectError } from '@/server/storage/missing-object';
+import { dispatchNotifications, newEventKey } from '@/server/queues/notification-dispatch';
 
 /**
  * What a check concluded.
@@ -137,7 +140,7 @@ export async function fingerprintForReview(versionId: string): Promise<{
 export function approvalBindingUpdate(fingerprint: {
   revisionId: string | null;
   contentModifiedAt: Date | null;
-}): Record<string, unknown> {
+}): VersionPatch {
   return {
     approvedRevisionId: fingerprint.revisionId,
     approvedContentModifiedAt: fingerprint.contentModifiedAt,
@@ -212,12 +215,10 @@ async function checkBinding(binding: VersionApprovalBinding): Promise<ApprovalCh
    */
   if (!binding.approvedRevisionId) {
     await versionRepository.updateFlags(versionId, {
-      $set: {
-        approvedRevisionId: current.revisionId,
-        approvedContentModifiedAt: current.modifiedAt,
-        googleDriveRevisionId: current.revisionId,
-        googleDriveModifiedTime: current.modifiedAt,
-      },
+      approvedRevisionId: current.revisionId,
+      approvedContentModifiedAt: current.modifiedAt,
+      googleDriveRevisionId: current.revisionId,
+      googleDriveModifiedTime: current.modifiedAt,
     });
     return { versionId, fileId, outcome: 'unchanged' };
   }
@@ -254,7 +255,9 @@ async function supersedeApproval(input: {
 }): Promise<void> {
   const { binding, current, reason } = input;
 
-  const file = await fileRepository.findById(binding.fileId, { includeDeleted: true });
+  // Internal: the approval-integrity sweep is a background job with no actor, and it must see
+  // trashed files because an approval that drifted still has to be withdrawn.
+  const file = await fileRepository.findByIdInternal(binding.fileId, { includeDeleted: true });
   if (!file) {
     getLogger().warn(
       { versionId: binding.versionId, fileId: binding.fileId },
@@ -267,18 +270,16 @@ async function supersedeApproval(input: {
     await versionRepository.updateFlags(
       binding.versionId,
       {
-        $set: {
-          // Cleared because this is what the badge and the approved-files list read.
-          // `approvedBy` and `approvedAt` stay: who signed, and when, remains true.
-          isApproved: false,
-          label: 'changes_requested',
-          approvalSupersededAt: new Date(),
-          approvalSupersededReason: reason.slice(0, 300),
-          // The version now tracks the content that is actually there.
-          googleDriveRevisionId: current.revisionId,
-          googleDriveModifiedTime: current.modifiedAt,
-          ...(current.md5 ? { googleDriveMd5: current.md5 } : {}),
-        },
+        // Cleared because this is what the badge and the approved-files list read.
+        // `approvedBy` and `approvedAt` stay: who signed, and when, remains true.
+        isApproved: false,
+        label: 'changes_requested',
+        approvalSupersededAt: new Date(),
+        approvalSupersededReason: reason.slice(0, 300),
+        // The version now tracks the content that is actually there.
+        googleDriveRevisionId: current.revisionId,
+        googleDriveModifiedTime: current.modifiedAt,
+        ...(current.md5 ? { googleDriveMd5: current.md5 } : {}),
       },
       session,
     );
@@ -290,11 +291,9 @@ async function supersedeApproval(input: {
       binding.fileId,
       { approvedVersionId: binding.versionId },
       {
-        $set: {
-          reviewStatus: 'changes_requested',
-          approvalStatus: 'none',
-          approvedVersionId: null,
-        },
+        reviewStatus: 'changes_requested',
+        approvalStatus: 'none',
+        approvedVersionId: null,
       },
       session,
     );
@@ -335,19 +334,18 @@ async function supersedeApproval(input: {
   // detached to keep a person's request fast; nobody is waiting on this one, and telling the
   // owner their approval no longer holds is the point of the whole exercise rather than a
   // nicety that can be dropped if the process ends first.
-  await notificationRepository
-    .createMany(
-      [...recipients].map((userId) => ({
-        organizationId: file.organizationId,
-        userId,
-        type: 'review.reopened' as const,
-        entityType: 'file',
-        entityId: binding.fileId,
-        entityLabel: file.displayName,
-        message,
-      })),
-    )
-    .catch(() => undefined);
+  await dispatchNotifications(
+    [...recipients].map((userId) => ({
+      organizationId: file.organizationId,
+      userId,
+      type: 'review.reopened' as const,
+      entityType: 'file',
+      entityId: binding.fileId,
+      entityLabel: file.displayName,
+      message,
+    })),
+    newEventKey(`review-reopened:${binding.fileId}`),
+  ).catch(() => undefined);
 
   /**
    * Deliberately no activity-feed entry.

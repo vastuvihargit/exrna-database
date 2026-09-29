@@ -9,7 +9,6 @@
  *   • the ID token's signature, issuer, audience and expiry are all verified
  *   • the *email domain* — not the `hd` claim — decides who may sign in
  */
-import { createHash, randomBytes } from 'crypto';
 import { getEnv } from '@/server/config/env';
 import { ValidationError } from '@/server/errors/app-error';
 
@@ -30,20 +29,55 @@ export function isGoogleConfigured(): boolean {
   return Boolean(env.GOOGLE_CLIENT_ID && env.GOOGLE_CLIENT_SECRET && env.GOOGLE_REDIRECT_URI);
 }
 
-function base64url(input: Buffer): string {
-  return input.toString('base64url');
+/**
+ * Base64url without padding — the encoding OAuth and JWT use everywhere.
+ *
+ * Written out rather than taken from `Buffer.toString('base64url')` so this module runs
+ * unchanged in a Worker, where `Buffer` is a `nodejs_compat` shim rather than a native type.
+ */
+function base64url(input: Uint8Array): string {
+  let binary = '';
+  for (const byte of input) binary += String.fromCharCode(byte);
+  return btoa(binary).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
 }
 
-export function beginGoogleLogin(hostedDomainHint?: string): OAuthStart {
+function randomBase64Url(byteLength: number): string {
+  const bytes = new Uint8Array(byteLength);
+  crypto.getRandomValues(bytes);
+  return base64url(bytes);
+}
+
+/**
+ * Returns `Uint8Array<ArrayBuffer>` rather than the inferred `Uint8Array<ArrayBufferLike>`:
+ * WebCrypto's `BufferSource` excludes `SharedArrayBuffer` and TypeScript 5.7 enforces it.
+ */
+function decodeBase64Url(value: string): Uint8Array<ArrayBuffer> {
+  const padded = value.replace(/-/g, '+').replace(/_/g, '/');
+  const binary = atob(padded + '='.repeat((4 - (padded.length % 4)) % 4));
+  const bytes = new Uint8Array(new ArrayBuffer(binary.length));
+  for (let index = 0; index < binary.length; index += 1) bytes[index] = binary.charCodeAt(index);
+  return bytes;
+}
+
+function decodeBase64UrlToString(value: string): string {
+  return new TextDecoder().decode(decodeBase64Url(value));
+}
+
+export async function beginGoogleLogin(hostedDomainHint?: string): Promise<OAuthStart> {
   const env = getEnv();
   if (!isGoogleConfigured()) {
     throw new ValidationError('Google sign-in is not configured on this deployment');
   }
 
-  const state = base64url(randomBytes(32));
-  const nonce = base64url(randomBytes(32));
-  const codeVerifier = base64url(randomBytes(48));
-  const codeChallenge = base64url(createHash('sha256').update(codeVerifier).digest());
+  const state = randomBase64Url(32);
+  const nonce = randomBase64Url(32);
+  const codeVerifier = randomBase64Url(48);
+  // PKCE S256: the challenge is the SHA-256 of the verifier, base64url encoded.
+  const codeChallenge = base64url(
+    new Uint8Array(
+      await crypto.subtle.digest('SHA-256', new TextEncoder().encode(codeVerifier)),
+    ),
+  );
 
   const params = new URLSearchParams({
     client_id: env.GOOGLE_CLIENT_ID!,
@@ -103,29 +137,41 @@ async function verifyIdTokenSignature(idToken: string): Promise<Record<string, u
   if (parts.length !== 3) throw new ValidationError('Malformed ID token');
   const [headerPart, payloadPart, signaturePart] = parts as [string, string, string];
 
-  const header = JSON.parse(Buffer.from(headerPart, 'base64url').toString('utf8')) as {
+  const header = JSON.parse(decodeBase64UrlToString(headerPart)) as {
     alg: string;
     kid: string;
   };
+  // Pinned to RS256 before the key is even looked up. This is the check that refuses an
+  // `alg: none` token and refuses a token that asks to be verified symmetrically with the
+  // public key as the HMAC secret — the two classic JWT forgeries.
   if (header.alg !== 'RS256') throw new ValidationError('Unsupported ID token algorithm');
 
   const keys = await getJwks();
   const jwk = keys.find((key) => key.kid === header.kid);
   if (!jwk) throw new ValidationError('Unknown ID token signing key');
 
-  const { createPublicKey, createVerify } = await import('crypto');
-  // The JWKS entry is a JSON Web Key; Node accepts it directly with format 'jwk'.
-  const publicKey = createPublicKey({ key: jwk, format: 'jwk' });
+  // The JWKS entry is already a JSON Web Key, so WebCrypto imports it directly. `false` for
+  // extractable and a single `verify` usage: this key can do nothing else.
+  const publicKey = await crypto.subtle.importKey(
+    'jwk',
+    jwk as unknown as JsonWebKey,
+    { name: 'RSASSA-PKCS1-v1_5', hash: 'SHA-256' },
+    false,
+    ['verify'],
+  );
 
-  const verifier = createVerify('RSA-SHA256');
-  verifier.update(`${headerPart}.${payloadPart}`);
-  verifier.end();
+  const verified = await crypto.subtle.verify(
+    'RSASSA-PKCS1-v1_5',
+    publicKey,
+    decodeBase64Url(signaturePart),
+    new TextEncoder().encode(`${headerPart}.${payloadPart}`),
+  );
 
-  if (!verifier.verify(publicKey, Buffer.from(signaturePart, 'base64url'))) {
+  if (!verified) {
     throw new ValidationError('ID token signature verification failed');
   }
 
-  return JSON.parse(Buffer.from(payloadPart, 'base64url').toString('utf8')) as Record<string, unknown>;
+  return JSON.parse(decodeBase64UrlToString(payloadPart)) as Record<string, unknown>;
 }
 
 export async function completeGoogleLogin(input: {

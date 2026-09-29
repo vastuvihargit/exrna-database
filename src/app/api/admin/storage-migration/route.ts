@@ -1,7 +1,7 @@
 import type { NextRequest } from 'next/server';
 import { z } from 'zod';
 
-import { withAuthenticatedRoute } from '@/server/http/authenticated-route';
+import { NODE_ONLY_FEATURES, withNodeOnlyRoute } from '@/server/http/node-only';
 import { created, ok } from '@/server/http/api-response';
 import { assertCompanyPermission } from '@/server/permissions/authorize';
 import { storageMigrationService } from '@/server/services/storage-migration.service';
@@ -42,13 +42,13 @@ const createSchema = z.object({
   selection: selectionSchema,
 });
 
-export const GET = withAuthenticatedRoute(async (_request, { actor }) => {
+export const GET = withNodeOnlyRoute(NODE_ONLY_FEATURES.storageMigration, async (_request, { actor }) => {
   assertCompanyPermission(actor, 'access.manage');
   const jobs = await storageMigrationService.listJobs(actor);
   return ok(jobs);
 });
 
-export const POST = withAuthenticatedRoute(async (request: NextRequest, { actor, meta }) => {
+export const POST = withNodeOnlyRoute(NODE_ONLY_FEATURES.storageMigration, async (request: NextRequest, { actor, meta }) => {
   assertCompanyPermission(actor, 'access.manage');
   const body: unknown = await request.json().catch(() => ({}));
   const input = createSchema.parse(body);

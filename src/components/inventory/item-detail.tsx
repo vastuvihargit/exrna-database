@@ -24,9 +24,12 @@ import { formatRelativeTime } from '@/lib/utils';
 import {
   useDeactivateInventoryItem,
   useInventoryItem,
+  useStockHistory,
   type InventoryItemDto,
+  type StockTransactionDto,
 } from '@/hooks/use-inventory';
 import { ItemDialog } from './item-dialog';
+import { StockDialog, type StockDialogMode } from './stock-dialog';
 import {
   ExpiryStateBadge,
   ItemStatusBadge,
@@ -46,6 +49,7 @@ export function ItemDetail({ itemId }: { itemId: string }) {
   const { data: item, isPending, isError, error } = useInventoryItem(itemId);
   const [editing, setEditing] = React.useState(false);
   const [confirmingRemove, setConfirmingRemove] = React.useState(false);
+  const [movement, setMovement] = React.useState<StockDialogMode | null>(null);
 
   if (isPending) {
     return (
@@ -91,6 +95,31 @@ export function ItemDetail({ itemId }: { itemId: string }) {
           <StockStateBadge state={item.stockState} />
           <ExpiryStateBadge state={item.expiryState} />
           <ItemStatusBadge status={item.status} />
+          {/*
+            Only the actions this reader may actually perform are offered. `capabilities` is
+            computed server-side against the item's custodian department, and the route asserts
+            the same permission again — this only avoids showing a button that would be refused.
+          */}
+          {item.capabilities.addStock ? (
+            <Button variant="outline" size="sm" onClick={() => setMovement('add')}>
+              Receive
+            </Button>
+          ) : null}
+          {item.capabilities.issueStock ? (
+            <Button
+              variant="outline"
+              size="sm"
+              disabled={item.availableQuantity <= 0}
+              onClick={() => setMovement('issue')}
+            >
+              Issue
+            </Button>
+          ) : null}
+          {item.capabilities.adjustStock ? (
+            <Button variant="outline" size="sm" onClick={() => setMovement('adjust')}>
+              Adjust
+            </Button>
+          ) : null}
           {item.capabilities.edit ? (
             <Button variant="outline" size="sm" onClick={() => setEditing(true)}>
               Edit
@@ -182,6 +211,8 @@ export function ItemDetail({ itemId }: { itemId: string }) {
         </CardContent>
       </Card>
 
+      <StockHistoryCard itemId={item.id} unit={item.unit} />
+
       {item.capabilities.edit ? (
         <RemoveItemCard
           item={item}
@@ -191,7 +222,100 @@ export function ItemDetail({ itemId }: { itemId: string }) {
       ) : null}
 
       <ItemDialog item={editing ? item : null} open={editing} onOpenChange={setEditing} />
+
+      {movement ? (
+        <StockDialog
+          item={item}
+          mode={movement}
+          open
+          onOpenChange={(open) => setMovement(open ? movement : null)}
+        />
+      ) : null}
     </div>
+  );
+}
+
+const ACTION_LABELS: Record<StockTransactionDto['action'], string> = {
+  added: 'Received',
+  issued: 'Issued',
+  returned: 'Returned',
+  adjusted: 'Adjusted',
+  expired: 'Written off',
+};
+
+/**
+ * Every movement of this item, newest first.
+ *
+ * `previousQuantity → newQuantity` is shown on each row rather than only the delta. That pair is
+ * what lets somebody check the running total by reading down the column, without trusting the
+ * figure at the top of the page — which is the point of keeping a ledger rather than a counter.
+ */
+function StockHistoryCard({ itemId, unit }: { itemId: string; unit: string }) {
+  const { data: history, isPending } = useStockHistory(itemId);
+
+  return (
+    <Card>
+      <CardHeader className="pb-3">
+        <CardTitle className="text-base">Stock history</CardTitle>
+        <CardDescription>
+          Every receipt, issue and correction. Append-only — a mistake is corrected by a new
+          adjustment, which leaves the correction visible.
+        </CardDescription>
+      </CardHeader>
+      <CardContent>
+        {isPending ? (
+          <Skeleton className="h-24 w-full" />
+        ) : !history || history.length === 0 ? (
+          <p className="rounded-md border border-dashed p-6 text-center text-sm text-muted-foreground">
+            Nothing has moved yet.
+          </p>
+        ) : (
+          <div className="overflow-x-auto">
+            <Table>
+              <TableHeader>
+                <TableRow>
+                  <TableHead>When</TableHead>
+                  <TableHead>What</TableHead>
+                  <TableHead className="text-right">Change</TableHead>
+                  <TableHead className="text-right">Running total</TableHead>
+                  <TableHead>Batch</TableHead>
+                  <TableHead>Who / what for</TableHead>
+                </TableRow>
+              </TableHeader>
+              <TableBody>
+                {history.map((row) => (
+                  <TableRow key={row.id}>
+                    <TableCell className="text-sm text-muted-foreground">
+                      {formatRelativeTime(row.performedAt)}
+                    </TableCell>
+                    <TableCell className="font-medium">{ACTION_LABELS[row.action]}</TableCell>
+                    <TableCell
+                      className={`text-right tabular-nums ${
+                        row.quantityDelta < 0 ? 'text-destructive' : ''
+                      }`}
+                    >
+                      {row.quantityDelta > 0 ? '+' : ''}
+                      {formatQuantity(row.quantityDelta, unit)}
+                    </TableCell>
+                    <TableCell className="text-right tabular-nums text-muted-foreground">
+                      {row.previousQuantity} → {row.newQuantity}
+                    </TableCell>
+                    <TableCell className="text-sm text-muted-foreground">
+                      {row.batchNumber || '—'}
+                    </TableCell>
+                    <TableCell className="text-sm text-muted-foreground">
+                      {[row.issuedToLabel, row.purpose, row.notes].filter(Boolean).join(' · ') ||
+                        row.performedByName ||
+                        '—'}
+                    </TableCell>
+                  </TableRow>
+                ))}
+              </TableBody>
+            </Table>
+          </div>
+        )}
+      </CardContent>
+    </Card>
   );
 }
 

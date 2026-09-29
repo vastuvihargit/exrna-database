@@ -9,6 +9,8 @@
  */
 import path from 'path';
 import { z } from 'zod';
+import { assertDataSourceMatrix } from '@/server/repositories/data-source';
+import { isWorkerRuntime } from '@/server/runtime';
 
 const bool = (defaultValue: boolean) =>
   z
@@ -91,6 +93,16 @@ const envSchema = z
     // Malware scanning (Phase 11). Disabled by default: a deployment with no antivirus
     // is a stated risk reported on the admin system page, never a silent one.
     MALWARE_SCAN_ENABLED: bool(false),
+    /**
+     * Which scanner, stated explicitly. Wins over `MALWARE_SCAN_ENABLED`, which remains as the
+     * older spelling of `clamav`. `http` is the vendor-neutral boundary a Worker can use — clamd
+     * needs a raw TCP socket, which workerd does not have. See `security/malware-scanner.ts` for
+     * the wire contract.
+     */
+    MALWARE_SCAN_MODE: z.enum(['disabled', 'clamav', 'http']).optional(),
+    MALWARE_SCAN_ENDPOINT: z.string().url().optional(),
+    MALWARE_SCAN_SECRET: z.string().optional(),
+    MALWARE_SCAN_TIMEOUT_MS: int(120_000, 1000, 900_000),
     CLAMAV_HOST: z.string().default('clamav'),
     CLAMAV_PORT: int(3310, 1, 65535),
     CLAMAV_TIMEOUT_MS: int(60_000, 1000, 600_000),
@@ -100,6 +112,9 @@ const envSchema = z
      * antivirus deployment quietly stops protecting anything.
      */
     MALWARE_SCAN_FAIL_CLOSED: bool(false),
+
+    /** The cutover window. See `runtime/maintenance.ts`. */
+    MAINTENANCE_MODE: z.enum(['off', 'read_only', 'maintenance']).default('off'),
 
     // Sessions
     SESSION_IDLE_TIMEOUT_MINUTES: int(480, 5),
@@ -131,6 +146,15 @@ const envSchema = z
       .optional()
       .or(z.literal('').transform(() => undefined)),
 
+    /**
+     * Cloudflare Access in front of the application. When both are set, Access is the sign-in
+     * method: every request must carry a valid Access assertion for the same person as its
+     * session, and password / Google sign-in are switched off. Unset — local development and
+     * the existing Node deployment — nothing about sign-in changes. See `auth/access-session.ts`.
+     */
+    CF_ACCESS_TEAM_DOMAIN: z.string().optional(),
+    CF_ACCESS_AUD: z.string().optional(),
+
     // OAuth (required only once Phase 2 enables the provider)
     GOOGLE_CLIENT_ID: z.string().optional(),
     GOOGLE_CLIENT_SECRET: z.string().optional(),
@@ -157,6 +181,30 @@ const envSchema = z
     GOOGLE_DRIVE_STORAGE_ENABLED: bool(false),
     /** Where *new* content is written. Existing records always read from their own field. */
     DEFAULT_STORAGE_PROVIDER: z.enum(['local', 'google_drive']).default('local'),
+
+    /**
+     * Where bytes are held while they are still untrusted — and, by consequence, whether a
+     * newly uploaded file has a local copy at all.
+     *
+     * This is **not** a duplicate of `DEFAULT_STORAGE_PROVIDER`, and conflating the two was
+     * tempting enough to be worth stating why it is wrong:
+     *
+     *   • `local` (the default) — bytes are streamed to local quarantine, scanned, moved into
+     *     `originals`, recorded, and *then* handed to Drive if `DEFAULT_STORAGE_PROVIDER` says
+     *     so. The local copy is retained for `LOCAL_COPY_RETENTION_DAYS`, and **that retained
+     *     copy is the entire rollback plan for the byte migration.** A Drive outage during this
+     *     window costs latency, not availability.
+     *
+     *   • `google_drive` — bytes are streamed straight into a Drive resumable upload in a
+     *     staging folder and promoted by re-parenting. Nothing is ever written to a disk, so
+     *     there is **no local copy and no local-copy fallback** for anything uploaded this way.
+     *
+     * A Cloudflare Worker has no persistent filesystem, so `google_drive` is the only value it
+     * can run with — `loadWorkerEnv` defaults to it and refuses `local`. On Node, `local`
+     * remains the default precisely because giving up the rollback copy should be a decision
+     * somebody made rather than one a deployment inherited.
+     */
+    UPLOAD_STAGING: z.enum(['local', 'google_drive']).default('local'),
 
     GOOGLE_WORKSPACE_DOMAIN: z.string().optional(),
     GOOGLE_SHARED_DRIVE_ID: z.string().optional(),
@@ -262,6 +310,70 @@ const envSchema = z
       });
     }
 
+    /**
+     * The HTTP scanner fails at configuration time, not on somebody's upload. A shared secret
+     * shorter than 16 characters is refused because it authenticates this application to the
+     * scanning service, and a guessable one lets anybody spend its quota — or, worse, answer in
+     * its place if the endpoint is ever misrouted.
+     */
+    // Half of an Access configuration is the dangerous half: a team domain with no audience
+    // would verify any Access application's token on the same team.
+    if (Boolean(v.CF_ACCESS_TEAM_DOMAIN?.trim()) !== Boolean(v.CF_ACCESS_AUD?.trim())) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: [v.CF_ACCESS_TEAM_DOMAIN ? 'CF_ACCESS_AUD' : 'CF_ACCESS_TEAM_DOMAIN'],
+        message: 'CF_ACCESS_TEAM_DOMAIN and CF_ACCESS_AUD must be set together, or neither',
+      });
+    }
+
+    if (v.MALWARE_SCAN_MODE === 'http') {
+      if (!v.MALWARE_SCAN_ENDPOINT) {
+        ctx.addIssue({
+          code: z.ZodIssueCode.custom,
+          path: ['MALWARE_SCAN_ENDPOINT'],
+          message: 'is required when MALWARE_SCAN_MODE is "http"',
+        });
+      } else if (v.NODE_ENV === 'production' && !v.MALWARE_SCAN_ENDPOINT.startsWith('https://')) {
+        ctx.addIssue({
+          code: z.ZodIssueCode.custom,
+          path: ['MALWARE_SCAN_ENDPOINT'],
+          message: 'must use https:// in production — file content is sent to it',
+        });
+      }
+      if (!v.MALWARE_SCAN_SECRET || v.MALWARE_SCAN_SECRET.length < 16) {
+        ctx.addIssue({
+          code: z.ZodIssueCode.custom,
+          path: ['MALWARE_SCAN_SECRET'],
+          message: 'must be at least 16 characters when MALWARE_SCAN_MODE is "http"',
+        });
+      }
+    }
+
+    if (v.UPLOAD_STAGING === 'google_drive' && !v.GOOGLE_DRIVE_STORAGE_ENABLED) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ['UPLOAD_STAGING'],
+        message:
+          'cannot be "google_drive" while GOOGLE_DRIVE_STORAGE_ENABLED is false — every upload would ' +
+          'have nowhere to be staged',
+      });
+    }
+
+    /**
+     * Staging in Drive while new content is recorded as local would produce versions whose
+     * `storageProvider` says `local` and whose bytes are in the Shared Drive. Every read would
+     * then look for a file on a disk that was never written.
+     */
+    if (v.UPLOAD_STAGING === 'google_drive' && v.DEFAULT_STORAGE_PROVIDER !== 'google_drive') {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ['UPLOAD_STAGING'],
+        message:
+          'is "google_drive" but DEFAULT_STORAGE_PROVIDER is "local" — content staged in Drive is ' +
+          'already in Drive and cannot be recorded as local. Set both, or neither.',
+      });
+    }
+
     if (v.GOOGLE_DRIVE_STORAGE_ENABLED) {
       if (!v.GOOGLE_SHARED_DRIVE_ID) {
         ctx.addIssue({
@@ -353,6 +465,15 @@ function assertDevSwitcherNotRequestedInProduction(
 
 export type RawEnv = z.infer<typeof envSchema>;
 
+export type MalwareScanMode = 'disabled' | 'clamav' | 'http';
+
+export function resolveMalwareScanMode(v: {
+  MALWARE_SCAN_MODE?: MalwareScanMode | undefined;
+  MALWARE_SCAN_ENABLED: boolean;
+}): MalwareScanMode {
+  return v.MALWARE_SCAN_MODE ?? (v.MALWARE_SCAN_ENABLED ? 'clamav' : 'disabled');
+}
+
 /**
  * Storage roots resolved to absolute paths.
  *
@@ -382,6 +503,8 @@ export interface AppEnv extends RawEnv {
   googleDriveUploadChunkBytes: number;
   /** Above this, a new upload is queued for Drive instead of transferred inline. */
   uploadDriveSyncThresholdBytes: number;
+  /** The scanner actually in force: `MALWARE_SCAN_MODE`, else the legacy boolean. */
+  malwareScanMode: MalwareScanMode;
 }
 
 const GB = 1024 ** 3;
@@ -415,9 +538,59 @@ function assertRootsArePrivate(roots: StorageRoots): void {
   }
 }
 
+/**
+ * The Node-only settings, as a Worker sees them.
+ *
+ * Application code reads this schema in both runtimes (`getEnv()`), but a Worker has no MongoDB
+ * and no filesystem, and is deliberately *not* configured with `MONGODB_URI` or the storage roots
+ * (EXTERNAL-SETUP.md §1.6). Without these, a Worker configured exactly as documented passes its
+ * own startup gate (`loadWorkerEnv`) and then fails every request that reads `getEnv()`.
+ *
+ * The values are unusable on purpose — an `.invalid` host (RFC 2606) and a root that says what it
+ * is — never a working fallback: Mongoose is refused in a Worker before it could connect
+ * (`db/connection.ts`), and nothing on the Worker path touches a storage root. A value that *is*
+ * set always wins, and on Node nothing changes: both remain required.
+ */
+const WORKER_NODE_ONLY_DEFAULTS: Readonly<Record<string, string>> = {
+  MONGODB_URI: 'mongodb://no-mongodb-on-a-worker.invalid/none',
+  LOCAL_STORAGE_ROOT: '/no-filesystem-on-a-worker/storage',
+  TEMP_UPLOAD_ROOT: '/no-filesystem-on-a-worker/temp',
+  QUARANTINE_ROOT: '/no-filesystem-on-a-worker/quarantine',
+  PREVIEW_ROOT: '/no-filesystem-on-a-worker/previews',
+  EXPORT_ROOT: '/no-filesystem-on-a-worker/exports',
+  BACKUP_ROOT: '/no-filesystem-on-a-worker/backups',
+};
+
+/**
+ * The Drive service-account names the Worker is configured with (`GOOGLE_SERVICE_ACCOUNT_*`,
+ * EXTERNAL-SETUP.md §1.6) and the longer ones this schema and the storage layer read
+ * (`GOOGLE_DRIVE_SERVICE_ACCOUNT_*`). `env.worker.ts` accepts both for its startup gate; without
+ * the same aliasing here, a Worker configured as documented passed that gate and then failed
+ * `getEnv()` on "GOOGLE_DRIVE_SERVICE_ACCOUNT_EMAIL is required". Either name works in either
+ * runtime; the longer one wins when both are set.
+ */
+const DRIVE_CREDENTIAL_ALIASES: ReadonlyArray<readonly [canonical: string, alias: string]> = [
+  ['GOOGLE_DRIVE_SERVICE_ACCOUNT_EMAIL', 'GOOGLE_SERVICE_ACCOUNT_EMAIL'],
+  ['GOOGLE_DRIVE_SERVICE_ACCOUNT_PRIVATE_KEY', 'GOOGLE_SERVICE_ACCOUNT_PRIVATE_KEY'],
+];
+
+function withRuntimeDefaults(source: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
+  const filled: NodeJS.ProcessEnv = { ...source };
+  for (const [canonical, alias] of DRIVE_CREDENTIAL_ALIASES) {
+    if (!filled[canonical] && filled[alias]) filled[canonical] = filled[alias];
+  }
+  if (isWorkerRuntime()) {
+    for (const [name, value] of Object.entries(WORKER_NODE_ONLY_DEFAULTS)) {
+      if (!filled[name]) filled[name] = value;
+    }
+  }
+  return filled;
+}
+
 let cached: AppEnv | null = null;
 
-export function loadEnv(source: NodeJS.ProcessEnv = process.env): AppEnv {
+export function loadEnv(input: NodeJS.ProcessEnv = process.env): AppEnv {
+  const source = withRuntimeDefaults(input);
   const parsed = envSchema.safeParse(source);
 
   if (!parsed.success) {
@@ -432,13 +605,17 @@ export function loadEnv(source: NodeJS.ProcessEnv = process.env): AppEnv {
   assertDevSwitcherNotRequestedInProduction(parsed.data, source);
 
   const raw = parsed.data;
-  // Scanning that is enabled in production fails closed unless the operator has
-  // explicitly said otherwise. Applied here rather than in the schema so the reason sits
-  // next to the decision.
+  // Scanning that is enabled fails closed unless the operator has explicitly said otherwise —
+  // in production, on staging (where the rehearsal runs on a production snapshot) and on any
+  // Worker. Only a developer's machine defaults to failing open, so a missing clamd does not
+  // stop anyone working. Applied here rather than in the schema so the reason sits next to the
+  // decision.
+  const failClosedByDefault =
+    raw.NODE_ENV === 'production' || raw.NODE_ENV === 'staging' || isWorkerRuntime();
   const v: RawEnv = {
     ...raw,
     MALWARE_SCAN_FAIL_CLOSED:
-      raw.NODE_ENV === 'production' && raw.MALWARE_SCAN_ENABLED
+      failClosedByDefault && resolveMalwareScanMode(raw) !== 'disabled'
         ? source.MALWARE_SCAN_FAIL_CLOSED === 'false' || source.MALWARE_SCAN_FAIL_CLOSED === '0'
           ? false
           : true
@@ -456,6 +633,11 @@ export function loadEnv(source: NodeJS.ProcessEnv = process.env): AppEnv {
 
   assertRootsArePrivate(storageRoots);
 
+  // Fails closed on a DATA_SOURCE_* split that would put a foreign key across two databases.
+  // Here rather than at the first write, so the mistake surfaces at startup with the exact
+  // pair named — see `dataSourceViolations()`.
+  assertDataSourceMatrix();
+
   return {
     ...v,
     isProduction: v.NODE_ENV === 'production',
@@ -469,6 +651,7 @@ export function loadEnv(source: NodeJS.ProcessEnv = process.env): AppEnv {
     defaultDepartmentQuotaBytes: v.DEFAULT_DEPARTMENT_STORAGE_QUOTA_GB * GB,
     googleDriveUploadChunkBytes: v.GOOGLE_DRIVE_UPLOAD_CHUNK_MB * MB,
     uploadDriveSyncThresholdBytes: v.UPLOAD_DRIVE_SYNC_THRESHOLD_MB * MB,
+    malwareScanMode: resolveMalwareScanMode(v),
   };
 }
 

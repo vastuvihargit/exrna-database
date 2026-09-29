@@ -14,7 +14,6 @@
  *   exports/{userId}/{exportJobId}.zip
  *   archives/{organizationId}/{year}/{fileId}/{versionId}
  */
-import { randomUUID } from 'crypto';
 import { assertSafeKey } from './path-safety';
 import type { StorageArea } from './types';
 
@@ -28,7 +27,7 @@ function id(value: string, label: string): string {
 }
 
 export function newStorageId(): string {
-  return randomUUID();
+  return crypto.randomUUID();
 }
 
 export interface KeyRef {

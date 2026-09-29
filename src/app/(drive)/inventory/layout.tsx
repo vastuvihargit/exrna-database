@@ -17,7 +17,10 @@ import { requireActor } from '@/server/http/page-guard';
  */
 export const dynamic = 'force-dynamic';
 
-const INVENTORY_TABS = [{ href: '/inventory/items', label: 'Items' }];
+const INVENTORY_TABS = [
+  { href: '/inventory', label: 'Overview' },
+  { href: '/inventory/items', label: 'Items' },
+];
 
 export default async function InventoryLayout({ children }: { children: ReactNode }) {
   const actor = await requireActor('/inventory');

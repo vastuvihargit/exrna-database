@@ -86,7 +86,7 @@ async function uploadInto(
     { folderId, filename, size: content.byteLength },
     TEST_META,
   );
-  await uploadService.receiveStream(actor, ticket.sessionId, Readable.from(content));
+  await uploadService.receiveStream(actor, ticket.sessionId, Readable.from(content), TEST_META);
   const result = await uploadService.finalize(actor, ticket.sessionId, TEST_META);
   return { fileId: result.fileId, versionId: result.versionId };
 }
@@ -166,7 +166,7 @@ describe('file mutations reach the Shared Drive', () => {
       { folderId: folder, filename: 'multi.txt', size: 2, targetFileId: first.fileId },
       TEST_META,
     );
-    await uploadService.receiveStream(actor, ticket.sessionId, Readable.from(Buffer.from('v2')));
+    await uploadService.receiveStream(actor, ticket.sessionId, Readable.from(Buffer.from('v2')), TEST_META);
     const second = await uploadService.finalize(actor, ticket.sessionId, TEST_META);
 
     await fileService.renameFile(actor, first.fileId, 'renamed.txt', TEST_META);
@@ -420,7 +420,7 @@ describe('a Drive failure changes nothing', () => {
       { folderId: folder, filename: 'partial.txt', size: 2, targetFileId: first.fileId },
       TEST_META,
     );
-    await uploadService.receiveStream(actor, ticket.sessionId, Readable.from(Buffer.from('v2')));
+    await uploadService.receiveStream(actor, ticket.sessionId, Readable.from(Buffer.from('v2')), TEST_META);
     const second = await uploadService.finalize(actor, ticket.sessionId, TEST_META);
 
     // First rename succeeds, second fails — the first must be rolled back.

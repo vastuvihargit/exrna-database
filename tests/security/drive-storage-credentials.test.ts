@@ -122,9 +122,25 @@ describe('the Drive credential cannot reach the browser', () => {
       if (source.includes('GOOGLE_DRIVE_SERVICE_ACCOUNT_PRIVATE_KEY')) readers.push(path.relative(SRC, file));
     }
 
-    // env.ts declares it; drive-config.ts resolves it. Nothing else may touch it.
+    /**
+     * `env.ts` declares it and `drive-config.ts` resolves it. Nothing else may touch it.
+     *
+     * `env.worker.ts` was added to this list in Cloudflare Phase 1, and only because it is
+     * a *declaration* of the same kind as `env.ts` — the Worker runtime's environment
+     * contract, which names the variable so it can be validated at boot and accepts the
+     * longer `GOOGLE_DRIVE_*` spelling as an alias for the shorter `GOOGLE_*` one the
+     * Worker uses. It does not read the key's value, pass it anywhere, or log it.
+     *
+     * **This list must not grow again without the same scrutiny.** The point of the
+     * assertion is that a credential which appears in three files is one somebody can lose
+     * track of; two declarations and one resolver is already the ceiling.
+     */
     expect(readers.sort()).toEqual(
-      [path.join('server', 'config', 'env.ts'), path.join('server', 'storage', 'google', 'drive-config.ts')].sort(),
+      [
+        path.join('server', 'config', 'env.ts'),
+        path.join('server', 'config', 'env.worker.ts'),
+        path.join('server', 'storage', 'google', 'drive-config.ts'),
+      ].sort(),
     );
   });
 });
