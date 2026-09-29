@@ -27,6 +27,10 @@ D1 suite, and a fresh Worker preview — rather than by review. Results:
 - **A record still on local disk downloaded from a Worker as a truncated file**; the local provider
   is no longer registered there, so it fails before any byte is sent.
 - **The employee table re-rendered for ever while loading**, hanging the *Add employee* pickers.
+- **Cloudflare Workers Builds failed on its default commands** (`npm run build` +
+  `npx wrangler deploy`): a plain `next build` left no Worker and let the argon2 native addon
+  into the bundle. `npm run build` now runs `cf:build` when `WORKERS_CI=1`; elsewhere it is
+  unchanged. The Worker is renamed `exrna-database` to match the Cloudflare project.
 
 ### Tests
 - Browser suite green: **34/34** on the D1 backend (was 18/32). Spec defects fixed along the way
