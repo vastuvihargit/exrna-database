@@ -5,7 +5,7 @@
  * Driven by the administrator, who holds the full inventory permission set.
  */
 import { expect, test, type BrowserContext, type Page } from '@playwright/test';
-import { api, contextFor } from './helpers';
+import { api, contextFor, mutate } from './helpers';
 
 const RUN = Date.now().toString(36);
 const NAME = `TRIzol Reagent ${RUN}`;
@@ -139,11 +139,7 @@ test('the stock history is complete and immutable', async () => {
 
   // There is no write path to a ledger row: the stock endpoint takes POST (a new movement) only.
   for (const method of ['PUT', 'PATCH', 'DELETE'] as const) {
-    const response = await page.request.fetch(`/api/inventory/items/${itemId}/stock`, {
-      method,
-      data: { quantityDelta: 1000 },
-      headers: { origin: new URL(page.url()).origin },
-    });
+    const response = await mutate(page, method, `/api/inventory/items/${itemId}/stock`, { quantityDelta: 1000 });
     expect(response.status(), `${method} on the ledger`).toBe(405);
   }
 

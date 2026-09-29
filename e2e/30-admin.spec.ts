@@ -4,7 +4,7 @@
  * what their own session can actually reach. Deactivation ends it.
  */
 import { expect, test, type BrowserContext, type Page } from '@playwright/test';
-import { api, contextFor, send, signInAs } from './helpers';
+import { api, contextFor, newMachine, send, signInAs } from './helpers';
 import { E2E_PASSWORD } from './env';
 
 const RUN = Date.now().toString(36);
@@ -85,7 +85,7 @@ test('add an employee to it as a Research Scientist', async () => {
 });
 
 test('the employee signs in and reaches only their own department', async ({ browser }) => {
-  const context = await browser.newContext();
+  const context = await newMachine(browser);
   const page = await context.newPage();
   await signInAs(page, EMPLOYEE.email, E2E_PASSWORD);
   employee = { context, page };
@@ -124,13 +124,18 @@ test('after signing in again, the new department is reachable', async () => {
 
 test('project access follows membership', async () => {
   // No project-creation screen exists yet, so the administrator uses the API the UI would.
+  //
+  // `restricted`, because clearance belongs to the person: the Research Scientist grant clears
+  // this employee to `confidential`, so a confidential MOLBIO project is legitimately visible
+  // through the MOLBIO grant. `restricted` is never reachable by role scope — only membership
+  // (or an explicit share) opens it, which is the rule under test.
   const departments = await api<{ id: string; code: string }[]>(admin.page.request, '/api/departments');
   const molbio = departments.find((department) => department.code === 'MOLBIO')!;
   const project = await send<{ id: string }>(admin.page, 'POST', '/api/projects', {
     name: PROJECT.name,
     code: PROJECT.code,
     departmentId: molbio.id,
-    confidentiality: 'confidential',
+    confidentiality: 'restricted',
   });
   expect((await drivesOf(employee.page)).projects.map((drive) => drive.name)).not.toContain(PROJECT.name);
   expect((await employee.page.request.get(`/api/projects/${project.id}`)).status()).toBe(404);
@@ -160,6 +165,8 @@ test('a deactivated employee is refused, session and sign-in alike', async () =>
   await employee.page.getByLabel('Work email').fill(EMPLOYEE.email);
   await employee.page.getByLabel('Password').fill(E2E_PASSWORD);
   await employee.page.getByRole('button', { name: 'Sign in' }).click();
+  // The generic refusal, not a rate-limit message that would also leave us on /login.
+  await expect(employee.page.getByText('Incorrect email address or password')).toBeVisible();
   await expect(employee.page).toHaveURL(/\/login/);
   expect((await employee.page.request.get('/api/drives')).status()).toBe(401);
 });

@@ -9,6 +9,8 @@
  */
 import { spawnSync } from 'node:child_process';
 import fs from 'node:fs';
+import { createRequire } from 'node:module';
+import path from 'node:path';
 import mongoose from 'mongoose';
 import {
   E2E_BACKEND,
@@ -20,11 +22,24 @@ import {
   baseEnv,
 } from './env';
 
-function run(label: string, command: string, args: string[]): void {
+const resolveFromRoot = createRequire(path.resolve('package.json')).resolve;
+
+/**
+ * The two CLIs the setup drives, run by this Node binary directly rather than through `npx`.
+ *
+ * `npx` on Windows needs `shell: true`, and cmd.exe then re-splits every argument on spaces:
+ * a checkout under a path with a space in it (or a TEMP that has one) handed wrangler a broken
+ * `--persist-to`. Without a shell each argument arrives exactly as written.
+ */
+const CLI = {
+  tsx: resolveFromRoot('tsx/cli'),
+  wrangler: path.join(path.dirname(resolveFromRoot('wrangler/package.json')), 'bin', 'wrangler.js'),
+};
+
+function run(label: string, cli: keyof typeof CLI, args: string[]): void {
   const started = Date.now();
-  const result = spawnSync(command, args, {
+  const result = spawnSync(process.execPath, [CLI[cli], ...args], {
     env: { ...process.env, ...baseEnv(), CI: 'true' },
-    shell: process.platform === 'win32',
     encoding: 'utf8',
     maxBuffer: 64 * 1024 * 1024,
   });
@@ -50,35 +65,35 @@ export default async function globalSetup(): Promise<void> {
 
   // The same provisioning step a host runs once (`npm run storage:init`): the upload path
   // checks free space on the storage root, and a root that does not exist is an error.
-  run('initialize local storage', 'npx', ['tsx', 'scripts/init-storage.ts']);
+  run('initialize local storage', 'tsx', ['scripts/init-storage.ts']);
 
   await mongoose.connect(E2E_MONGODB_URI);
   await mongoose.connection.dropDatabase();
   await mongoose.disconnect();
 
-  run('seed MongoDB', 'npx', [
-    'tsx', 'scripts/seed.ts',
+  run('seed MongoDB', 'tsx', [
+    'scripts/seed.ts',
     '--admin-email', USERS.admin.email,
     '--admin-password', E2E_PASSWORD,
-    '--admin-name', `"${USERS.admin.name}"`,
+    '--admin-name', USERS.admin.name,
     '--demo',
     '--demo-password', E2E_PASSWORD,
   ]);
 
   if (E2E_BACKEND === 'd1') {
-    run('apply D1 migrations', 'npx', [
-      'wrangler', 'd1', 'migrations', 'apply', 'biotech-drive-dev',
+    run('apply D1 migrations', 'wrangler', [
+      'd1', 'migrations', 'apply', 'biotech-drive-dev',
       '--env', 'development', '--local', '--persist-to', E2E_D1_DIR,
     ]);
-    run('migrate MongoDB to D1', 'npx', [
-      'tsx', 'scripts/migrate-to-d1.ts',
+    run('migrate MongoDB to D1', 'tsx', [
+      'scripts/migrate-to-d1.ts',
       '--env', 'development', '--write', '--persist-to', E2E_D1_DIR,
-      '--run-id', 'e2e', '--report', `${E2E_STATE_DIR}/migration-report.json`,
+      '--run-id', 'e2e', '--report', path.join(E2E_STATE_DIR, 'migration-report.json'),
     ]);
-    run('verify the migration', 'npx', [
-      'tsx', 'scripts/verify-d1-migration.ts',
+    run('verify the migration', 'tsx', [
+      'scripts/verify-d1-migration.ts',
       '--env', 'development', '--persist-to', E2E_D1_DIR,
-      '--report', `${E2E_STATE_DIR}/verify-report.json`,
+      '--report', path.join(E2E_STATE_DIR, 'verify-report.json'),
     ]);
   }
 }
