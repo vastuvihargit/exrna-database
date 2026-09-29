@@ -1,21 +1,16 @@
 # Deployment readiness — Biotech Research Drive on Cloudflare
 
-**Status: NOT READY.** Interim revision after the migration-tooling commit (`03adb14`); a full
-rewrite follows once the remaining code items are done.
+**Status: READY FOR PRODUCTION REHEARSAL** — as of 2026-09-29, branch `cloudflare-migration`.
 
-Both repository blockers named by the previous revision are now closed:
+That means exactly this: the locally implementable code is complete, every test suite is green,
+the Worker builds and serves in a local preview, the migration tooling is ready and has been run,
+and the cutover and rollback runbooks are written. **What remains needs things this repository
+cannot provide**: live Cloudflare and Google resources, a malware-scanning decision, and a
+rehearsal on a real production snapshot (§6).
 
-1. ~~Uploads cannot work in a Worker.~~ **Fixed by `e023975`** — uploads stage directly into a
-   Google Drive staging folder behind `UPLOAD_STAGING=google_drive` and are promoted by
-   re-parenting. See `20-phase-7-worker-uploads.md`.
-2. ~~No Mongo → D1 metadata migration tooling exists.~~ **Code complete and tested locally
-   (`03adb14`)** — validate, migrate (dry run by default), resume, delta pass and verify. It has
-   been dry-run against the development MongoDB; it has not been run against a production
-   snapshot. See `21-phase-9-mongo-to-d1-migration.md`.
-
-What still stands between this repository and a deployment is §6.5–§6.6 (Access wiring, queue
-consumers, end-to-end tests, a fresh Worker preview, the cutover runbook) and the external items
-in §7.
+It does **not** mean production is live, or production-ready. No production resource exists, no
+production flag has changed, no live Google Drive or Cloudflare Access call has been made, and
+no migration has touched real data.
 
 ---
 
@@ -23,410 +18,147 @@ in §7.
 
 ```
 Browser
-  └── Cloudflare Access  (Google Workspace IdP)   identity, verified server-side
-        └── Cloudflare Worker  (OpenNext-built Next.js 15)
+  └── Cloudflare Access  (Google Workspace IdP)   identity, verified server-side (JWT)
+        └── Cloudflare Worker  (OpenNext-built Next.js 15, entry: cloudflare-worker.ts)
               ├── D1                     application metadata — the authoritative store
               ├── Google Shared Drive    file bytes; D1 holds metadata only
-              └── Queues                 asynchronous delivery and Drive sync
+              ├── Queues                 Drive sync + notifications (with DLQs), fed by two crons
+              └── Durable Object         RATE_LIMITER — exact counters across isolates
 ```
 
-MongoDB and the local object store remain the rollback path until cutover verification
-completes. **No production flag has been changed by this work**: every `DATA_SOURCE_*` variable
-is unset, and unset means MongoDB.
+The legacy Node + MongoDB + local-disk deployment remains production until cutover and the
+rollback target after it. Every `DATA_SOURCE_*` is unset in every committed configuration.
 
-## 2. What is complete and proven
+## 2. Gate results
 
-Each has a document in `docs/cloudflare-migration/` recording its design, its divergences from
-MongoDB, and its verification.
-
-| Module | Flag | Document |
-|---|---|---|
-| Worker / OpenNext compatibility | — | `01-phase-1-worker.md` |
-| D1 schema and migrations 0000–0004 | — | `02-phase-2-d1-schema.md` |
-| Users, departments | `_USERS`, `_DEPARTMENTS` | `03-…-module-1` |
-| Roles, permissions | `_ROLES` | `04-…-module-2` |
-| Projects, experiments | `_PROJECTS`, `_EXPERIMENTS` | `05-…-module-3` |
-| ACL visibility, deny, expiry, inheritance | — | `06-…-module-4` |
-| Folders | `_FOLDERS` | `07-…-module-5` |
-| Files, metadata, tags, FTS | `_FILES` | `08-…-module-6` |
-| Atomic folder+file moves | — | `09-…-module-7` |
-| Atomic trash / restore / archive | — | `10-…-module-8` |
-| File versions, atomic version writes | `_FILE_VERSIONS` | `11-…-module-9` |
-| Search, stars, recent, saved searches | `_SEARCH` | `12-…-module-10` |
-| Reviews and approvals | `_REVIEWS` | `13-…-module-11` |
-| Audit trail | `_AUDIT_LOGS` | `14-…-module-12` |
-| Sessions, organizations, notifications, flag matrix, Cloudflare Access | `_SESSIONS`, `_ORGANIZATIONS`, `_NOTIFICATIONS` | `15-…-module-13` |
-| Storage audit (classification only) | — | `16-phase-7-storage-audit.md` |
-| Login history, settings, storage accounting, activity, comments, upload sessions | `_LOGIN_HISTORY`, `_APP_SETTINGS`, `_STORAGE_USAGE`, `_ACTIVITIES`, `_COMMENTS`, `_UPLOAD_SESSIONS` | `17-…-module-14` |
-| Inventory, batches, stock ledger **and stock movement** | `_INVENTORY` | `18-…-module-15` |
-| Drive change-feed cursor | `_DRIVE_SYNC` | `19-…-module-16` |
-
-## 3. Test results
-
-Exactly as run, from the repository root, at the tip of `cloudflare-migration`.
+Run on 2026-09-29 at the tip of `cloudflare-migration`, on the development machine (Windows 11,
+8 GB), one heavy job at a time.
 
 | Gate | Command | Result |
 |---|---|---|
-| Full MongoDB suite | `npm run test:mongo` | **51 files, 768 tests passed** (192 s) |
-| Full D1 suite | `npm run test:d1` | **17 files, 584 tests passed** (1844 s) |
 | Typecheck | `npm run typecheck` | clean |
 | Lint | `npm run lint` | clean |
-| Worker production build | `npm run cf:build` | **passed** — bundle written to `.open-next/worker.js` |
-| Worker preview | `npm run cf:preview` | **not run in this session** — see §3.2 |
-
-The D1 suite is slow by design: `fileParallelism: false`, a real Miniflare/workerd SQLite per
-file, and a real `mongod` per file for the parity blocks. It fails rather than skips when either
-database is unavailable, because a run that quietly checked nothing reports the same green ticks
-as one that checked everything.
-
-### 3.1 What the newest suites assert
-
-* `tests/d1/session-organization-repository.test.ts` — 42 tests. Each session-liveness predicate
-  is defeated **individually**, because an implementation missing exactly one of them passes a
-  combined test and is an authentication bypass.
-* `tests/d1/notification-repository.test.ts` — 20 tests, both engines, including that
-  deduplication does *not* over-reach: two identical notifications with no dedupe key must both
-  survive.
-* `tests/unit/cloudflare-access.test.ts` — 21 tests signing real RS256 tokens against a generated
-  key pair. Refuses `alg: none`, HS256-with-the-public-key, a tampered payload, an unknown `kid`,
-  another application's audience, another team's issuer, expired, not-yet-valid, and an
-  unreachable certs endpoint.
-
-### 3.2 Honest note on the Worker gates
-
-`cf:build` **was** re-run after the module 13 changes and passed. That matters more than it
-sounds: `env.worker.ts` gained two startup assertions and now imports `data-source.ts` and
-`cloudflare-access.ts`, so the build is what proves neither pulled anything Node-only into the
-Worker module graph.
-
-`cf:preview` was **not** re-run. The earlier result is recorded in `01-phase-1-worker.md` and
-should not be treated as current, because the new assertions run at boot: a preview started
-without `CF_ACCESS_*` will now warn, and one started with `NODE_ENV=production` will refuse.
-Re-establish it before relying on it.
-
-## 4. What has *not* been verified
-
-Stated plainly, because the absence of a result is not a pass.
-
-* **No end-to-end test exists.** There is no Playwright suite and no `tests/e2e` content; the
-  vitest config excludes that path. The scientist workflow in the brief has not been executed
-  against a running application.
-* **No live Google Drive call has been made.** Drive code is exercised against
-  `tests/helpers/fake-drive.ts`. No credentials were available.
-* **No live Cloudflare Access token has been verified.** The suite generates its own key pair.
-* **No migration has been run against production-shaped data.** The tooling has been dry-run
-  against the development MongoDB (292 records, 0 failed); a real-snapshot rehearsal needs a
-  production snapshot.
-* **No UI walkthrough** has been performed against a running application.
-
-## 5. Defects found and fixed
-
-Nine, each reachable in code that had already shipped or been written.
-
-### 5.0 `objectIdSchema` rejected every id D1 mints — a cutover blocker
-
-The most consequential one found so far, and it was in a four-line validator.
-
-`objectIdSchema` accepted only 24 hex characters. Every D1 repository mints
-`crypto.randomUUID()`. So the moment any module was switched to D1, **every resource created
-after the switch had an id its own API rejected** — 238 call sites returning 422 "Invalid
-identifier" from routes that never reached the database. A user would create a folder and be
-unable to open it.
-
-There is no cutover ordering that avoids it, because migrated rows keep their ObjectId (Phase 9
-preserves them as TEXT) and new rows get UUIDs, so both shapes are live in the same column at the
-same time. `schema/_shared.ts` says so explicitly — *"Both shapes coexist in the same column
-deliberately"* — and the validator had simply never been told.
-
-Widened to accept either. The anchored, fixed-length, character-restricted check was kept
-because it is load-bearing twice over: `Types.ObjectId.isValid()` returns true for any
-12-character string, and the Mongo repositories branch on it to return `null`, so a value that is
-neither shape reaching that branch turns a malformed request into a 404 instead of a 422.
-
-### 5.7 A stock overdraw check that reported success
-
-The first MongoDB `issue()` used `updateOne` with `arrayFilters` pinning
-`quantity: { $gte: take }`, and treated `modifiedCount === 0` as "somebody got there first".
-
-The driver reports the *parent document* as matched, so the overdraw case did not throw — it
-changed nothing and returned success. The failure mode is the bad one: the caller is told the
-stock was issued, the material is still on the shelf, and the two only disagree at the next
-stock take.
-
-Found by the concurrency test rather than by review, which is the argument for writing that test.
-Replaced by a comparison against the value read inside the transaction; the write conflict makes
-`withTransaction` retry, so the loser re-reads the decremented quantity.
-
-### 5.8 SQLite validates CHECK before resolving an upsert conflict
-
-A negative D1 stock adjustment was written as an upsert carrying `quantity = -3`, relying on
-`ON CONFLICT DO UPDATE` to turn it into `quantity + (-3)`.
-
-SQLite validates CHECK constraints on the candidate row **first**, so
-`ck_inventory_batches_quantity` aborts the statement even though the DO UPDATE branch would have
-produced a legal positive value. Worth recording because the resulting error is indistinguishable
-from a real overdraw, and would have been "fixed" by weakening the constraint.
-
-Negative adjustments now use a plain UPDATE, which is sound because the batch is required to
-exist.
-
-### 5.1 D1 binds at most 100 parameters per statement — not 999
-
-Comments across the D1 layer were written against SQLite's compile-time default of 999
-(`MAX_BOUND_IDS = 500`, `MAX_ACTOR_PRINCIPALS = 200`). Measured against the real engine, D1
-accepts 100 and refuses 101.
-
-Reachable paths: the **Starred page** (`listStarred` hands up to 200 ids to `findByIds`), any
-folder page at maximum page size, and every listing for an actor carrying ~90 principals —
-because the principal list is bound inside the visibility predicate of every permission-aware
-read.
-
-Fixed by `src/server/db/d1-bindings.ts`, which renders `IN (SELECT value FROM json_each(?))` —
-one bound parameter regardless of list length — applied across all D1 repositories and
-`visibility.d1.ts`. `EXPLAIN QUERY PLAN` confirms the index is still used.
-`tests/d1/bound-parameter-limit.test.ts` measures the ceiling rather than asserting a remembered
-number.
-
-### 5.2 File search dropped its text filter for punctuation-only queries
-
-`file.repository.d1.ts` built its `MATCH` argument by escaping rather than extracting, and the
-caller read `if (match) push(...)`. A search for `***` therefore applied **no filter** and
-returned every file the actor could see — the user asked one question and was shown the answer
-to another.
-
-Fixed by `src/server/repositories/fts-query.ts`, which extracts word runs and returns `null` for
-unsearchable input; callers turn that into *no results*, never *no filter*. The
-phrase-per-word rule was itself found by a test: OR-ing tokens *within* a word made a search for
-`S-1111` match `S-2222` on the shared `S`.
-
-### 5.3 Mongo aggregates counted trashed files
-
-Mongoose does not route `aggregate` through the soft-delete middleware, so `searchFacets` and
-four of the five `projectContentBreakdown` figures counted trashed files while
-`linkedToExperiment` — a `countDocuments`, and therefore hooked — did not. A facet chip reading
-`qpcr (2)` beside a single result row discloses that a second file exists. Fixed on the Mongo
-side and pinned on both engines.
-
-### 5.4 The session sweep could not run at all
-
-`deleteExpiredBefore` is new on both engines, because SQLite has no TTL index. The first D1
-implementation issued a bare `DELETE` and failed on a foreign key: `login_history.session_id`
-references `sessions.id` with no cascade, so *every session that was ever logged into* blocks its
-own deletion. `sessions.rotated_from_id` does the same for rotated sessions.
-
-Now detaches both references and deletes, all three statements in one `batch()`. Detaching rather
-than cascading is deliberate: a login-history row is a security record that must outlive the
-session it describes.
-
-Found by a test. A sweep that crashes leaves expired sessions in the table for ever, and the only
-symptom is a growing table nobody is watching.
-
-### 5.5 `sparse: true` does not exclude an explicit `null`
-
-The MongoDB deduplication index was first written `{ unique: true, sparse: true }`. Sparse
-excludes documents where the field is *absent*; every inline-written notification stores an
-explicit `dedupeKey: null` from the schema default. The index therefore covered all of them,
-decided they were the same key, and **rejected the second notification anybody ever received**.
-Now `partialFilterExpression: { dedupeKey: { $type: 'string' } }`.
-
-### 5.6 A partial unique index breaks `ON CONFLICT` on SQLite
-
-The D1 side was first given a matching partial index. SQLite matches `ON CONFLICT (col)` to an
-index by comparing the columns *and* the WHERE clause, so it needs
-`ON CONFLICT (dedupe_key) WHERE dedupe_key IS NOT NULL` — and drizzle's SQLite builder emits its
-`where` after `DO NOTHING`, which is the `DO UPDATE` position and a syntax error. The failure was
-not on a duplicate; it was on the first insert.
-
-Resolved by making the D1 index plain: SQLite treats every NULL in a unique index as distinct, so
-`UNIQUE(dedupe_key)` already permits unlimited NULLs. The two engines legitimately need different
-index shapes, and migration 0004 says why.
-
-## 6. What remains
-
-### 6.1 Uploads assume a local filesystem — RESOLVED (`e023975`)
-
-The staging backend (`storage/staging/`) gives `upload.service.ts` one call instead of eight
-`getStorageProvider()` calls. Drive staging buffers the first 4 KB for the signature check,
-streams a resumable upload into `.upload-staging/`, verifies size and checksum, and promotes with
-`files.update` (a metadata change). Migration 0005 added `external_upload_uri` and
-`external_staged_id`. `/api/health/ready` no longer reports `local` for external staging.
-Details and verification: `20-phase-7-worker-uploads.md`.
-
-### 6.2 The repository list is closed — RESOLVED
-
-Modules 14, 15 and 16 finished it. Every repository a Worker can reach now has a
-contract/Mongo/D1/façade split, tests on both engines and a flag.
-
-`migration` and `storage-migration` still have no D1 implementation and never will: they read the
-local filesystem by definition and must keep running on Node.
-
-### 6.3 Inventory stock movement — RESOLVED
-
-Implemented in module 15, on both engines. Receipts, issues, adjustments and the expiry sweep
-each move stock and append a ledger row atomically or do neither; negative stock is prevented by
-`CHECK` inside a D1 `batch()` and by the retried transaction on MongoDB; the ledger's before/after
-figures are computed by the database rather than predicted. `18-…-module-15.md` has the design and
-the reasoning, including two deliberate divergences between the engines.
-
-The UI is done too: receive/issue/adjust from the item page, a stock-history table showing the
-running total per row, and an overview page with the four counts a store manager checks first.
-
-### 6.4 Mongo → D1 metadata migration tooling — CODE COMPLETE (`03adb14`)
-
-`npm run migrate:validate`, `migrate:d1` and `migrate:verify`. 33 steps, ids preserved, dry run
-by default, checkpointed resume, delta pass, count / relationship / ACL / search verification.
-18 integration tests on real `mongod` + workerd SQLite and 17 unit tests on the gateways. Three
-defects found in review were fixed before commit (delta-pass reference seeding, failed-step
-checkpoint, continuing past a failed step). Not yet run against a production snapshot — that is a
-rehearsal action, not code.
-
-### 6.5 Cloudflare Access is verified but not wired to a route
-
-`verifyAccessJwt` and `completeAccessLogin` exist and are tested. No route calls them, and
-`resolveSession` still expects a session cookie. Wiring is a route handler plus a product
-decision about whether Access replaces the login page or sits in front of it.
-
-### 6.6 Everything downstream
-
-Not started: Queue consumers (`wrangler.jsonc` declares producers only — deliberately, because a
-consumer declared without a handler silently swallows messages), end-to-end tests, the UI
-walkthrough against a running application, and the cutover runbook, which should not be written
-as though it were runnable until §6.4 exists.
-
-Much of the Phase 14 UI work is already done from earlier phases: the home page is no longer a
-build tracker, the navigation carries no migration jargon, and the combined folder/file lifecycle
-views are covered by module 10's tests. One remaining instance of build-phase jargon in the admin
-role dialog ("Phase 3") was removed in this run.
-
-## 7. Genuine external blockers
-
-Only two things here need somebody outside this repository.
-
-1. **Live credentials** — a Google Shared Drive id and service-account key, a Cloudflare account
-   with D1 databases created, and an Access application. Everything they gate is *code-complete
-   and mocked*; what is blocked is the live smoke test, not the implementation.
-2. **A malware-scanning decision for the Worker.** `security/malware-scanner.ts` talks to clamd
-   over TCP and workerd has no `net`. The three options — an HTTP scanning service, scanning
-   asynchronously in a Queue consumer (which opens a window in which an infected file is
-   downloadable), or accepting no scanning in a Worker and saying so on the admin page — differ
-   in security posture, not in effort. **The code should not pick one silently.**
-
-## 8. Required secrets
-
-Names only. Set with `npx wrangler secret put <NAME> --env <development|staging|production>`.
-
-```
-AUTH_SECRET
-SESSION_SECRET
-GOOGLE_SHARED_DRIVE_ID
-GOOGLE_SERVICE_ACCOUNT_EMAIL
-GOOGLE_SERVICE_ACCOUNT_PRIVATE_KEY
-GOOGLE_WORKSPACE_DOMAIN
-CF_ACCESS_TEAM_DOMAIN
-CF_ACCESS_AUD
-```
-
-`GOOGLE_DRIVE_ROOT_FOLDER_ID` is optional; without it content is written to the Shared Drive
-root, which the admin page reports as a warning because a dedicated folder is easier to audit.
-
-`CF_ACCESS_TEAM_DOMAIN` and `CF_ACCESS_AUD` are **required in production** and `loadWorkerEnv`
-refuses to boot without them — see §9.2. They must be set together: a team domain with no
-audience verifies signatures and accepts any Access application's token on the same team.
-
-`env.worker.ts` accepts both the short `GOOGLE_SERVICE_ACCOUNT_*` names and the longer
-`GOOGLE_DRIVE_SERVICE_ACCOUNT_*` names the Node deployment uses, so one `.env` can feed both.
-There is **no** file-based alternative in a Worker:
-`GOOGLE_DRIVE_SERVICE_ACCOUNT_PRIVATE_KEY_FILE` reads from disk.
-
-No real secret is in Git. `.dev.vars.example` carries names and empty values only.
-
-## 9. Cloudflare configuration
-
-### 9.1 Bindings
-
-Declared in `wrangler.jsonc` for all three environments:
-
-* **D1** — binding `DB`; `database_id` values are placeholders. Create with
-  `npx wrangler d1 create biotech-drive-<env>` and paste the returned id.
-* **Queues (producers)** — `SYNC_QUEUE`, `NOTIFICATION_QUEUE`.
-* **Assets** — binding `ASSETS`.
-* **Observability** — enabled; sampled at 0.2 in production.
-
-Not declared, deliberately: queue **consumers**, dead-letter queues, retry policy, and any
-`workflows` binding. A `workflows` binding requires the Worker entrypoint to export the workflow
-class, and the OpenNext-generated entrypoint exports only the Next.js handler — declaring it
-before the class exists makes every `wrangler dev` and every deploy fail.
-
-Apply migrations with `npm run db:migrate:production` (or `:staging`, `:local`).
-
-### 9.2 Access
-
-* One Access application in front of the Worker's hostname, with Google Workspace as the IdP and
-  a policy restricting to the company domain.
-* `CF_ACCESS_AUD` is that application's Audience tag; `CF_ACCESS_TEAM_DOMAIN` is
-  `<team>.cloudflareaccess.com`.
-* The Worker verifies the JWT's signature, issuer, audience, `exp` and `nbf` server-side. It
-  **never** trusts `Cf-Access-Authenticated-User-Email` — that header is plaintext and forgeable
-  by anything that can reach the Worker directly, and a Worker URL is public.
-* Access decides *identity*. Application roles still decide *capability*, and a verified token
-  for a suspended account is refused by `completeOAuthLogin`.
-
-## 10. Google Shared Drive configuration
-
-* One **Shared Drive** owned by the company; the service account added as a **Content Manager
-  member** of it.
-* **No domain-wide delegation.** It would let the key impersonate any employee in the Workspace
-  domain, turning a leaked environment variable into a full-domain compromise. Nothing here needs
-  impersonation: the application ACL is authoritative.
-* Scope `https://www.googleapis.com/auth/drive`, restricted in practice by that membership — the
-  account can see exactly one Shared Drive.
-* The logical structure `Company → Department → Project → Experiment → folders/files` is mirrored
-  into Drive, but **application authorization never depends on Google folder permissions**, and a
-  Drive file id is never treated as a capability.
-
-## 11. Migration, cutover and rollback
-
-The metadata tooling now exists (§6.4). The operational cutover and rollback runbooks are still
-to be written in this pass.
-
-**Rollback today is trivial, and is the state the repository is in.** Every `DATA_SOURCE_*`
-variable is unset, MongoDB serves every request, and the local object store holds every byte.
-Reverting any module is deleting its variable; it takes effect on the next request, because the
-flag is read per call and not cached at startup.
-
-## 12. The data-source flag matrix
-
-`DATA_SOURCE_DEPENDENCIES` in `src/server/repositories/data-source.ts` records every pair where
-one module cannot be on D1 unless another is. Each entry is a **foreign key that exists in the D1
-schema**, not a preference: a split pair does not degrade, it fails every write in the dependent
-module on a constraint violation, at runtime, on a user's action.
-
-`assertDataSourceMatrix()` runs inside both `loadEnv()` and `loadWorkerEnv()` and **refuses to
-boot** on an unsafe combination, naming the exact pair. `dataSourceViolations()` returns all of
-them rather than the first, because fixing one flag per restart cycle is how a cutover window
-gets spent.
-
-`workerReadinessGaps()` reports modules still on MongoDB: an error in a production Worker, a
-warning otherwise so `cf:preview` can boot with a partial set.
-
-Two flags are not independently movable, and both are runbook items rather than defects:
-
-* `DATA_SOURCE_SESSIONS` — flipping it logs everybody out, because the new engine holds none of
-  the existing sessions. It belongs inside the write freeze.
-* `DATA_SOURCE_NOTIFICATIONS` — notifications written before the flip stop appearing until the
-  migration copies them.
-
-## 13. Known limitations
-
+| MongoDB suites | `npm run test:mongo` | **69 files, 938 tests passed** (261 s) |
+| D1 suites | `npm run test:d1` | __D1_RESULT__ |
+| Browser E2E | `npm run test:e2e` | __E2E_RESULT__ |
+| Drizzle metadata | `npx drizzle-kit generate` | "No schema changes, nothing to migrate" — journal 0000–0005 |
+| Worker build | `npm run cf:build` | exit 0; entrypoint bundles (`wrangler deploy --dry-run`) at 2.67 MB gzip |
+| Worker preview | `opennextjs-cloudflare preview --env development` | serving; details in `26-worker-preview.md` |
+| Source validation | `npm run migrate:validate` (development MongoDB) | PASS — no blockers |
+| Migration dry run | `npm run migrate:d1` (development MongoDB → scratch local D1) | 33 steps, 295 read, 295 would-write, 0 skipped, 0 failed; nothing written |
+| Migration write + verify | E2E global setup: `migrate:d1 --write` + `migrate:verify` on seeded data | ok on every E2E run |
+
+The focused suites the task list names are inside those runs: security (`tests/security/`,
+including `cloudflare-access-integration`), Access (`tests/unit/cloudflare-access.test.ts`),
+queues (`tests/unit/queue-schedule.test.ts`, `tests/integration/queue-consumers.test.ts`),
+inventory (`tests/unit/inventory-domain.test.ts`, `tests/security/inventory-permissions.test.ts`,
+and stock movement plus the expiry sweep on both engines in `tests/d1/inventory-repository.test.ts`),
+migration (`tests/d1/mongo-to-d1-migration.test.ts`, `tests/unit/migration-gateway.test.ts`).
+
+### 2.1 What the Worker preview established
+
+Against a local D1 holding migrated data plus everything the E2E suite created, with every module
+routed to D1: health 200; every protected route 401 `UNAUTHENTICATED` without a session; with a
+session, folders, files, file versions, search, reviews/approvals, inventory, notifications and
+admin all 200, including D1 **writes** (create/trash a folder, share a file); the three Node-only
+tools 501 `NODE_ONLY_OPERATION`; the Durable Object limiter returning 429 with `Retry-After` after
+ten attempts; both crons enqueuing their work and both queue consumers processing it. No request
+returned a 500 from Worker or module loading. Not verified there: Access sign-in, any Drive call,
+live queues/DLQs (`26-worker-preview.md` §3).
+
+## 3. Defects found in this verification pass
+
+All found by running the gates, all fixed with a test that fails without the fix:
+
+| Defect | Severity | Doc |
+|---|---|---|
+| Confidential projects visible below clearance through role scope (both engines) | security | `25-browser-e2e.md` §5 |
+| Per-IP sign-in limit keyed on a client-written `X-Forwarded-For` | security | `docs/security/hardening.md` |
+| Overlapping D1 expiry sweeps wrote the same stock off twice | data integrity | `18-…-module-15` §4 |
+| Revoked session → redirect loop, sign-in page unreachable | availability | `25-browser-e2e.md` §5 |
+| Password sign-in on a Worker: 500 / misleading "incorrect password" | correctness | `26-worker-preview.md` §4.1 |
+| Local-disk record on a Worker downloaded as a truncated file | data integrity | `26-worker-preview.md` §4.2 |
+| Employee table re-render loop hung the *Add employee* pickers | UI | `25-browser-e2e.md` §5 |
+
+Earlier defects (the ObjectId/UUID validator, D1's 100-parameter limit, FTS filter dropping,
+trashed files in aggregates, the session sweep, notification dedupe indexes) are recorded in the
+module documents 03–19.
+
+## 4. Status of every production-readiness item
+
+| Item | State | Where |
+|---|---|---|
+| All repositories on D1 behind flags (22 `DATA_SOURCE_*`) | done; no flag without a reader (test-enforced) | `DATA-SOURCE-FLAGS.md` |
+| Unsafe flag combinations | refused at boot, all violations listed | `DATA-SOURCE-FLAGS.md` §3 |
+| Uploads on a Worker (Drive staging) | done | `20-phase-7-worker-uploads.md` |
+| Mongo → D1 migration tooling (validate, migrate, resume, delta, verify) | done, dry-run and write-verified locally | `21-phase-9-mongo-to-d1-migration.md` |
+| Cloudflare Access sign-in, JWT verified server-side | done | `22-cloudflare-access.md` |
+| Worker entrypoint: configuration gate, queue consumers, crons, DLQs | done | `23-worker-entrypoint-and-queues.md` |
+| Rate limiting on the Worker | Durable Object, exact across isolates | `docs/security/hardening.md` |
+| Inventory expiry sweep | daily via the 03:07 cron → queue; idempotent (now also under overlap) | `18-…-module-15` |
+| Node-only admin tools on a Worker | 501 `NODE_ONLY_OPERATION`; tabs hidden | `node-only.ts` |
+| Password reset / sign-in / change on a Worker | refused, pointing to the identity provider | `26-worker-preview.md` §4.1 |
+| Malware scanning boundary | `http` (fail-closed on Workers and staging) or explicit `disabled`; staging/production refuse to boot unset | `24-malware-scanning.md` |
+| Drizzle metadata | journal + snapshot through 0005; `db:generate` no-op; CI drift gate | — |
+| Browser E2E | green | `25-browser-e2e.md` |
+| Worker preview | verified | `26-worker-preview.md` |
+| CI | typecheck, lint, drift check, Mongo + D1 suites, legacy build, Worker build + dry-run bundle, E2E; no job deploys production | `.github/workflows/ci.yml` |
+| Deployment | staging Worker: manual workflow; production: runbook step 17, by an operator | `deploy-cloudflare.yml`, `CUTOVER-RUNBOOK.md` |
+| Cutover runbook (20 steps, maintenance window, session logout) | written | `CUTOVER-RUNBOOK.md` |
+| Rollback runbook (incl. reconciling D1-only writes) | written | `ROLLBACK-RUNBOOK.md` |
+| External setup checklist | written | `EXTERNAL-SETUP.md` |
+| Rehearsal commands | written | `REHEARSAL.md` |
+
+## 5. Known limitations (accepted, documented)
+
+* **Switching `DATA_SOURCE_SESSIONS` signs everyone out** — the new store holds none of the
+  existing sessions. It happens inside the maintenance window (cutover step 16).
+* **Clearance is per person, not per grant.** `actorClearance` is the highest over all of an
+  actor's grants, and authorization, file/folder filters and now project visibility all use it
+  that way. Someone cleared to `confidential` in one department sees `confidential` material in
+  another department where they hold any grant. This is the long-standing model, not a
+  regression; changing it is a product decision.
 * `setCurrent()` on the version repository moves `file_versions.is_current` without touching
-  `files.current_version_id`. Correct for its one caller, wrong for an upload; pinned by a test
-  with a comment saying not to reach for it as a shortcut.
-* The version validator's `missing_parent_file` check cannot be provoked on D1, because
-  `file_versions.file_id` is a real foreign key. It stays because it targets a copy of the Mongo
-  corpus loaded before constraints are enforced.
-* Audit records are written after the business commit rather than inside it, so a process death
-  in the gap can lose an audit row. The alternative — writing inside the transaction — can record
-  a success for a write that rolled back, which is worse.
-* `stored-content.ts` has a local-copy fallback that throws in a Worker (no `local` provider
-  registered) and is converted to the correct `NotFoundError` by the surrounding `catch`. The
-  behaviour is right; the log line it would have written is not reached.
+  `files.current_version_id` — correct for its one caller; pinned by a test.
+* Audit records are written after the business commit, so a process death in the gap can lose an
+  audit row (the alternative can record a success for a write that rolled back).
+* On a Worker, a record still pointing at local disk fails with `STORAGE_ERROR`. After cutover
+  none should exist (cutover step 12 checks).
+* `cf:preview` hides the Worker's `console.warn`/`console.error` (OpenNext pipes wrangler's
+  stderr); use `wrangler dev` to read them locally. Workers Logs captures them in production.
+* This machine had < 4 GB free disk during verification; Windows Storage Sense emptied `%TEMP%`
+  mid-run, so the heavy runs used a project-local `TEMP` (`25-browser-e2e.md` §3).
+
+## 6. What remains, and who does it
+
+### 6.1 External infrastructure (`EXTERNAL-SETUP.md` has the exact steps)
+
+**Cloudflare:** D1 databases for staging and production and their real `database_id`s in
+`wrangler.jsonc` (all three are the all-zero placeholder today); the sync and notification queues
+and their two DLQs per environment; the Access application (Google Workspace IdP, company-domain
+policy) and its audience tag; the hostname/custom domain; the Worker secrets.
+
+**Google:** the Shared Drive and its root folder; a service account added as **Content Manager**
+(no domain-wide delegation); the Workspace domain.
+
+**Secrets** (names only; set with `wrangler secret put <NAME> --env <env>`): `AUTH_SECRET`,
+`SESSION_SECRET`, `APP_URL`, `COMPANY_EMAIL_DOMAINS`, `GOOGLE_SHARED_DRIVE_ID`,
+`GOOGLE_DRIVE_ROOT_FOLDER_ID` (recommended), `GOOGLE_SERVICE_ACCOUNT_EMAIL`,
+`GOOGLE_SERVICE_ACCOUNT_PRIVATE_KEY`, `GOOGLE_WORKSPACE_DOMAIN`, `CF_ACCESS_TEAM_DOMAIN`,
+`CF_ACCESS_AUD`, `MALWARE_SCAN_SECRET` (with `http` mode). Vars: `MALWARE_SCAN_MODE`,
+`MALWARE_SCAN_ENDPOINT`, and the 22 `DATA_SOURCE_*=d1` at cutover step 15. CI needs
+`CLOUDFLARE_API_TOKEN` and `CLOUDFLARE_ACCOUNT_ID` in the `staging` GitHub environment.
+
+### 6.2 A business decision
+
+**The malware scanner.** `MALWARE_SCAN_MODE=http` needs a scanning service the company chooses
+(endpoint + secret); `disabled` needs someone to accept running without scanning, in writing.
+Staging and production Workers refuse to boot until one is set. Options and trade-offs:
+`EXTERNAL-SETUP.md` §4, `24-malware-scanning.md`.
+
+### 6.3 The rehearsal
+
+On a production snapshot, against staging: `REHEARSAL.md` has the exact commands — backup,
+validate, D1 migrations, dry run, write, verify, Drive migration and finalisation, resume, final
+deltas, smoke tests, and a rollback drill. Only after a clean rehearsal is the cutover
+(`CUTOVER-RUNBOOK.md`) scheduled.

@@ -2,6 +2,38 @@
 
 All notable changes to the Biotech Research Drive.
 
+## [Cloudflare migration — verification pass] — 2026-09-29
+
+Everything below was found by running the full gates — the browser suite to the end, the full
+D1 suite, and a fresh Worker preview — rather than by review. Results:
+`docs/cloudflare-migration/FINAL-READINESS.md`.
+
+### Security
+- **Confidential projects were visible below clearance**, on both engines. The project list (which
+  also gates `GET /api/projects/:id`) and the project drive let every role-scope route in
+  regardless of classification. Role scope now requires the project's classification to be within
+  the actor's clearance, as files and folders already did; members and the lead still see it.
+- **The per-IP sign-in limit was keyed on a client-written header.** The first
+  `X-Forwarded-For` entry is whatever the client sent (Cloudflare and nginx both append), so the
+  limit could be reset per attempt. Now `CF-Connecting-IP`, then `X-Real-IP`.
+
+### Fixed
+- **Overlapping D1 expiry sweeps wrote the same stock off twice** (a phantom ledger row). The
+  ledger insert is now guarded by the rows as they stand inside the atomic batch.
+- **A revoked session locked the person out of the sign-in page** (`ERR_TOO_MANY_REDIRECTS` after
+  any role change). A dead cookie is now cleared through `/api/auth/session-expired`.
+- **Password sign-in on a Worker** answered 500 for an unknown address and "incorrect password"
+  for a known one; it is now refused deliberately, like password reset.
+- **A record still on local disk downloaded from a Worker as a truncated file**; the local provider
+  is no longer registered there, so it fails before any byte is sent.
+- **The employee table re-rendered for ever while loading**, hanging the *Add employee* pickers.
+
+### Tests
+- Browser suite green: **34/34** on the D1 backend (was 18/32). Spec defects fixed along the way
+  are listed in `25-browser-e2e.md` §5; global setup now survives a path containing a space.
+- The route-protection test recognises `withNodeOnlyRoute` and pins that it authenticates.
+- Worker preview verification written up: `26-worker-preview.md`.
+
 ## [Cloudflare migration — production readiness] — 2026-09-28
 
 The last locally-fixable gaps between "every module has a D1 repository" and "ready for a
