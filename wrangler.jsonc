@@ -1,6 +1,6 @@
 {
   "$schema": "node_modules/wrangler/config-schema.json",
-  "name": "biotech-research-drive",
+  "name": "exrna-database",
   // The entrypoint wraps OpenNext's generated `.open-next/worker.js` with the configuration
   // gate, the queue consumers and the cron trigger. See cloudflare-worker.ts.
   "main": "cloudflare-worker.ts",
