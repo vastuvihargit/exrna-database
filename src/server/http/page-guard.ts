@@ -16,10 +16,19 @@ import { SESSION_COOKIE } from './cookies';
  */
 export async function requireActor(nextPath?: string): Promise<Actor> {
   const store = await cookies();
-  const resolved = await resolveRequestSession(store.get(SESSION_COOKIE)?.value, await headers());
+  const token = store.get(SESSION_COOKIE)?.value;
+  const resolved = await resolveRequestSession(token, await headers());
 
-  // With Cloudflare Access in front this is the Access sign-in bridge, not the password page.
-  if (!resolved) redirect(signInPath(nextPath));
+  if (!resolved) {
+    // A cookie that no longer resolves has to be cleared before sign-in, or the middleware —
+    // which sees only that a cookie exists — sends /login straight back here, in a loop.
+    if (token) {
+      const safeNext = nextPath && nextPath.startsWith('/') && !nextPath.startsWith('//') ? nextPath : null;
+      redirect(`/api/auth/session-expired${safeNext ? `?next=${encodeURIComponent(safeNext)}` : ''}`);
+    }
+    // With Cloudflare Access in front this is the Access sign-in bridge, not the password page.
+    redirect(signInPath(nextPath));
+  }
 
   return resolved.actor;
 }
