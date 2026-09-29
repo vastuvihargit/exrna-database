@@ -25,6 +25,7 @@ import type { ScopeType } from '@/server/domain/permissions';
 import type { RequestMeta } from '@/server/http/request-meta';
 import { normalizeCompanyEmail } from '@/server/auth/email-domain';
 import { checkPasswordPolicy, hashPassword } from '@/server/auth/password';
+import { isPasswordAuthAvailable } from '@/server/auth/access-session';
 import { userDirectoryFilter } from '@/server/permissions/visibility';
 import type { UserStatus } from '@/server/db/models';
 
@@ -227,6 +228,13 @@ export async function createEmployee(
 
   let passwordHash: string | null = null;
   if (input.temporaryPassword) {
+    // Where nobody signs in with a password, one set here could never be used — and on a Worker
+    // it could not even be hashed.
+    if (!isPasswordAuthAvailable()) {
+      throw new ValidationError(
+        'Temporary passwords are not used on this deployment: employees sign in with their company account.',
+      );
+    }
     const policy = checkPasswordPolicy(input.temporaryPassword, { email, name: input.name });
     if (!policy.ok) throw new ValidationError('Temporary password does not meet the policy', policy.problems);
     passwordHash = await hashPassword(input.temporaryPassword);

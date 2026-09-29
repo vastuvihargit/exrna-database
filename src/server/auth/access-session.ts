@@ -81,6 +81,21 @@ export function isPasswordRecoveryAvailable(): boolean {
 }
 
 /**
+ * Whether this deployment can sign anyone in with a password, change one, or set one.
+ *
+ * No behind Access (identity is external) and no on a Worker at all: the stored hashes are
+ * Argon2id, which workerd cannot compute (`shims/argon2.worker.ts`). Without this check a Worker
+ * without Access answered a sign-in for an unknown address with a 500 (the timing-equalisation
+ * hash threw) and a known address with "incorrect password" — even for the right password.
+ */
+export function isPasswordAuthAvailable(): boolean {
+  return !isAccessEnforced() && !isWorkerRuntime();
+}
+
+export const PASSWORD_AUTH_UNAVAILABLE_MESSAGE =
+  'Sign-in is handled by your company single sign-on. Password sign-in is not available here.';
+
+/**
  * Where the browser goes after signing out.
  *
  * With Access in front, clearing the application session alone would sign the person straight

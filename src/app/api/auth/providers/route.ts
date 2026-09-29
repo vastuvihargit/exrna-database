@@ -3,7 +3,7 @@ import { ok } from '@/server/http/api-response';
 import { getEnv } from '@/server/config/env';
 import { isGoogleConfigured } from '@/server/auth/google-oauth';
 import * as organizationRepository from '@/server/repositories/organization.repository';
-import { isAccessEnforced } from '@/server/auth/access-session';
+import { isAccessEnforced, isPasswordAuthAvailable } from '@/server/auth/access-session';
 
 export const runtime = 'nodejs';
 export const dynamic = 'force-dynamic';
@@ -22,7 +22,7 @@ export const GET = withRouteHandler(async () => {
 
   return ok({
     access,
-    password: !access,
+    password: isPasswordAuthAvailable(),
     google: !access && isGoogleConfigured(),
     microsoft: false,
     companyEmailDomains: domains,

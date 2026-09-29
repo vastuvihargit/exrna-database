@@ -38,7 +38,8 @@ import { issueSession, revokeAllSessions, type IssuedSession } from '@/server/au
 import { Types } from 'mongoose';
 import {
   EXTERNAL_PASSWORD_RECOVERY_MESSAGE,
-  isAccessEnforced,
+  PASSWORD_AUTH_UNAVAILABLE_MESSAGE,
+  isPasswordAuthAvailable,
   isPasswordRecoveryAvailable,
 } from '@/server/auth/access-session';
 
@@ -69,11 +70,8 @@ function assertPasswordRecoveryAvailable(): void {
 }
 
 function assertPasswordAuthAvailable(): void {
-  if (isAccessEnforced()) {
-    throw new ForbiddenError(
-      'Sign-in is handled by your company single sign-on. Password sign-in is not available here.',
-    );
-  }
+  // Behind Access, and on any Worker (which cannot compute Argon2id) — see isPasswordAuthAvailable.
+  if (!isPasswordAuthAvailable()) throw new ForbiddenError(PASSWORD_AUTH_UNAVAILABLE_MESSAGE);
 }
 
 export async function loginWithPassword(input: LoginInput, meta: RequestMeta): Promise<IssuedSession> {
@@ -521,6 +519,7 @@ export async function changePassword(
   input: { userId: string; currentPassword: string; newPassword: string; sessionId: string },
   meta: RequestMeta,
 ): Promise<IssuedSession> {
+  assertPasswordAuthAvailable();
   const user = await userRepository.findById(input.userId);
   if (!user) throw new UnauthenticatedError();
 
