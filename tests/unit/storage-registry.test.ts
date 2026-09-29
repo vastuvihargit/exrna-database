@@ -143,3 +143,37 @@ describe('StorageRegistry — default provider', () => {
     expect(() => registry.resolve('local')).toThrow();
   });
 });
+
+describe('the local provider on a Worker', () => {
+  /**
+   * workerd's `node:fs` is an empty in-memory filesystem: a local read opens and then fails after
+   * the 200 and its Content-Length are sent, so the browser saves a truncated file. Found in the
+   * Worker preview. On a Worker the local provider is therefore never registered, and a record
+   * still pointing at local disk fails before any byte is sent.
+   */
+  it('is not registered', async () => {
+    const { setRuntimeOverride } = await import('@/server/runtime');
+    const storage = await import('@/server/storage');
+    setRuntimeOverride('workerd');
+    storage.setStorageProvider(null);
+    try {
+      expect(() => storage.getObjectStore('local')).toThrow(/"local" storage provider/);
+    } finally {
+      setRuntimeOverride(null);
+      storage.setStorageProvider(null);
+    }
+  });
+
+  it('is registered on the Node deployment', async () => {
+    const { setRuntimeOverride } = await import('@/server/runtime');
+    const storage = await import('@/server/storage');
+    setRuntimeOverride('node');
+    storage.setStorageProvider(null);
+    try {
+      expect(storage.getObjectStore('local').provider).toBe('local');
+    } finally {
+      setRuntimeOverride(null);
+      storage.setStorageProvider(null);
+    }
+  });
+});
