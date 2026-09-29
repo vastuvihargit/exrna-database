@@ -157,6 +157,15 @@ simulation) and `tests/unit/rate-limiter-durable-object.test.ts`.
 A second Node app container would still need a shared store; the Node deployment remains
 single-node until it is retired.
 
+**Which address "per IP" means** (`buildRequestContext` in `server/http/route-handler.ts`):
+`CF-Connecting-IP`, then `X-Real-IP`, then the first `X-Forwarded-For` entry. Cloudflare sets
+`CF-Connecting-IP` and nginx sets `X-Real-IP` to `$remote_addr`, both overwriting whatever the
+client sent; both *append* to `X-Forwarded-For` (`$proxy_add_x_forwarded_for`), so its first
+entry is whatever the client wrote and a limit keyed on it could be reset with a header per
+attempt. It was keyed on exactly that until 2026-09-29. `X-Forwarded-For` is now only the last
+resort for a server with no proxy in front (`next dev`, the E2E suite). Test:
+`tests/unit/client-ip.test.ts`.
+
 ---
 
 ## Audit

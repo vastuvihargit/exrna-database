@@ -27,10 +27,16 @@ export function buildRequestContext(request: NextRequest): RequestContext {
   const requestId =
     headerId && /^[A-Za-z0-9-]{8,64}$/.test(headerId) ? headerId : crypto.randomUUID();
 
+  // The address the per-IP sign-in limit counts against, so only headers a proxy *overwrites*
+  // come first: Cloudflare sets CF-Connecting-IP, and the Node deployment's nginx sets X-Real-IP
+  // to $remote_addr. X-Forwarded-For is appended to by both, so its first entry is whatever the
+  // client wrote — keyed on that, anyone could reset their own counter with a header. It remains
+  // only as the last resort for a server with no proxy in front (`next dev`).
   const forwardedFor = request.headers.get('x-forwarded-for');
   const ip =
+    request.headers.get('cf-connecting-ip')?.trim() ||
+    request.headers.get('x-real-ip')?.trim() ||
     forwardedFor?.split(',')[0]?.trim() ||
-    request.headers.get('x-real-ip') ||
     'unknown';
 
   return {
