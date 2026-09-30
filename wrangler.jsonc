@@ -174,7 +174,7 @@
         {
           "binding": "DB",
           "database_name": "biotech-drive-staging",
-          "database_id": "00000000-0000-0000-0000-000000000000",
+          "database_id": "dde7e614-26b5-48fc-b8b5-4791125f6115",
           "migrations_dir": "drizzle/migrations"
         }
       ],
