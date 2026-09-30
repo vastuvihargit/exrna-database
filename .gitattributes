@@ -1,0 +1,5 @@
+# D1 migrations must stay LF on every checkout. `wrangler d1 migrations apply --remote` sends the
+# file verbatim, and D1's server-side statement splitter fails on CREATE TRIGGER ... BEGIN ... END
+# bodies with CRLF line endings ("incomplete input: SQLITE_ERROR"). With core.autocrlf=true on
+# Windows, git would otherwise rewrite them to CRLF in the working tree.
+drizzle/migrations/*.sql text eol=lf
