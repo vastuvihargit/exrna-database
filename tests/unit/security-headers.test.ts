@@ -45,23 +45,30 @@ function headersFor(rules: HeaderRule[], pathname: string): Map<string, string> 
 }
 
 describe('application security headers', () => {
-  it('sends a CSP, framing and referrer policy on ordinary routes', async () => {
+  it('sends framing and referrer policy on ordinary routes', async () => {
     const applied = headersFor(await headerRules(), '/home');
 
-    expect(applied.get('content-security-policy')).toContain("default-src 'self'");
     expect(applied.get('x-frame-options')).toBe('DENY');
     expect(applied.get('referrer-policy')).toBe('strict-origin-when-cross-origin');
     expect(applied.get('x-content-type-options')).toBe('nosniff');
   });
 
-  it('allows the viewer page to embed a same-origin preview', async () => {
-    const applied = headersFor(await headerRules(), '/drive/6a6ae145e89e7c6f88ce6af9');
-    const csp = applied.get('content-security-policy') ?? '';
+  /**
+   * Pages get their CSP from the middleware, with a per-request nonce. A static policy here
+   * would be a second CSP header; browsers enforce both, so its `script-src` without the nonce
+   * would still block the App Router's inline bootstrap scripts — the blank /login on staging.
+   */
+  it('configures no static CSP on page routes, which the nonce policy covers', async () => {
+    for (const page of ['/', '/login', '/home', '/drive/6a6ae145e89e7c6f88ce6af9', '/admin/users']) {
+      expect(headersFor(await headerRules(), page).has('content-security-policy'), page).toBe(false);
+    }
+  });
 
-    // `object-src 'none'` here would block the <object> the preview dialog uses for PDFs,
-    // whatever the preview response itself allows.
-    expect(csp).toContain("object-src 'self'");
-    expect(csp).not.toContain("object-src 'none'");
+  it('keeps a static CSP, without inline script, on API routes', async () => {
+    const csp = headersFor(await headerRules(), '/api/auth/session').get('content-security-policy') ?? '';
+    expect(csp).toContain("default-src 'self'");
+    expect(csp).toContain("frame-ancestors 'none'");
+    expect(csp.split(';').find((d) => d.trim().startsWith('script-src'))).not.toContain('unsafe-inline');
   });
 
   it('does not configure a CSP for the inline preview route', async () => {

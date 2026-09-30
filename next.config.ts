@@ -1,6 +1,8 @@
 import path from 'path';
 import type { NextConfig } from 'next';
 
+import { buildContentSecurityPolicy } from './src/lib/security/content-security-policy';
+
 /**
  * Security headers applied to every route.
  *
@@ -26,30 +28,29 @@ const documentSecurityHeaders = [
   ...baseSecurityHeaders,
   { key: 'X-Frame-Options', value: 'DENY' },
   { key: 'Referrer-Policy', value: 'strict-origin-when-cross-origin' },
-  {
-    key: 'Content-Security-Policy',
-    value: [
-      "default-src 'self'",
-      // 'unsafe-eval' is required by React's dev refresh only; it is dropped in production below.
-      process.env.NODE_ENV === 'production'
-        ? "script-src 'self'"
-        : "script-src 'self' 'unsafe-eval' 'unsafe-inline'",
-      "style-src 'self' 'unsafe-inline'",
-      "img-src 'self' blob: data:",
-      "media-src 'self' blob:",
-      "font-src 'self'",
-      "connect-src 'self'",
-      "object-src 'self'",
-      "frame-ancestors 'none'",
-      "base-uri 'none'",
-      "form-action 'self'",
-    ].join('; '),
-  },
 ];
+
+/**
+ * The CSP is **not** configured here for pages. `src/middleware.ts` sends a per-request nonce
+ * policy on every page, which is what lets the App Router's inline bootstrap scripts run
+ * without `'unsafe-inline'`. A static policy configured here as well would be a second header,
+ * and browsers enforce every CSP header they receive — so it would still block those scripts.
+ *
+ * API responses never render HTML and the middleware does not run on them, so they keep the
+ * static policy (same directives, no nonce), built by the same function.
+ */
+const apiContentSecurityPolicy = {
+  key: 'Content-Security-Policy',
+  value: buildContentSecurityPolicy({
+    nonce: null,
+    development: process.env.NODE_ENV !== 'production',
+  }),
+};
 
 /** `/api/files/{id}/preview` — the one route that owns its CSP. */
 const PREVIEW_ROUTE = '/api/files/:fileId/preview';
 const EXCEPT_PREVIEW_ROUTE = '/((?!api/files/[^/]+/preview).*)';
+const API_EXCEPT_PREVIEW_ROUTE = '/api/((?!files/[^/]+/preview).*)';
 
 /**
  * Which files Next will treat as routes.
@@ -174,6 +175,7 @@ const nextConfig: NextConfig = {
   async headers() {
     const rules = [
       { source: EXCEPT_PREVIEW_ROUTE, headers: documentSecurityHeaders },
+      { source: API_EXCEPT_PREVIEW_ROUTE, headers: [apiContentSecurityPolicy] },
       // The preview route keeps the headers that do not conflict; it sets its own
       // sandbox CSP and `Referrer-Policy: no-referrer` in the response itself.
       { source: PREVIEW_ROUTE, headers: baseSecurityHeaders },
