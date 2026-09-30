@@ -104,8 +104,8 @@
     "development": {
       "vars": {
         "NODE_ENV": "development",
-        // Explicit, and logged at startup. Staging and production leave it unset on purpose,
-        // so they refuse to boot until somebody decides.
+        // Explicit, and logged at startup. Production leaves it unset on purpose, so it
+        // refuses to boot until somebody decides.
         "MALWARE_SCAN_MODE": "disabled",
         "APP_NAME": "Biotech Research Drive",
         "LOG_LEVEL": "debug"
@@ -160,6 +160,10 @@
     "staging": {
       "vars": {
         "NODE_ENV": "staging",
+        // Staging only, so the first smoke test can boot while the scanner vendor is undecided.
+        // Files are recorded as `skipped`, never `clean`. NOT a production decision: production
+        // still leaves it unset and refuses to boot until one is made.
+        "MALWARE_SCAN_MODE": "disabled",
         "APP_NAME": "Biotech Research Drive (Staging)",
         "LOG_LEVEL": "debug"
 ,
@@ -289,8 +293,9 @@
   //
   // Non-secret, set per environment under "vars" once decided:
   //
-  //   MALWARE_SCAN_MODE              "http" or "disabled". Deliberately NOT set for staging or
-  //                                  production: choosing a scanner is a business decision, and
+  //   MALWARE_SCAN_MODE              "http" or "disabled". Staging is explicitly "disabled" for
+  //                                  smoke testing; deliberately NOT set for production:
+  //                                  choosing a scanner is a business decision, and
   //                                  a Worker with no value refuses to boot rather than
   //                                  silently running without one.
   //   MALWARE_SCAN_ENDPOINT          https URL of the scanning service, when mode is "http"
