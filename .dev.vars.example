@@ -44,9 +44,14 @@ GOOGLE_SERVICE_ACCOUNT_EMAIL=biotech-drive@your-project.iam.gserviceaccount.com
 # reads from disk and the Worker has none. This is a secret, never a var.
 GOOGLE_SERVICE_ACCOUNT_PRIVATE_KEY="-----BEGIN PRIVATE KEY-----\n...\n-----END PRIVATE KEY-----\n"
 
-# ── Google sign-in (Node deployment only; removed at Phase 8) ─────────────────────────
-GOOGLE_CLIENT_ID=
-GOOGLE_CLIENT_SECRET=
+# ── Google sign-in ────────────────────────────────────────────────────────────────────
+# AUTH_PROVIDER=google_oauth makes Google Workspace OAuth the only sign-in (no Cloudflare
+# Access; CF_ACCESS_* must then be unset). The redirect URI is derived as
+# ${APP_URL}/api/auth/google/callback and GOOGLE_WORKSPACE_DOMAIN must be in
+# COMPANY_EMAIL_DOMAINS. GOOGLE_CLIENT_ID / _SECRET are accepted under these names too.
+# AUTH_PROVIDER=google_oauth
+GOOGLE_OAUTH_CLIENT_ID=
+GOOGLE_OAUTH_CLIENT_SECRET=
 
 # ── Which database backs which module ─────────────────────────────────────────────
 # Not secrets. Unset (or anything but the exact string "d1") means MongoDB. Only "d1" moves a

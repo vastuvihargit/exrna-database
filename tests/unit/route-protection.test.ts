@@ -23,6 +23,7 @@ const PUBLIC_ROUTES = new Set([
   'auth/reset-password/route.ts',
   'auth/google/route.ts',
   'auth/callback/google/route.ts',
+  'auth/google/callback/route.ts', // re-export of the one above, the google_oauth redirect URI
   // The Cloudflare Access sign-in bridge: how a session is obtained, so it cannot require one.
   // It verifies the signed Access assertion itself and is 404 when Access is not configured.
   'auth/access/route.ts',

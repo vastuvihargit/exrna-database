@@ -38,8 +38,10 @@ const OAUTH_ERRORS: Record<string, string> = {
   oauth_cancelled: 'Sign-in was cancelled.',
   oauth_state_missing: 'The sign-in attempt expired. Please try again.',
   oauth_state_mismatch: 'The sign-in attempt could not be verified. Please try again.',
-  oauth_failed: 'Google sign-in failed. Please try again or use your password.',
+  oauth_failed: 'Google sign-in failed. Please try again.',
   not_provisioned: 'Your account has not been set up yet. Contact your administrator for access.',
+  account_inactive: 'Your account is not active. Contact your administrator.',
+  domain_rejected: 'Sign in with your company Google Workspace account.',
 };
 
 export function LoginForm() {
@@ -84,6 +86,9 @@ export function LoginForm() {
   });
 
   const domains = providers?.companyEmailDomains ?? [];
+  // Hidden behind Access and wherever the server cannot verify a password (a Worker): offering
+  // a form that can only fail would send people round in circles.
+  const showPassword = !providers?.access && providers?.password !== false;
 
   return (
     <Card>
@@ -123,19 +128,21 @@ export function LoginForm() {
 
         {providers?.google ? (
           <>
-            <Button variant="outline" className="w-full" asChild>
+            <Button variant={showPassword ? 'outline' : 'default'} className="w-full" asChild>
               <a href="/api/auth/google">Continue with Google Workspace</a>
             </Button>
+            {showPassword ? (
             <div className="relative">
               <Separator />
               <span className="absolute left-1/2 top-1/2 -translate-x-1/2 -translate-y-1/2 bg-card px-2 text-xs uppercase tracking-wide text-muted-foreground">
                 or
               </span>
             </div>
+            ) : null}
           </>
         ) : null}
 
-        {providers?.access ? null : (
+        {!showPassword ? null : (
         <form
           className="space-y-4"
           onSubmit={form.handleSubmit((values) => {

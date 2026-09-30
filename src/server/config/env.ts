@@ -11,6 +11,11 @@ import path from 'path';
 import { z } from 'zod';
 import { assertDataSourceMatrix } from '@/server/repositories/data-source';
 import { isWorkerRuntime } from '@/server/runtime';
+import {
+  AUTH_PROVIDERS,
+  googleOAuthRedirectUri,
+  signInConfigIssues,
+} from '@/server/auth/auth-provider';
 
 const bool = (defaultValue: boolean) =>
   z
@@ -155,7 +160,15 @@ const envSchema = z
     CF_ACCESS_TEAM_DOMAIN: z.string().optional(),
     CF_ACCESS_AUD: z.string().optional(),
 
-    // OAuth (required only once Phase 2 enables the provider)
+    /**
+     * `google_oauth` makes the application's own Google Workspace sign-in the front door and
+     * switches Access off: `CF_ACCESS_*` must then be unset. See `auth/auth-provider.ts`.
+     */
+    AUTH_PROVIDER: z.enum(AUTH_PROVIDERS).optional(),
+
+    // Google sign-in. `GOOGLE_OAUTH_CLIENT_ID` / `_SECRET` are accepted as aliases (see
+    // `withRuntimeDefaults`). In `google_oauth` mode the redirect URI defaults to
+    // `${APP_URL}/api/auth/google/callback`.
     GOOGLE_CLIENT_ID: z.string().optional(),
     GOOGLE_CLIENT_SECRET: z.string().optional(),
     GOOGLE_REDIRECT_URI: z.string().optional(),
@@ -324,6 +337,10 @@ const envSchema = z
         path: [v.CF_ACCESS_TEAM_DOMAIN ? 'CF_ACCESS_AUD' : 'CF_ACCESS_TEAM_DOMAIN'],
         message: 'CF_ACCESS_TEAM_DOMAIN and CF_ACCESS_AUD must be set together, or neither',
       });
+    }
+
+    for (const issue of signInConfigIssues(v)) {
+      ctx.addIssue({ code: z.ZodIssueCode.custom, path: [issue.path], message: issue.message });
     }
 
     if (v.MALWARE_SCAN_MODE === 'http') {
@@ -574,9 +591,19 @@ const DRIVE_CREDENTIAL_ALIASES: ReadonlyArray<readonly [canonical: string, alias
   ['GOOGLE_DRIVE_SERVICE_ACCOUNT_PRIVATE_KEY', 'GOOGLE_SERVICE_ACCOUNT_PRIVATE_KEY'],
 ];
 
+/**
+ * The sign-in OAuth client, under the names the Worker is configured with. Named apart from the
+ * Drive credentials above: this client only ever asks for `openid email profile`, and the Drive
+ * service account never signs anybody in.
+ */
+const OAUTH_CLIENT_ALIASES: ReadonlyArray<readonly [canonical: string, alias: string]> = [
+  ['GOOGLE_CLIENT_ID', 'GOOGLE_OAUTH_CLIENT_ID'],
+  ['GOOGLE_CLIENT_SECRET', 'GOOGLE_OAUTH_CLIENT_SECRET'],
+];
+
 function withRuntimeDefaults(source: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
   const filled: NodeJS.ProcessEnv = { ...source };
-  for (const [canonical, alias] of DRIVE_CREDENTIAL_ALIASES) {
+  for (const [canonical, alias] of [...DRIVE_CREDENTIAL_ALIASES, ...OAUTH_CLIENT_ALIASES]) {
     if (!filled[canonical] && filled[alias]) filled[canonical] = filled[alias];
   }
   if (isWorkerRuntime()) {
@@ -614,6 +641,10 @@ export function loadEnv(input: NodeJS.ProcessEnv = process.env): AppEnv {
     raw.NODE_ENV === 'production' || raw.NODE_ENV === 'staging' || isWorkerRuntime();
   const v: RawEnv = {
     ...raw,
+    // Derived rather than configured, so the URI Google redirects to cannot drift from APP_URL.
+    ...(raw.AUTH_PROVIDER === 'google_oauth' && !raw.GOOGLE_REDIRECT_URI
+      ? { GOOGLE_REDIRECT_URI: googleOAuthRedirectUri(raw.APP_URL) }
+      : {}),
     MALWARE_SCAN_FAIL_CLOSED:
       failClosedByDefault && resolveMalwareScanMode(raw) !== 'disabled'
         ? source.MALWARE_SCAN_FAIL_CLOSED === 'false' || source.MALWARE_SCAN_FAIL_CLOSED === '0'

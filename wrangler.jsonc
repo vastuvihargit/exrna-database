@@ -165,7 +165,14 @@
         // still leaves it unset and refuses to boot until one is made.
         "MALWARE_SCAN_MODE": "disabled",
         "APP_NAME": "Biotech Research Drive (Staging)",
-        "LOG_LEVEL": "debug"
+        "LOG_LEVEL": "debug",
+        // Sign-in: the application's own Google Workspace OAuth, no Cloudflare Access. Requires the
+        // GOOGLE_OAUTH_CLIENT_ID / GOOGLE_OAUTH_CLIENT_SECRET secrets and an https APP_URL; the
+        // redirect URI is derived as ${APP_URL}/api/auth/google/callback. CF_ACCESS_* must be
+        // unset here — env.worker.ts refuses to boot with both. See auth/auth-provider.ts.
+        "AUTH_PROVIDER": "google_oauth",
+        "GOOGLE_WORKSPACE_DOMAIN": "exrna.com",
+        "COMPANY_EMAIL_DOMAINS": "exrna.com"
 ,
         // Storage. A Worker has no persistent filesystem, so these are the only values it can
         // run with — env.worker.ts refuses anything else at boot rather than per upload.
@@ -287,8 +294,11 @@
   //   GOOGLE_SERVICE_ACCOUNT_PRIVATE_KEY
   //   GOOGLE_SHARED_DRIVE_ID
   //   GOOGLE_WORKSPACE_DOMAIN
-  //   CF_ACCESS_TEAM_DOMAIN          required in production (loadWorkerEnv refuses to boot)
-  //   CF_ACCESS_AUD                  required in production, together with the team domain
+  //   GOOGLE_OAUTH_CLIENT_ID         when AUTH_PROVIDER=google_oauth (staging)
+  //   GOOGLE_OAUTH_CLIENT_SECRET     when AUTH_PROVIDER=google_oauth (staging)
+  //   CF_ACCESS_TEAM_DOMAIN          required in production unless AUTH_PROVIDER=google_oauth;
+  //                                  must be unset when it is (loadWorkerEnv refuses to boot)
+  //   CF_ACCESS_AUD                  as CF_ACCESS_TEAM_DOMAIN, always together with it
   //   MALWARE_SCAN_SECRET            only when MALWARE_SCAN_MODE=http
   //
   // Non-secret, set per environment under "vars" once decided:

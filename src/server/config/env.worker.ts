@@ -38,6 +38,7 @@ import {
   workerReadinessGaps,
 } from '@/server/repositories/data-source';
 import { assertAccessConfigured } from '@/server/auth/cloudflare-access';
+import { AUTH_PROVIDERS, signInConfigIssues } from '@/server/auth/auth-provider';
 
 const bool = (defaultValue: boolean) =>
   z
@@ -133,7 +134,13 @@ const workerEnvSchema = z.object({
   MALWARE_SCAN_ENDPOINT: z.string().url().optional(),
   MALWARE_SCAN_SECRET: z.string().optional(),
 
-  // Cloudflare Access. Optional until Phase 8 turns it on, then required in production.
+  /**
+   * The sign-in front door (`auth/auth-provider.ts`). `google_oauth` needs the OAuth client and
+   * no Access; otherwise Access is required in production, as before.
+   */
+  AUTH_PROVIDER: z.enum(AUTH_PROVIDERS).optional(),
+
+  // Cloudflare Access. Required in production unless AUTH_PROVIDER is "google_oauth".
   CF_ACCESS_TEAM_DOMAIN: z.string().optional(),
   CF_ACCESS_AUD: z.string().optional(),
 
@@ -206,6 +213,9 @@ function withAliases(source: Record<string, string | undefined>): Record<string,
       source.GOOGLE_SERVICE_ACCOUNT_EMAIL ?? source.GOOGLE_DRIVE_SERVICE_ACCOUNT_EMAIL,
     GOOGLE_SERVICE_ACCOUNT_PRIVATE_KEY:
       source.GOOGLE_SERVICE_ACCOUNT_PRIVATE_KEY ?? source.GOOGLE_DRIVE_SERVICE_ACCOUNT_PRIVATE_KEY,
+    // The sign-in OAuth client: the Worker is configured with the GOOGLE_OAUTH_* names.
+    GOOGLE_CLIENT_ID: source.GOOGLE_CLIENT_ID ?? source.GOOGLE_OAUTH_CLIENT_ID,
+    GOOGLE_CLIENT_SECRET: source.GOOGLE_CLIENT_SECRET ?? source.GOOGLE_OAUTH_CLIENT_SECRET,
   };
 }
 
@@ -277,15 +287,24 @@ export function loadWorkerEnv(source: Record<string, string | undefined>): Worke
   assertDataSourceMatrix();
 
   /**
-   * A production Worker with no Access configuration cannot authenticate anybody.
+   * A production Worker with no identity provider cannot authenticate anybody.
    *
    * `@node-rs/argon2` is a native addon workerd cannot load, so the existing `passwordHash`
    * values are unverifiable there by any means — `shims/argon2.worker.ts` refuses rather than
-   * substituting a different algorithm, which would reject every correct password. Access is
-   * therefore the only identity source, and booting without it produces a deployment that 401s
-   * every request while looking healthy.
+   * substituting a different algorithm, which would reject every correct password. Identity
+   * therefore comes from Access or, with `AUTH_PROVIDER=google_oauth`, from Google sign-in, and
+   * booting with neither produces a deployment that 401s every request while looking healthy.
    */
-  assertAccessConfigured(v, v.NODE_ENV === 'production');
+  const signInIssues = signInConfigIssues(v);
+  if (signInIssues.length > 0) {
+    throw new Error(
+      'Invalid Worker environment configuration:\n' +
+        signInIssues.map((issue) => `  • ${issue.path}: ${issue.message}`).join('\n'),
+    );
+  }
+  // In `google_oauth` mode identity comes from a verified Google ID token instead, and the
+  // check above has already required the OAuth client and refused a half-Access configuration.
+  if (v.AUTH_PROVIDER !== 'google_oauth') assertAccessConfigured(v, v.NODE_ENV === 'production');
 
   /**
    * In a Worker, every module must be on D1 — and in production that is an error, not a warning.
