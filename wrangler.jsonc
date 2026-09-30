@@ -167,10 +167,14 @@
         "APP_NAME": "Biotech Research Drive (Staging)",
         "LOG_LEVEL": "debug",
         // Sign-in: the application's own Google Workspace OAuth, no Cloudflare Access. Requires the
-        // GOOGLE_OAUTH_CLIENT_ID / GOOGLE_OAUTH_CLIENT_SECRET secrets and an https APP_URL; the
+        // GOOGLE_OAUTH_CLIENT_SECRET secret and the https APP_URL / client ID vars below; the
         // redirect URI is derived as ${APP_URL}/api/auth/google/callback. CF_ACCESS_* must be
         // unset here — env.worker.ts refuses to boot with both. See auth/auth-provider.ts.
         "AUTH_PROVIDER": "google_oauth",
+        // Not secrets, so they live here rather than as dashboard variables, which the next
+        // `wrangler deploy` would delete. The Google client ID appears in every sign-in URL.
+        "APP_URL": "https://exrna-database-staging.cmc-330.workers.dev",
+        "GOOGLE_OAUTH_CLIENT_ID": "151201177057-bfr63rhc5350jb3mccq08chskvhe70cs.apps.googleusercontent.com",
         "GOOGLE_WORKSPACE_DOMAIN": "exrna.com",
         "COMPANY_EMAIL_DOMAINS": "exrna.com"
 ,
@@ -285,17 +289,17 @@
   //
   // Never in this file. Set with `npx wrangler secret put <NAME> --env <environment>`:
   //
-  //   AUTH_SECRET
-  //   SESSION_SECRET
-  //   APP_URL                        https://<hostname> (may be a var instead)
+  //   AUTH_SECRET                    a secret, never a dashboard variable (deploys delete those);
+  //   SESSION_SECRET                 scripts/check-worker-secrets.mjs refuses a deploy without them
+  //   APP_URL                        https://<hostname> (may be a var instead; staging: a var)
   //   COMPANY_EMAIL_DOMAINS          comma-separated (may be a var instead)
   //   GOOGLE_DRIVE_ROOT_FOLDER_ID    recommended
   //   GOOGLE_SERVICE_ACCOUNT_EMAIL
   //   GOOGLE_SERVICE_ACCOUNT_PRIVATE_KEY
   //   GOOGLE_SHARED_DRIVE_ID
   //   GOOGLE_WORKSPACE_DOMAIN
-  //   GOOGLE_OAUTH_CLIENT_ID         when AUTH_PROVIDER=google_oauth (staging)
-  //   GOOGLE_OAUTH_CLIENT_SECRET     when AUTH_PROVIDER=google_oauth (staging)
+  //   GOOGLE_OAUTH_CLIENT_SECRET     when AUTH_PROVIDER=google_oauth (staging; the client ID is
+  //                                  a staging var above, not a secret)
   //   CF_ACCESS_TEAM_DOMAIN          required in production unless AUTH_PROVIDER=google_oauth;
   //                                  must be unset when it is (loadWorkerEnv refuses to boot)
   //   CF_ACCESS_AUD                  as CF_ACCESS_TEAM_DOMAIN, always together with it

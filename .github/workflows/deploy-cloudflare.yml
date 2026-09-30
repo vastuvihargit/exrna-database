@@ -76,6 +76,10 @@ jobs:
       - name: Install dependencies
         run: npm ci
 
+      - name: Refuse to deploy without the Worker's secrets
+        # A dashboard *variable* is deleted by the deploy below; only real secrets survive it.
+        run: npm run cf:check-secrets:staging
+
       - name: Apply D1 migrations (staging)
         if: ${{ inputs.apply_migrations }}
         run: npm run db:migrate:staging

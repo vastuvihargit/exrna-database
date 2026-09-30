@@ -67,8 +67,8 @@ unknown users are refused (no auto-provisioning, whatever the organisation setti
    * Authorized redirect URI — exactly `${APP_URL}/api/auth/google/callback`. For staging:
      `https://exrna-database-staging.cmc-330.workers.dev/api/auth/google/callback`
    * No JavaScript origins are needed (the flow is server-side).
-3. Client ID → secret `GOOGLE_OAUTH_CLIENT_ID`; client secret → secret
-   `GOOGLE_OAUTH_CLIENT_SECRET`.
+3. Client ID → var `GOOGLE_OAUTH_CLIENT_ID` in `wrangler.jsonc` (it is public: every sign-in URL
+   carries it); client secret → secret `GOOGLE_OAUTH_CLIENT_SECRET`.
 4. `APP_URL` (https) is the origin the redirect URI is derived from; set `GOOGLE_REDIRECT_URI`
    only to override it, and then only on the same origin.
 
@@ -111,14 +111,14 @@ one:
 |---|---|---|
 | `AUTH_SECRET` | yes | ≥ 32 characters |
 | `SESSION_SECRET` | yes | ≥ 32 characters, different from `AUTH_SECRET` |
-| `APP_URL` | yes | `https://<hostname>`. Staging: `https://exrna-database-staging.cmc-330.workers.dev` |
+| `APP_URL` | yes | `https://<hostname>`. **A var for staging** (`wrangler.jsonc`): `https://exrna-database-staging.cmc-330.workers.dev` |
 | `COMPANY_EMAIL_DOMAINS` | yes | comma-separated. **A var for staging** (`wrangler.jsonc`) — do not also set it as a secret |
 | `GOOGLE_SHARED_DRIVE_ID` | yes | §2.1 |
 | `GOOGLE_DRIVE_ROOT_FOLDER_ID` | recommended | §2.2. Without it, content is written to the Shared Drive root and the admin page warns. |
 | `GOOGLE_SERVICE_ACCOUNT_EMAIL` | yes | §2.3 |
 | `GOOGLE_SERVICE_ACCOUNT_PRIVATE_KEY` | yes | the PEM from the key JSON, one line, `\n`-escaped |
 | `GOOGLE_WORKSPACE_DOMAIN` | yes | e.g. `company.com`. **A var for staging** (`wrangler.jsonc`) — do not also set it as a secret |
-| `GOOGLE_OAUTH_CLIENT_ID` | with `AUTH_PROVIDER=google_oauth` | §1.4a |
+| `GOOGLE_OAUTH_CLIENT_ID` | with `AUTH_PROVIDER=google_oauth` | §1.4a. **A var for staging** (`wrangler.jsonc`), not a secret |
 | `GOOGLE_OAUTH_CLIENT_SECRET` | with `AUTH_PROVIDER=google_oauth` | §1.4a |
 | `CF_ACCESS_TEAM_DOMAIN` | **yes in production** unless `AUTH_PROVIDER=google_oauth`, when it must be unset | §1.4b. Must be set together with `CF_ACCESS_AUD`. |
 | `CF_ACCESS_AUD` | as `CF_ACCESS_TEAM_DOMAIN` | §1.4b |
@@ -140,10 +140,12 @@ Node-deployment settings. (`GOOGLE_CLIENT_ID` / `_SECRET` are accepted as aliase
 Worker's plain-text variables with the `vars` in `wrangler.jsonc`, so a value typed into the
 dashboard as a *variable* disappears on the next deploy and the Worker refuses to boot. Secrets
 survive deploys. Conversely, a name that is a `var` in `wrangler.jsonc` (for staging:
-`AUTH_PROVIDER`, `GOOGLE_WORKSPACE_DOMAIN`, `COMPANY_EMAIL_DOMAINS`, `MALWARE_SCAN_MODE`) must not
-also be a secret.
+`AUTH_PROVIDER`, `APP_URL`, `GOOGLE_OAUTH_CLIENT_ID`, `GOOGLE_WORKSPACE_DOMAIN`,
+`COMPANY_EMAIL_DOMAINS`, `MALWARE_SCAN_MODE`) must not also be a secret.
 
-**Pass:** `npx wrangler secret list --env <env>` lists every required name.
+**Pass:** `npm run cf:check-secrets:staging` exits 0 (`scripts/check-worker-secrets.mjs`: every
+required name is a real secret, no `CF_ACCESS_*`). The staging workflow and
+`npm run cf:deploy:staging` run it before deploying.
 
 ### 1.7 GitHub (for `deploy-cloudflare.yml`, staging only)
 
