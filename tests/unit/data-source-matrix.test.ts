@@ -213,6 +213,30 @@ describe('the table itself', () => {
     }
   });
 
+  /**
+   * The staging Worker's flags as deployed, read from `wrangler.jsonc` rather than restated here,
+   * then run through the same checks `loadWorkerEnv()` runs at boot. A flag missing from the file
+   * would be a module that throws on first use on the Worker; a misspelled one would be ignored.
+   */
+  it('puts every module on D1 in the staging Worker configuration, with no unknown flags', () => {
+    const config = fs.readFileSync(path.resolve(__dirname, '../../wrangler.jsonc'), 'utf8');
+    const staging = config.slice(config.indexOf('"staging": {'), config.indexOf('"production": {'));
+    const flags = Object.fromEntries(
+      [...staging.matchAll(/"(DATA_SOURCE_[A-Z_]+)"\s*:\s*"([^"]*)"/g)].map((match) => [match[1]!, match[2]!]),
+    );
+
+    expect(Object.keys(flags).sort()).toEqual(DATA_SOURCE_MODULES.map(envVarFor).sort());
+    expect(Object.values(flags).every((value) => value === 'd1')).toBe(true);
+
+    for (const [key, value] of Object.entries(flags)) {
+      touched.push(key);
+      process.env[key] = value;
+    }
+    expect(dataSourceViolations()).toEqual([]);
+    expect(() => assertDataSourceMatrix()).not.toThrow();
+    expect(workerReadinessGaps()).toEqual([]);
+  });
+
   it('derives the environment variable name from the module name', () => {
     expect(envVarFor('users')).toBe('DATA_SOURCE_USERS');
     expect(envVarFor('fileVersions')).toBe('DATA_SOURCE_FILE_VERSIONS');

@@ -44,6 +44,7 @@
     "migrate:d1": "tsx scripts/migrate-to-d1.ts",
     "migrate:verify": "tsx scripts/verify-d1-migration.ts",
     "migrate:validate": "tsx scripts/validate-mongo-source.ts",
+    "bootstrap:d1": "tsx scripts/bootstrap-d1.ts",
     "test:e2e": "playwright test"
   },
   "dependencies": {

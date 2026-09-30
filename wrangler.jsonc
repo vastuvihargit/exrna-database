@@ -176,7 +176,34 @@
         "APP_URL": "https://exrna-database-staging.cmc-330.workers.dev",
         "GOOGLE_OAUTH_CLIENT_ID": "151201177057-bfr63rhc5350jb3mccq08chskvhe70cs.apps.googleusercontent.com",
         "GOOGLE_WORKSPACE_DOMAIN": "exrna.com",
-        "COMPANY_EMAIL_DOMAINS": "exrna.com"
+        "COMPANY_EMAIL_DOMAINS": "exrna.com",
+        // Every module on D1: a Worker cannot reach MongoDB, and this is the only configuration
+        // a Worker accepts (DATA-SOURCE-FLAGS.md §4). Staging starts from a fresh D1 bootstrapped
+        // with `npm run bootstrap:d1`, not from migrated MongoDB data. All 22, in the order of
+        // DATA_SOURCE_MODULES; tests/unit/data-source-matrix.test.ts reads this block and runs
+        // it through the startup matrix check.
+        "DATA_SOURCE_ORGANIZATIONS": "d1",
+        "DATA_SOURCE_USERS": "d1",
+        "DATA_SOURCE_DEPARTMENTS": "d1",
+        "DATA_SOURCE_ROLES": "d1",
+        "DATA_SOURCE_PROJECTS": "d1",
+        "DATA_SOURCE_EXPERIMENTS": "d1",
+        "DATA_SOURCE_FOLDERS": "d1",
+        "DATA_SOURCE_FILES": "d1",
+        "DATA_SOURCE_FILE_VERSIONS": "d1",
+        "DATA_SOURCE_SEARCH": "d1",
+        "DATA_SOURCE_REVIEWS": "d1",
+        "DATA_SOURCE_AUDIT_LOGS": "d1",
+        "DATA_SOURCE_INVENTORY": "d1",
+        "DATA_SOURCE_NOTIFICATIONS": "d1",
+        "DATA_SOURCE_SESSIONS": "d1",
+        "DATA_SOURCE_LOGIN_HISTORY": "d1",
+        "DATA_SOURCE_STORAGE_USAGE": "d1",
+        "DATA_SOURCE_ACTIVITIES": "d1",
+        "DATA_SOURCE_COMMENTS": "d1",
+        "DATA_SOURCE_DRIVE_SYNC": "d1",
+        "DATA_SOURCE_UPLOAD_SESSIONS": "d1",
+        "DATA_SOURCE_APP_SETTINGS": "d1"
 ,
         // Storage. A Worker has no persistent filesystem, so these are the only values it can
         // run with — env.worker.ts refuses anything else at boot rather than per upload.
