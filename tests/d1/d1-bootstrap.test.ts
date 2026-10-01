@@ -244,3 +244,76 @@ describe('first sign-in with google_oauth', () => {
     expect(counts.sessions).toBe(0);
   });
 });
+
+describe('other Workspace users, created by the Super Admin', () => {
+  /** Signs `email` in through Google and returns the actor its session resolves to. */
+  async function signIn(email: string) {
+    const { completeOAuthLogin } = await import('@/server/services/auth.service');
+    const { resolveRequestSession } = await import('@/server/auth/access-session');
+    const session = await completeOAuthLogin(
+      { email, providerAccountId: `google-${email}`, provider: 'google' },
+      META,
+    );
+    const resolved = await resolveRequestSession(session.token, new Headers());
+    if (!resolved) throw new Error(`no session resolved for ${email}`);
+    return resolved.actor;
+  }
+
+  it('lets every active provisioned user sign in, with only the access their roles give', async () => {
+    await gateway.run(planBootstrap(INPUT).statements);
+    const users = await import('@/server/services/user.service');
+    const { assertCompanyPermission } = await import('@/server/permissions/authorize');
+
+    const admin = await signIn('admin@exrna.com');
+    const create = (email: string, extra: Partial<Parameters<typeof users.createEmployee>[1]> = {}) =>
+      users.createEmployee(admin, { email, name: email.split('@')[0]!, ...extra }, META);
+
+    await create('alice@exrna.com', { status: 'active', roleKey: 'company_admin' });
+    await create('bob@exrna.com', { status: 'active', roleKey: 'management_viewer' });
+    await create('erin@exrna.com', { status: 'active' }); // no role yet
+    await create('carol@exrna.com'); // invited, never activated
+    const dave = await create('dave@exrna.com', { status: 'active', roleKey: 'management_viewer' });
+    await users.setStatus(admin, dave.id, 'deactivated', 'left the company', META);
+
+    // Several company users sign in, each to their own session and their own roles.
+    const alice = await signIn('alice@exrna.com');
+    const bob = await signIn('bob@exrna.com');
+    const erin = await signIn('erin@exrna.com');
+    expect(new Set([admin.sessionId, alice.sessionId, bob.sessionId, erin.sessionId]).size).toBe(4);
+    expect(alice.roleKeys).toEqual(['company_admin']);
+    expect(bob.roleKeys).toEqual(['management_viewer']);
+    expect(erin.roleKeys).toEqual([]);
+    expect(erin.permissions.size).toBe(0);
+
+    // Super Admin is never handed out by sign-in or by creating an account: only the
+    // bootstrapped administrator holds it, even for a user an administrator created.
+    for (const actor of [alice, bob, erin]) expect(actor.isSuperAdmin).toBe(false);
+    const flagged = await d1.prepare('SELECT email FROM users WHERE is_super_admin = 1').all();
+    expect(flagged.results).toEqual([{ email: 'admin@exrna.com' }]);
+    const grants = await d1
+      .prepare(
+        `SELECT u.email FROM user_roles g JOIN roles r ON r.id = g.role_id JOIN users u ON u.id = g.user_id
+         WHERE r.key = 'super_admin' AND g.revoked_at IS NULL`,
+      )
+      .all();
+    expect(grants.results).toEqual([{ email: 'admin@exrna.com' }]);
+
+    // Roles, not the sign-in, decide what each may do.
+    expect(() => assertCompanyPermission(alice, 'user.manage')).not.toThrow();
+    expect(() => assertCompanyPermission(bob, 'user.manage')).toThrow();
+    expect(() => assertCompanyPermission(erin, 'user.manage')).toThrow();
+    await expect(users.listForAdmin(alice, { page: 1, pageSize: 50 })).resolves.toMatchObject({ total: 6 });
+    await expect(users.listForAdmin(bob, { page: 1, pageSize: 50 })).rejects.toThrow();
+    await expect(users.listForAdmin(erin, { page: 1, pageSize: 50 })).rejects.toThrow();
+    await expect(users.createEmployee(bob, { email: 'gina@exrna.com', name: 'gina' }, META)).rejects.toThrow();
+
+    // An invited (not yet activated) or a deactivated user is refused, and gets no session.
+    const sessionsBefore = (await tableCounts()).sessions;
+    await expect(signIn('carol@exrna.com')).rejects.toThrow(/not active/);
+    await expect(signIn('dave@exrna.com')).rejects.toThrow(/not active/);
+    // So is an exrna.com address nobody created; it is not created by trying.
+    await expect(signIn('stranger@exrna.com')).rejects.toThrow(/not been set up/);
+    expect((await tableCounts()).sessions).toBe(sessionsBefore);
+    expect(await d1.prepare(`SELECT count(*) AS n FROM users WHERE email = 'stranger@exrna.com'`).first('n')).toBe(0);
+  });
+});
