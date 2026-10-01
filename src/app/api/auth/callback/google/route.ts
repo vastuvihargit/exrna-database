@@ -3,7 +3,7 @@ import { NextResponse } from 'next/server';
 
 import { withRouteHandler } from '@/server/http/route-handler';
 import { getEnv } from '@/server/config/env';
-import { setSessionCookies } from '@/server/http/cookies';
+import { cookieSecure, setSessionCookies } from '@/server/http/cookies';
 import { completeGoogleLogin } from '@/server/auth/google-oauth';
 import { authService } from '@/server/services/auth.service';
 import { safeCompare } from '@/server/auth/tokens';
@@ -32,7 +32,7 @@ export const GET = withRouteHandler(async (request: NextRequest, { requestContex
   const fail = (reason: string) => {
     loginUrl.searchParams.set('error', reason);
     const response = NextResponse.redirect(loginUrl);
-    clearOAuthCookies(response, env.isProduction);
+    clearOAuthCookies(response);
     return response;
   };
 
@@ -73,21 +73,31 @@ export const GET = withRouteHandler(async (request: NextRequest, { requestContex
       csrfToken: session.csrfToken,
       expiresAt: session.absoluteExpiresAt,
     });
-    clearOAuthCookies(response, env.isProduction);
+    clearOAuthCookies(response);
     return response;
   } catch (error) {
     getLogger().warn({ err: error, requestId: requestContext.requestId }, 'Google sign-in failed');
-    // "Not provisioned" is the one case worth distinguishing — it tells a legitimate
-    // employee to contact an administrator instead of retrying forever.
-    const reason =
-      error instanceof Error && error.message.toLowerCase().includes('not been set up')
-        ? 'not_provisioned'
-        : 'oauth_failed';
-    return fail(reason);
+    return fail(failureReason(error));
   }
 });
 
-function clearOAuthCookies(response: NextResponse, secure: boolean): void {
+/**
+ * The account-policy refusals are the cases worth distinguishing — they tell a legitimate
+ * employee to contact an administrator (or pick another account) instead of retrying forever.
+ * Everything else, including every token-verification failure, is a single coarse code.
+ */
+function failureReason(error: unknown): string {
+  const message = error instanceof Error ? error.message.toLowerCase() : '';
+  if (message.includes('not been set up')) return 'not_provisioned';
+  if (message.includes('not active')) return 'account_inactive';
+  if (message.includes('approved company domain') || message.includes('company workspace')) {
+    return 'domain_rejected';
+  }
+  return 'oauth_failed';
+}
+
+function clearOAuthCookies(response: NextResponse): void {
+  const secure = cookieSecure();
   for (const name of [OAUTH_STATE_COOKIE, OAUTH_VERIFIER_COOKIE, OAUTH_NONCE_COOKIE]) {
     response.cookies.set(name, '', { httpOnly: true, secure, sameSite: 'lax', path: '/', maxAge: 0 });
   }

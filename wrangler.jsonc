@@ -104,8 +104,8 @@
     "development": {
       "vars": {
         "NODE_ENV": "development",
-        // Explicit, and logged at startup. Staging and production leave it unset on purpose,
-        // so they refuse to boot until somebody decides.
+        // Explicit, and logged at startup. Production leaves it unset on purpose, so it
+        // refuses to boot until somebody decides.
         "MALWARE_SCAN_MODE": "disabled",
         "APP_NAME": "Biotech Research Drive",
         "LOG_LEVEL": "debug"
@@ -160,8 +160,50 @@
     "staging": {
       "vars": {
         "NODE_ENV": "staging",
+        // Staging only, so the first smoke test can boot while the scanner vendor is undecided.
+        // Files are recorded as `skipped`, never `clean`. NOT a production decision: production
+        // still leaves it unset and refuses to boot until one is made.
+        "MALWARE_SCAN_MODE": "disabled",
         "APP_NAME": "Biotech Research Drive (Staging)",
-        "LOG_LEVEL": "debug"
+        "LOG_LEVEL": "debug",
+        // Sign-in: the application's own Google Workspace OAuth, no Cloudflare Access. Requires the
+        // GOOGLE_OAUTH_CLIENT_SECRET secret and the https APP_URL / client ID vars below; the
+        // redirect URI is derived as ${APP_URL}/api/auth/google/callback. CF_ACCESS_* must be
+        // unset here — env.worker.ts refuses to boot with both. See auth/auth-provider.ts.
+        "AUTH_PROVIDER": "google_oauth",
+        // Not secrets, so they live here rather than as dashboard variables, which the next
+        // `wrangler deploy` would delete. The Google client ID appears in every sign-in URL.
+        "APP_URL": "https://exrna-database-staging.cmc-330.workers.dev",
+        "GOOGLE_OAUTH_CLIENT_ID": "151201177057-bfr63rhc5350jb3mccq08chskvhe70cs.apps.googleusercontent.com",
+        "GOOGLE_WORKSPACE_DOMAIN": "exrna.com",
+        "COMPANY_EMAIL_DOMAINS": "exrna.com",
+        // Every module on D1: a Worker cannot reach MongoDB, and this is the only configuration
+        // a Worker accepts (DATA-SOURCE-FLAGS.md §4). Staging starts from a fresh D1 bootstrapped
+        // with `npm run bootstrap:d1`, not from migrated MongoDB data. All 22, in the order of
+        // DATA_SOURCE_MODULES; tests/unit/data-source-matrix.test.ts reads this block and runs
+        // it through the startup matrix check.
+        "DATA_SOURCE_ORGANIZATIONS": "d1",
+        "DATA_SOURCE_USERS": "d1",
+        "DATA_SOURCE_DEPARTMENTS": "d1",
+        "DATA_SOURCE_ROLES": "d1",
+        "DATA_SOURCE_PROJECTS": "d1",
+        "DATA_SOURCE_EXPERIMENTS": "d1",
+        "DATA_SOURCE_FOLDERS": "d1",
+        "DATA_SOURCE_FILES": "d1",
+        "DATA_SOURCE_FILE_VERSIONS": "d1",
+        "DATA_SOURCE_SEARCH": "d1",
+        "DATA_SOURCE_REVIEWS": "d1",
+        "DATA_SOURCE_AUDIT_LOGS": "d1",
+        "DATA_SOURCE_INVENTORY": "d1",
+        "DATA_SOURCE_NOTIFICATIONS": "d1",
+        "DATA_SOURCE_SESSIONS": "d1",
+        "DATA_SOURCE_LOGIN_HISTORY": "d1",
+        "DATA_SOURCE_STORAGE_USAGE": "d1",
+        "DATA_SOURCE_ACTIVITIES": "d1",
+        "DATA_SOURCE_COMMENTS": "d1",
+        "DATA_SOURCE_DRIVE_SYNC": "d1",
+        "DATA_SOURCE_UPLOAD_SESSIONS": "d1",
+        "DATA_SOURCE_APP_SETTINGS": "d1"
 ,
         // Storage. A Worker has no persistent filesystem, so these are the only values it can
         // run with — env.worker.ts refuses anything else at boot rather than per upload.
@@ -174,7 +216,7 @@
         {
           "binding": "DB",
           "database_name": "biotech-drive-staging",
-          "database_id": "00000000-0000-0000-0000-000000000000",
+          "database_id": "dde7e614-26b5-48fc-b8b5-4791125f6115",
           "migrations_dir": "drizzle/migrations"
         }
       ],
@@ -274,23 +316,27 @@
   //
   // Never in this file. Set with `npx wrangler secret put <NAME> --env <environment>`:
   //
-  //   AUTH_SECRET
-  //   SESSION_SECRET
-  //   APP_URL                        https://<hostname> (may be a var instead)
+  //   AUTH_SECRET                    a secret, never a dashboard variable (deploys delete those);
+  //   SESSION_SECRET                 scripts/check-worker-secrets.mjs refuses a deploy without them
+  //   APP_URL                        https://<hostname> (may be a var instead; staging: a var)
   //   COMPANY_EMAIL_DOMAINS          comma-separated (may be a var instead)
   //   GOOGLE_DRIVE_ROOT_FOLDER_ID    recommended
   //   GOOGLE_SERVICE_ACCOUNT_EMAIL
   //   GOOGLE_SERVICE_ACCOUNT_PRIVATE_KEY
   //   GOOGLE_SHARED_DRIVE_ID
   //   GOOGLE_WORKSPACE_DOMAIN
-  //   CF_ACCESS_TEAM_DOMAIN          required in production (loadWorkerEnv refuses to boot)
-  //   CF_ACCESS_AUD                  required in production, together with the team domain
+  //   GOOGLE_OAUTH_CLIENT_SECRET     when AUTH_PROVIDER=google_oauth (staging; the client ID is
+  //                                  a staging var above, not a secret)
+  //   CF_ACCESS_TEAM_DOMAIN          required in production unless AUTH_PROVIDER=google_oauth;
+  //                                  must be unset when it is (loadWorkerEnv refuses to boot)
+  //   CF_ACCESS_AUD                  as CF_ACCESS_TEAM_DOMAIN, always together with it
   //   MALWARE_SCAN_SECRET            only when MALWARE_SCAN_MODE=http
   //
   // Non-secret, set per environment under "vars" once decided:
   //
-  //   MALWARE_SCAN_MODE              "http" or "disabled". Deliberately NOT set for staging or
-  //                                  production: choosing a scanner is a business decision, and
+  //   MALWARE_SCAN_MODE              "http" or "disabled". Staging is explicitly "disabled" for
+  //                                  smoke testing; deliberately NOT set for production:
+  //                                  choosing a scanner is a business decision, and
   //                                  a Worker with no value refuses to boot rather than
   //                                  silently running without one.
   //   MALWARE_SCAN_ENDPOINT          https URL of the scanning service, when mode is "http"

@@ -3,6 +3,7 @@ import 'server-only';
 import { getEnv } from '@/server/config/env';
 import { getLogger } from '@/server/logging/logger';
 import { getStorageProvider } from '@/server/storage';
+import { stagingProviderName } from '@/server/storage/staging';
 
 /**
  * One-time process bootstrap: validate configuration and prepare the private storage
@@ -32,7 +33,13 @@ async function run(): Promise<void> {
   }
 
   try {
-    await getStorageProvider().ensureReady();
+    // Only a deployment that stages uploads on local disk has a storage tree to prepare. With
+    // Drive staging (every Worker) there is no volume, and workerd refuses the mkdir outright —
+    // which, thrown from the authenticated layout, took down every signed-in page. Same rule
+    // as the readiness probe's storage check (health-service.ts).
+    if (stagingProviderName() === 'local') {
+      await getStorageProvider().ensureReady();
+    }
     log.info(
       {
         environment: env.NODE_ENV,

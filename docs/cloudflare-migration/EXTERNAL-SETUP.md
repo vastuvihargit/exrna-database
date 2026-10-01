@@ -47,7 +47,37 @@ Nothing to create by hand. `wrangler deploy` creates the `RateLimiter` Durable O
 the `migrations` block in `wrangler.jsonc` on first deploy. It needs a Workers **Paid** plan
 (SQLite-backed Durable Objects).
 
-### 1.4 Cloudflare Access (one application per hostname)
+### 1.4 Sign-in: choose one front door per environment
+
+`AUTH_PROVIDER` in `env.<env>.vars` selects it (`src/server/auth/auth-provider.ts`). **Staging
+uses `google_oauth`**; production is undecided and, with `AUTH_PROVIDER` unset, still requires
+Access (§1.4b). Either way the identity provider only establishes *who* someone is: the account
+must already exist in the application and be `active`, and roles, departments, projects and ACLs
+decide what they may do.
+
+#### 1.4a Google Workspace OAuth (`AUTH_PROVIDER=google_oauth`, staging)
+
+No Cloudflare Access. `CF_ACCESS_TEAM_DOMAIN` / `CF_ACCESS_AUD` must be **unset** — the Worker
+refuses to boot with them. Password sign-in and self-service password recovery are closed, and
+unknown users are refused (no auto-provisioning, whatever the organisation setting says).
+
+1. Google Cloud console → the company project → APIs & Services → OAuth consent screen:
+   **Internal** (Workspace users only); scopes `openid`, `email`, `profile` — nothing else.
+2. Credentials → Create credentials → OAuth client ID → **Web application**.
+   * Authorized redirect URI — exactly `${APP_URL}/api/auth/google/callback`. For staging:
+     `https://exrna-database-staging.cmc-330.workers.dev/api/auth/google/callback`
+   * No JavaScript origins are needed (the flow is server-side).
+3. Client ID → var `GOOGLE_OAUTH_CLIENT_ID` in `wrangler.jsonc` (it is public: every sign-in URL
+   carries it); client secret → secret `GOOGLE_OAUTH_CLIENT_SECRET`.
+4. `APP_URL` (https) is the origin the redirect URI is derived from; set `GOOGLE_REDIRECT_URI`
+   only to override it, and then only on the same origin.
+
+What a sign-in must satisfy: a valid RS256 ID token from Google for this client (issuer,
+audience, expiry, nonce), `email_verified`, an `hd` claim equal to `GOOGLE_WORKSPACE_DOMAIN`, an
+email address on that same domain, and an existing active user with that address.
+`COMPANY_EMAIL_DOMAINS` must include `GOOGLE_WORKSPACE_DOMAIN`.
+
+#### 1.4b Cloudflare Access (one application per hostname)
 
 Full procedure: `22-cloudflare-access.md` §3.
 
@@ -68,7 +98,7 @@ one:
 * Workers & Pages → the Worker → Settings → Domains & Routes → **Add custom domain**
   (e.g. `drive.company.com`), **or** add a `routes` entry to `env.production` in
   `wrangler.jsonc`.
-* Put the same hostname in front of the Access application (§1.4) **before** users are sent to
+* Put the same hostname in front of the Access application (§1.4b), when Access is used, **before** users are sent to
   it.
 * Consider setting `workers_dev: false` for staging too once its custom domain exists; the
   per-request Access check refuses a request that bypassed Access either way.
@@ -81,15 +111,17 @@ one:
 |---|---|---|
 | `AUTH_SECRET` | yes | ≥ 32 characters |
 | `SESSION_SECRET` | yes | ≥ 32 characters, different from `AUTH_SECRET` |
-| `APP_URL` | yes | `https://<hostname>` (may be a var instead of a secret) |
-| `COMPANY_EMAIL_DOMAINS` | yes | comma-separated (may be a var) |
+| `APP_URL` | yes | `https://<hostname>`. **A var for staging** (`wrangler.jsonc`): `https://exrna-database-staging.cmc-330.workers.dev` |
+| `COMPANY_EMAIL_DOMAINS` | yes | comma-separated. **A var for staging** (`wrangler.jsonc`) — do not also set it as a secret |
 | `GOOGLE_SHARED_DRIVE_ID` | yes | §2.1 |
 | `GOOGLE_DRIVE_ROOT_FOLDER_ID` | recommended | §2.2. Without it, content is written to the Shared Drive root and the admin page warns. |
 | `GOOGLE_SERVICE_ACCOUNT_EMAIL` | yes | §2.3 |
 | `GOOGLE_SERVICE_ACCOUNT_PRIVATE_KEY` | yes | the PEM from the key JSON, one line, `\n`-escaped |
-| `GOOGLE_WORKSPACE_DOMAIN` | yes | e.g. `company.com` |
-| `CF_ACCESS_TEAM_DOMAIN` | **yes in production** | §1.4. Must be set together with `CF_ACCESS_AUD`. |
-| `CF_ACCESS_AUD` | **yes in production** | §1.4 |
+| `GOOGLE_WORKSPACE_DOMAIN` | yes | e.g. `company.com`. **A var for staging** (`wrangler.jsonc`) — do not also set it as a secret |
+| `GOOGLE_OAUTH_CLIENT_ID` | with `AUTH_PROVIDER=google_oauth` | §1.4a. **A var for staging** (`wrangler.jsonc`), not a secret |
+| `GOOGLE_OAUTH_CLIENT_SECRET` | with `AUTH_PROVIDER=google_oauth` | §1.4a |
+| `CF_ACCESS_TEAM_DOMAIN` | **yes in production** unless `AUTH_PROVIDER=google_oauth`, when it must be unset | §1.4b. Must be set together with `CF_ACCESS_AUD`. |
+| `CF_ACCESS_AUD` | as `CF_ACCESS_TEAM_DOMAIN` | §1.4b |
 | `MALWARE_SCAN_SECRET` | when `MALWARE_SCAN_MODE=http` | ≥ 16 characters; §4 |
 
 Also required, as **vars** in `wrangler.jsonc` → `env.<env>.vars`:
@@ -100,10 +132,20 @@ Also required, as **vars** in `wrangler.jsonc` → `env.<env>.vars`:
 * The 22 `DATA_SOURCE_*=d1` flags, at cutover step 15 (`DATA-SOURCE-FLAGS.md` §2). Set them for
   **staging** as soon as staging holds migrated data.
 
-Not needed on the Worker: `MONGODB_URI`, the `*_ROOT` storage paths, `GOOGLE_CLIENT_ID`,
-`GOOGLE_CLIENT_SECRET` and `CLAMAV_*`. They are Node-deployment settings.
+Not needed on the Worker: `MONGODB_URI`, the `*_ROOT` storage paths and `CLAMAV_*`. They are
+Node-deployment settings. (`GOOGLE_CLIENT_ID` / `_SECRET` are accepted as aliases of the
+`GOOGLE_OAUTH_*` names.)
 
-**Pass:** `npx wrangler secret list --env <env>` lists every required name.
+**Set values as secrets, never as dashboard text variables.** `wrangler deploy` replaces the
+Worker's plain-text variables with the `vars` in `wrangler.jsonc`, so a value typed into the
+dashboard as a *variable* disappears on the next deploy and the Worker refuses to boot. Secrets
+survive deploys. Conversely, a name that is a `var` in `wrangler.jsonc` (for staging:
+`AUTH_PROVIDER`, `APP_URL`, `GOOGLE_OAUTH_CLIENT_ID`, `GOOGLE_WORKSPACE_DOMAIN`,
+`COMPANY_EMAIL_DOMAINS`, `MALWARE_SCAN_MODE`) must not also be a secret.
+
+**Pass:** `npm run cf:check-secrets:staging` exits 0 (`scripts/check-worker-secrets.mjs`: every
+required name is a real secret, no `CF_ACCESS_*`). The staging workflow and
+`npm run cf:deploy:staging` run it before deploying.
 
 ### 1.7 GitHub (for `deploy-cloudflare.yml`, staging only)
 
@@ -185,7 +227,7 @@ covered by tests: infected files and scanner errors never become downloadable in
 ## 5. Order of operations
 
 1. Google §2.1–2.4 → Cloudflare §1.1–1.2 → secrets §1.6 for **staging**.
-2. Access §1.4 and hostname §1.5 for staging.
+2. Sign-in §1.4 (staging: Google OAuth, §1.4a) and hostname §1.5 for staging.
 3. Malware decision §4.
 4. Deploy staging (`deploy-cloudflare.yml`, or `REHEARSAL.md` §5).
 5. Live Drive checks §2.6 and a live Access sign-in on staging.

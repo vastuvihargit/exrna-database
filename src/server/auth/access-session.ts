@@ -33,10 +33,12 @@
  *
  * ── When Access is not configured ───────────────────────────────────────────────────────
  *
- * Local development and the existing Node deployment: `accessConfig()` is null and every
- * function here is a pass-through. A production *Worker* cannot be in that state —
- * `loadWorkerEnv` refuses to boot without Access, because Argon2id passwords cannot be verified
- * there. There is therefore no production fallback to a weaker check.
+ * Local development, the existing Node deployment and `AUTH_PROVIDER=google_oauth`:
+ * `accessConfig()` is null and every function here is a pass-through. A production *Worker*
+ * reaches that state only in `google_oauth` mode — otherwise `loadWorkerEnv` refuses to boot
+ * without Access, because Argon2id passwords cannot be verified there. There is therefore no
+ * production fallback to a weaker check: identity comes from Access or from a verified Google
+ * ID token, never from neither.
  */
 import { getEnv } from '@/server/config/env';
 import {
@@ -49,8 +51,14 @@ import { resolveSession, type ResolvedSession } from './session.service';
 import { getLogger } from '@/server/logging/logger';
 import { isWorkerRuntime } from '@/server/runtime';
 
+/**
+ * Null in `AUTH_PROVIDER=google_oauth` mode as well as when Access is unconfigured: that mode's
+ * startup check refuses `CF_ACCESS_*`, and this makes "no Access" hold even if it did not.
+ */
 export function accessConfig(): AccessConfig | null {
-  return accessConfigFrom(getEnv());
+  const env = getEnv();
+  if (env.AUTH_PROVIDER === 'google_oauth') return null;
+  return accessConfigFrom(env);
 }
 
 export function isAccessEnforced(): boolean {
@@ -77,7 +85,7 @@ export const EXTERNAL_PASSWORD_RECOVERY_MESSAGE =
  * cannot be computed there. The legacy Node deployment keeps the flow unchanged.
  */
 export function isPasswordRecoveryAvailable(): boolean {
-  return !isAccessEnforced() && !isWorkerRuntime();
+  return !isAccessEnforced() && !isGoogleOAuthOnly() && !isWorkerRuntime();
 }
 
 /**
@@ -89,7 +97,15 @@ export function isPasswordRecoveryAvailable(): boolean {
  * hash threw) and a known address with "incorrect password" — even for the right password.
  */
 export function isPasswordAuthAvailable(): boolean {
-  return !isAccessEnforced() && !isWorkerRuntime();
+  return !isAccessEnforced() && !isGoogleOAuthOnly() && !isWorkerRuntime();
+}
+
+/**
+ * `AUTH_PROVIDER=google_oauth`: Google Workspace sign-in is the only identity source, on a Node
+ * deployment as much as on a Worker, so the password paths are closed there too.
+ */
+function isGoogleOAuthOnly(): boolean {
+  return getEnv().AUTH_PROVIDER === 'google_oauth';
 }
 
 export const PASSWORD_AUTH_UNAVAILABLE_MESSAGE =

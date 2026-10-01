@@ -18,6 +18,8 @@
     "cf:build": "cross-env BUILD_TARGET=cloudflare opennextjs-cloudflare build",
     "cf:preview": "cross-env BUILD_TARGET=cloudflare opennextjs-cloudflare preview",
     "cf:deploy": "cross-env BUILD_TARGET=cloudflare opennextjs-cloudflare deploy",
+    "cf:check-secrets:staging": "node scripts/check-worker-secrets.mjs staging",
+    "cf:deploy:staging": "npm run cf:check-secrets:staging && npm run cf:build && cross-env BUILD_TARGET=cloudflare opennextjs-cloudflare deploy --env staging",
     "cf:typegen": "wrangler types --env-interface CloudflareEnv worker-configuration.d.ts",
     "db:generate": "drizzle-kit generate",
     "db:migrate:local": "wrangler d1 migrations apply biotech-drive-dev --env development --local",
@@ -42,6 +44,7 @@
     "migrate:d1": "tsx scripts/migrate-to-d1.ts",
     "migrate:verify": "tsx scripts/verify-d1-migration.ts",
     "migrate:validate": "tsx scripts/validate-mongo-source.ts",
+    "bootstrap:d1": "tsx scripts/bootstrap-d1.ts",
     "test:e2e": "playwright test"
   },
   "dependencies": {

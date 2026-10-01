@@ -1,5 +1,11 @@
 import { NextResponse, type NextRequest } from 'next/server';
 
+import {
+  NONCE_HEADER,
+  buildContentSecurityPolicy,
+  generateNonce,
+} from '@/lib/security/content-security-policy';
+
 /**
  * Edge middleware — a *routing* guard, not a security boundary.
  *
@@ -20,6 +26,14 @@ import { NextResponse, type NextRequest } from 'next/server';
  * Access sign-in bridge rather than the password page — the bridge verifies the assertion
  * server-side. The presence check here decides only *where to send* the browser; nothing is
  * trusted because of it.
+ *
+ * ── Content-Security-Policy ─────────────────────────────────────────────────────────────
+ *
+ * Every page response gets its policy here, with a nonce minted for that request, because a
+ * static policy cannot allow the App Router's inline scripts without `'unsafe-inline'`
+ * (`lib/security/content-security-policy.ts`). The same policy is forwarded on the request so
+ * Next.js stamps the nonce on the scripts it renders; `next.config.ts` therefore sets no CSP
+ * on the routes this middleware matches — a second, static policy would still block them.
  */
 const SESSION_COOKIE = 'bd_session';
 const ACCESS_HEADER = 'cf-access-jwt-assertion';
@@ -28,6 +42,17 @@ const ACCESS_COOKIE = 'CF_Authorization';
 const PUBLIC_PATHS = ['/login', '/forgot-password', '/reset-password', '/access-denied'];
 
 export function middleware(request: NextRequest) {
+  const nonce = generateNonce();
+  const policy = buildContentSecurityPolicy({
+    nonce,
+    development: process.env.NODE_ENV !== 'production',
+  });
+  const response = route(request, policy, nonce);
+  response.headers.set('Content-Security-Policy', policy);
+  return response;
+}
+
+function route(request: NextRequest, policy: string, nonce: string): NextResponse {
   const { pathname } = request.nextUrl;
   const hasSessionCookie = Boolean(request.cookies.get(SESSION_COOKIE)?.value);
   const isPublic = PUBLIC_PATHS.some((path) => pathname === path || pathname.startsWith(`${path}/`));
@@ -53,7 +78,11 @@ export function middleware(request: NextRequest) {
     return NextResponse.redirect(new URL('/home', request.url));
   }
 
-  return NextResponse.next();
+  // Forwarded on the request: Next.js takes the nonce from this header when it renders.
+  const headers = new Headers(request.headers);
+  headers.set('Content-Security-Policy', policy);
+  headers.set(NONCE_HEADER, nonce);
+  return NextResponse.next({ request: { headers } });
 }
 
 export const config = {

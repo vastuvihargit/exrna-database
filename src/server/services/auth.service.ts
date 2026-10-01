@@ -241,7 +241,15 @@ export async function completeOAuthLogin(
   meta: RequestMeta,
 ): Promise<IssuedSession> {
   const env = getEnv();
-  const allowedDomains = await organizationRepository.getSignInDomains(env.COMPANY_EMAIL_DOMAINS);
+  const signInDomains = await organizationRepository.getSignInDomains(env.COMPANY_EMAIL_DOMAINS);
+  // With Google as the only front door, the Workspace domain is the only one that signs in, even
+  // if the organisation record lists others (a Workspace's secondary or alias domains share its
+  // `hd`). Startup requires it to be on the env allow-list; here it must be on the effective one.
+  const workspaceDomain = env.GOOGLE_WORKSPACE_DOMAIN?.trim().toLowerCase();
+  const allowedDomains =
+    env.AUTH_PROVIDER === 'google_oauth'
+      ? signInDomains.filter((domain) => domain.trim().toLowerCase() === workspaceDomain)
+      : signInDomains;
   const email = normalizeCompanyEmail(input.email, allowedDomains);
 
   if (!email) {
@@ -259,7 +267,13 @@ export async function completeOAuthLogin(
 
   if (!user) {
     const organization = await organizationRepository.getPrimary();
-    const autoProvision = organization?.settings.allowAutoProvisioning ?? env.ALLOW_AUTO_PROVISIONING;
+    // With Google sign-in as the only front door, every account is created by an administrator:
+    // a Workspace login proves who someone is; the existing user row, with its roles and ACLs,
+    // is what grants access. The organisation setting and env flag are ignored in that mode.
+    const autoProvision =
+      env.AUTH_PROVIDER === 'google_oauth'
+        ? false
+        : (organization?.settings.allowAutoProvisioning ?? env.ALLOW_AUTO_PROVISIONING);
 
     // Owning a company address is sign-in *eligibility*, not access. With
     // auto-provisioning off (the default), an administrator must create the account.

@@ -1,11 +1,13 @@
 import type { Metadata, Viewport } from 'next';
 import { Inter } from 'next/font/google';
+import { headers } from 'next/headers';
 
 import './globals.css';
 import { Toaster } from 'sonner';
 import { ThemeProvider } from '@/components/providers/theme-provider';
 import { QueryProvider } from '@/components/providers/query-provider';
 import { DevSwitcherMount } from '@/components/dev/dev-switcher-mount';
+import { NONCE_HEADER } from '@/lib/security/content-security-policy';
 
 const inter = Inter({ subsets: ['latin'], variable: '--font-sans', display: 'swap' });
 
@@ -28,7 +30,17 @@ export const viewport: Viewport = {
   ],
 };
 
-export default function RootLayout({ children }: { children: React.ReactNode }) {
+/**
+ * Async, and reading the request headers, on purpose.
+ *
+ * The CSP nonce is minted per request by `src/middleware.ts`. `next-themes` renders an inline
+ * script that must carry it, and Next.js stamps it on its own scripts only while rendering a
+ * request. Reading `headers()` here makes every page dynamic, so no HTML is ever prerendered
+ * or cached with a nonce that no later response's policy will match.
+ */
+export default async function RootLayout({ children }: { children: React.ReactNode }) {
+  const nonce = (await headers()).get(NONCE_HEADER) ?? undefined;
+
   return (
     <html lang="en" suppressHydrationWarning>
       <body className={`${inter.variable} font-sans`}>
@@ -38,7 +50,13 @@ export default function RootLayout({ children }: { children: React.ReactNode }) 
         >
           Skip to content
         </a>
-        <ThemeProvider attribute="class" defaultTheme="system" enableSystem disableTransitionOnChange>
+        <ThemeProvider
+          attribute="class"
+          defaultTheme="system"
+          enableSystem
+          disableTransitionOnChange
+          nonce={nonce}
+        >
           <QueryProvider>
             {children}
             {/* Drive operations are mostly silent on success; a toast is the only

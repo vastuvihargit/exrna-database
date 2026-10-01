@@ -7,7 +7,9 @@
  *   • PKCE binds the code to this client (code interception)
  *   • `nonce` binds the ID token to this request (token replay)
  *   • the ID token's signature, issuer, audience and expiry are all verified
- *   • the *email domain* — not the `hd` claim — decides who may sign in
+ *   • the *email domain* — not the `hd` claim — decides who may sign in; with
+ *     `AUTH_PROVIDER=google_oauth` the `hd` claim must additionally equal
+ *     `GOOGLE_WORKSPACE_DOMAIN` (and `completeOAuthLogin` pins the email domain to it)
  */
 import { getEnv } from '@/server/config/env';
 import { ValidationError } from '@/server/errors/app-error';
@@ -121,6 +123,11 @@ interface JwkKey {
 let jwksCache: { keys: JwkKey[]; fetchedAt: number } | null = null;
 const JWKS_TTL_MS = 60 * 60_000;
 
+/** Test-only: forget the cached Google signing keys. */
+export function resetGoogleJwksCache(): void {
+  jwksCache = null;
+}
+
 async function getJwks(): Promise<JwkKey[]> {
   if (jwksCache && Date.now() - jwksCache.fetchedAt < JWKS_TTL_MS) return jwksCache.keys;
 
@@ -217,6 +224,18 @@ export async function completeGoogleLogin(input: {
   // An unverified address at Google is not proof of control of that mailbox.
   const emailVerified = claims.email_verified === true || claims.email_verified === 'true';
   if (!email || !emailVerified) throw new ValidationError('Google account email is not verified');
+
+  // As the only front door, sign-in also requires the account to belong to the company's
+  // Workspace. A consumer Google account can be registered with a company address and carries
+  // no `hd`; its `email_verified` proves the mailbox, not that the company manages the account.
+  // The email domain allow-list (in `completeOAuthLogin`) still decides who may sign in.
+  if (env.AUTH_PROVIDER === 'google_oauth') {
+    const hostedDomain = typeof claims.hd === 'string' ? claims.hd.trim().toLowerCase() : '';
+    const workspaceDomain = env.GOOGLE_WORKSPACE_DOMAIN?.trim().toLowerCase() ?? '';
+    if (!hostedDomain || hostedDomain !== workspaceDomain) {
+      throw new ValidationError('Google account is not managed by the company Workspace');
+    }
+  }
 
   return {
     email,
